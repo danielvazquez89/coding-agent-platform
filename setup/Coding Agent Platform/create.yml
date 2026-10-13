@@ -1,0 +1,29 @@
+info:
+  name: create
+  type: http
+  seq: 1
+
+http:
+  method: POST
+  url: http://localhost:8081/api/tasks
+  body:
+    type: json
+    data: |-
+      {
+          "title": "Update greeting plus regression test, final smoke",
+        "description": "In Greeting.java, change the returned string from Hello to Hello from Qwen. In GreetingTest.java, update its expected string to Hello from Qwen. Do not change anything else. Read both files, apply a complete unified diff, and run Maven validation.",
+        "acceptanceCriteria": [
+          "Greeting.message returns Hello from Qwen",
+          "GreetingTest expects Hello from Qwen",
+          "Maven tests pass"
+        ],
+          "repositoryUrl": "C:\\Users\\danie\\IdeaProjects\\coding-agent-platform\\target\\agent-smoke-repo"
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5
+  forwardAuthorizationHeader: false
