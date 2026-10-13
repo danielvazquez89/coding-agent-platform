@@ -11,9 +11,11 @@ class TaskLifecycleTest {
             TaskStatus.QUEUED to TaskStatus.CANCELLED,
             TaskStatus.RUNNING to TaskStatus.VALIDATING,
             TaskStatus.RUNNING to TaskStatus.FAILED,
+            TaskStatus.RUNNING to TaskStatus.NEEDS_INPUT,
             TaskStatus.RUNNING to TaskStatus.CANCELLED,
             TaskStatus.VALIDATING to TaskStatus.COMPLETED,
             TaskStatus.VALIDATING to TaskStatus.FAILED,
+            TaskStatus.VALIDATING to TaskStatus.NEEDS_INPUT,
             TaskStatus.VALIDATING to TaskStatus.CANCELLED
         )
 

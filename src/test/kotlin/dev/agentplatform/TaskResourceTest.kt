@@ -3,13 +3,37 @@ package dev.agentplatform
 import io.restassured.RestAssured.given
 import io.restassured.http.ContentType
 import io.quarkus.test.junit.QuarkusTest
+import jakarta.inject.Inject
+import jakarta.ws.rs.BadRequestException
+import jakarta.ws.rs.NotFoundException
 import org.hamcrest.CoreMatchers.equalTo
 import org.hamcrest.CoreMatchers.nullValue
 import org.hamcrest.Matchers.hasItem
+import org.junit.jupiter.api.Assertions.assertNotNull
+import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
+import java.util.UUID
 
 @QuarkusTest
 class TaskResourceTest {
+    @Inject
+    lateinit var taskResource: TaskResource
+
+    @Test
+    fun `resource validation and direct lookup cover both branches`() {
+        assertThrows(BadRequestException::class.java) {
+            taskResource.create(CreateTaskRequest(" ", "Description"))
+        }
+        assertThrows(BadRequestException::class.java) {
+            taskResource.create(CreateTaskRequest("Title", " "))
+        }
+
+        val created = taskResource.create(CreateTaskRequest("Title", "Description"))
+        val id = UUID.fromString(created.location.path.substringAfterLast('/'))
+        assertNotNull(taskResource.get(id))
+        assertThrows(NotFoundException::class.java) { taskResource.get(UUID.randomUUID()) }
+    }
+
     @Test
     fun `created task is queued and has an initial history entry`() {
         val id = createTask()
@@ -87,6 +111,11 @@ class TaskResourceTest {
     @Test
     fun `unknown tasks return not found for status and history`() {
         val missingId = "00000000-0000-0000-0000-000000000001"
+
+        given()
+            .`when`().get("/api/tasks/$missingId")
+            .then()
+            .statusCode(404)
 
         transition(missingId, "RUNNING").statusCode(404)
         given()

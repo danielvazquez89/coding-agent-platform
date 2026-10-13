@@ -20,7 +20,10 @@ import java.util.UUID
 @Path("/api/tasks")
 @Consumes(MediaType.APPLICATION_JSON)
 @Produces(MediaType.APPLICATION_JSON)
-class TaskResource @Inject constructor(private val taskService: TaskService) {
+class TaskResource @Inject constructor(
+    private val taskService: TaskService,
+    private val attemptService: TaskAttemptService
+) {
 
     @POST
     fun create(request: CreateTaskRequest): Response {
@@ -55,10 +58,25 @@ class TaskResource @Inject constructor(private val taskService: TaskService) {
         if (taskService.findById(id) == null) throw NotFoundException("Task $id was not found")
         return taskService.history(id)
     }
+
+    @GET
+    @Path("/{id}/attempts")
+    fun attempts(@PathParam("id") id: UUID): List<TaskAttemptResponse> {
+        if (taskService.findById(id) == null) throw NotFoundException("Task $id was not found")
+        return attemptService.list(id)
+    }
+
+    @GET
+    @Path("/{id}/attempts/{attemptId}")
+    fun attempt(
+        @PathParam("id") id: UUID,
+        @PathParam("attemptId") attemptId: UUID
+    ): TaskAttemptResponse = attemptService.find(id, attemptId)
+        ?: throw NotFoundException("Attempt $attemptId was not found for task $id")
 }
 
 @Provider
 class InvalidTaskTransitionMapper : ExceptionMapper<InvalidTaskTransitionException> {
     override fun toResponse(exception: InvalidTaskTransitionException): Response =
-        Response.status(Response.Status.CONFLICT).entity(ApiError(exception.message ?: "Invalid task transition")).build()
+        Response.status(Response.Status.CONFLICT).entity(ApiError(exception.apiMessage)).build()
 }

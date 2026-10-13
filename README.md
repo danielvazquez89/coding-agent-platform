@@ -2,7 +2,7 @@
 
 A Kotlin + Quarkus project for a controlled software engineering agent. The intended product takes a GitHub issue, inspects one repository, proposes a patch, runs validation in isolation, and opens a pull request for a person to review.
 
-The project is at the foundation stage: it accepts task descriptions over REST and persists them to PostgreSQL. It does not yet use an LLM, clone repositories, execute code, or talk to GitHub.
+The project now runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks local Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and runs Maven tests in an isolated Docker environment. It returns a report with changed files, a diff, validation results, decisions, and open questions. GitHub issue ingestion and pull-request creation are not implemented.
 
 ## Product goals
 
@@ -27,8 +27,18 @@ The engineering challenge is making the workflow dependable and safe, not adding
 | `GET` | `/api/tasks/{id}` | Return a task or `404`. |
 | `PATCH` | `/api/tasks/{id}/status` | Apply a permitted status transition; return `409` for an invalid transition and `404` for an unknown task. |
 | `GET` | `/api/tasks/{id}/history` | Return ordered, append-only status history, including the initial `QUEUED` entry. |
+| `GET` | `/api/tasks/{id}/attempts` | Return attempts in attempt-number order, with status, report, and failure summary. |
+| `GET` | `/api/tasks/{id}/attempts/{attemptId}` | Return one attempt and its structured execution report. |
 
-Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list), and `repositoryUrl` (optional). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. No background worker or retry attempts are implemented yet.
+Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list), and `repositoryUrl` (required for execution). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. A scheduled single-process worker claims queued tasks every two seconds and creates a durable attempt. Task creation currently returns `201` with `QUEUED`; the worker executes asynchronously after persistence.
+
+`CodingModelProvider` defines a provider-independent chat/tool-call contract. `OllamaCodingModelProvider` implements Ollama's `/api/chat` protocol, including structured assistant tool-call history and named tool-result messages, tool schemas, usage counts, timeouts, and bounded error messages. For models that return a JSON tool request in message content instead of Ollama's native `tool_calls`, it normalizes that response only when the requested tool was offered to the model. The adapter is configured with `OLLAMA_BASE_URL` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen2.5-coder:7b`), and `OLLAMA_TIMEOUT_SECONDS` (default `120`). It does not download models.
+
+The current local default is `qwen2.5-coder:7b`. If needed, install it with `ollama pull qwen2.5-coder:7b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL.
+
+The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repositories must be under `AGENT_ALLOWED_LOCAL_ROOT`; public GitHub HTTPS URLs are also accepted. A task report includes implementation summary, choices and rationale, alternatives, open questions and their impact, changed files, validation outcomes, and patch diff. Attempts can finish as `COMPLETED`, `FAILED`, or `NEEDS_INPUT`; failures retain a bounded summary. A task is completed only when the workspace changed and the supported validation passed.
+
+Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and the host Maven artifact cache mounted read-only. It cannot download dependencies: if required artifacts are missing from the cache, validation fails or is skipped. Gradle, other build systems, and network-enabled dependency resolution are not supported yet.
 
 Allowed transitions:
 
@@ -51,12 +61,22 @@ QUEUED → RUNNING → VALIDATING → COMPLETED
 - `src/main/kotlin/dev/agentplatform/TaskStatusTransitionRepository.kt` — ordered task history persistence.
 - `src/main/kotlin/dev/agentplatform/CodingTask.kt` — persisted task entity and ordered acceptance criteria.
 - `src/main/kotlin/dev/agentplatform/TaskStatusTransition.kt` — append-only status history entity.
+- `src/main/kotlin/dev/agentplatform/TaskAttempt.kt` — persisted attempt and attempt status.
+- `src/main/kotlin/dev/agentplatform/TaskAttemptService.kt` — attempt lifecycle and report serialization for worker use and read APIs.
+- `src/main/kotlin/dev/agentplatform/TaskAttemptRepository.kt` — ordered attempt persistence.
+- `src/main/kotlin/dev/agentplatform/CodingModelProvider.kt` — provider-neutral model messages, tool definitions, tool calls, and turns.
+- `src/main/kotlin/dev/agentplatform/OllamaCodingModelProvider.kt` — Ollama `/api/chat` adapter; no repository tools are executed by this class.
+- `src/main/kotlin/dev/agentplatform/TaskExecutionWorker.kt` — scheduled task claim, bounded model/tool loop, report generation, and terminal-state handling.
+- `src/main/kotlin/dev/agentplatform/WorkspaceToolExecutor.kt` — path-checked repository inspection, patch application, and validation tool boundary.
+- `src/main/kotlin/dev/agentplatform/GitRepositoryWorkspaceFactory.kt` — authorized local/GitHub repository copy into an isolated temporary workspace and diff collection.
+- `src/main/kotlin/dev/agentplatform/DockerValidationRunner.kt` — disposable Docker Maven/PostgreSQL validation runtime.
+- `src/main/kotlin/dev/agentplatform/LocalCommandExecutor.kt` — argument-vector process runner with bounded output and timeouts.
 - `src/main/resources/application.properties` — app name and HTTP port (`8081`).
-- `src/main/resources/db/migration/` — Flyway-managed PostgreSQL schema migrations.
-- `src/test/kotlin/dev/agentplatform/` — lifecycle policy unit tests and API/database integration tests.
+- `src/main/resources/db/migration/` — Flyway-managed PostgreSQL schema migrations (V1 tasks, V2 status history, V3 attempts, V4 one-running-attempt constraint).
+- `src/test/kotlin/dev/agentplatform/` — lifecycle policy and Quarkus REST/PostgreSQL integration tests; JaCoCo coverage is enforced during `verify`.
 - `pom.xml` — Maven build, Kotlin compiler, Quarkus platform and extensions. The Quarkus Maven plugin is configured to disable its default dev-mode debugger; the project has had a conflict on debugger port `5005`.
 
-Task data and status history are durable in PostgreSQL. Flyway creates and evolves the schema; Hibernate validates the mapped schema at startup rather than creating tables implicitly.
+Task data, status history, attempts, and attempt reports are durable in PostgreSQL. Flyway creates and evolves the schema; Hibernate validates the mapped schema at startup rather than creating tables implicitly. Reports are stored as JSON text for now; normalize or index report fields when actual query needs are known.
 
 ## Open in IntelliJ IDEA
 
@@ -102,7 +122,7 @@ $env:DB_PASSWORD = (Get-Content .env | ConvertFrom-StringData).DB_PASSWORD
 Remove-Item Env:DB_PASSWORD
 ```
 
-The suite includes exhaustive transition-policy checks plus REST tests for task creation, status changes, invalid transitions, history ordering, and not-found/validation responses.
+The suite includes transition-policy and REST/database tests, provider protocol tests, worker/report lifecycle tests, path and patch safety tests, repository workspace tests, command execution tests, and Docker-runner tests. `mvnw verify` enforces 100% line and branch coverage for measured application code.
 
 ### Try the API
 
@@ -126,7 +146,7 @@ Invoke-RestMethod -Method Patch -Uri "http://localhost:8081/api/tasks/$($task.id
 Invoke-RestMethod -Uri "http://localhost:8081/api/tasks/$($task.id)/history"
 ```
 
-Use a repository URL you control before adding any repository-cloning capability. The current API only stores the URL as text.
+Create a task against a repository under the configured allowlisted local root, or against a public GitHub HTTPS URL. For local access, configure `AGENT_ALLOWED_LOCAL_ROOT` to a parent directory containing only repositories you intend the agent to access. Keep `AGENT_WORKSPACE_ROOT` separate. Do not point the agent at directories containing credentials or production data.
 
 ## Decisions and boundaries
 
@@ -137,35 +157,75 @@ Use a repository URL you control before adding any repository-cloning capability
 - **Human approval:** create draft/proposed pull requests only. Do not auto-merge or deploy.
 - **Repository content is untrusted:** issue text and files can contain prompt injection or malicious code. Model tool requests are proposals; application policy must authorize and constrain each operation.
 
+## Architecture evolution: synchronous MVP to async workers
+
+The current implementation is a **Quarkus** REST API and one in-process scheduled worker backed by PostgreSQL. The API stores a task as `QUEUED`; the worker claims it, creates an attempt, opens an isolated workspace, runs a bounded model/tool loop, validates changes in Docker, and persists the report and terminal state. This is still an early single-worker slice: there are no leases, heartbeats, retries, crash recovery, cancellation during execution, broker, GitHub write integration, or independent worker process.
+
+When execution becomes asynchronous and needs to survive API restarts or scale independently, evolve toward this flow:
+
+```text
+Client → Quarkus API → PostgreSQL (task + attempt)
+                           ↓
+                    RabbitMQ job message
+                           ↓
+                    Worker process → model-provider interface → Ollama / controlled tools
+                           ↓
+                    PostgreSQL (progress, result, errors)
+```
+
+The broker carries a job reference (for example, task ID and attempt ID) from the API to a worker. It does **not** communicate with the model; the worker calls the model provider and tools. PostgreSQL remains the source of truth for task state, attempt history, results, and recovery. The model provider stays behind an application interface so changing providers does not change queue responsibilities.
+
+### Broker choice
+
+RabbitMQ is the initial broker to consider when the requirement is durable work distribution to workers: it has queue-oriented delivery, acknowledgements, and retry/dead-letter patterns. Kafka is a strong choice for durable event streams, replay, and multiple independent consumers, but would add design and operational complexity for a first worker queue. Revisit Kafka if replayable event history or high-throughput multi-consumer streaming becomes a real requirement. Neither broker is needed merely to call Claude.
+
+### Database and broker consistency
+
+Do not assume a PostgreSQL transaction can atomically commit a RabbitMQ publish. If the API commits a task but fails to publish its job, work can be stranded; publishing first can create a message for a task whose transaction later rolls back. Once broker-backed dispatch is introduced, use a **transactional outbox**: insert/update the task and insert an outbox event in the same PostgreSQL transaction. A separate publisher sends pending outbox rows to RabbitMQ and marks them published. The publisher can crash after sending but before marking, so duplicate delivery is expected. Workers must be idempotent: use stable task/attempt identifiers and atomically verify/claim eligible work in PostgreSQL before executing it.
+
+For long-running agent work, avoid holding a RabbitMQ delivery unacknowledged for the entire model/tool/test run without checking the consequences of consumer timeouts and redelivery. A practical design is to durably claim the task/attempt, then acknowledge the dispatch message and track execution leases/heartbeats in PostgreSQL. Recovery logic can requeue or retry work whose lease expires. The exact acknowledgement point, lease duration, retry/backoff policy, and dead-letter behavior should be specified and tested when the worker is implemented.
+
+### Incremental path
+
+1. **Current MVP:** Quarkus API, PostgreSQL task persistence, and audited status transitions.
+2. **Execution model:** add attempt records and a single database-backed worker; define claims, leases, bounded retries, timeouts, cancellation, and idempotency.
+3. **Asynchronous API:** return `202 Accepted` for submitted work and expose task/attempt progress while a worker executes independently.
+4. **Broker-backed dispatch:** add RabbitMQ when independent worker processes, scaling, or isolation make it useful. Introduce an outbox with broker publication and idempotent consumption as part of reliable dispatch.
+5. **Operational hardening:** add recovery for expired leases, retry/backoff limits, dead-letter handling, concurrency and provider-rate limits, and observability before increasing worker count.
+
+Treat these as architecture guidance, not commitments to add every component now. Prefer the simplest stage that meets the current reliability and scaling needs.
+
+### Execution definition of done
+
+Given an authorized repository and a task with acceptance criteria, the agent should inspect relevant code, identify related tests, make a focused patch in an isolated working copy, add or update tests when needed, run relevant validation, and return a reviewable report. The report explains what changed, why important implementation choices were made, alternatives considered where useful, unresolved questions, changed files, and the actual validation outcomes. If an unresolved question blocks safe progress, the attempt should finish as `NEEDS_INPUT` with the question and its impact; it must not claim completion. A failed or unavailable check must be reported as such, never as a pass.
+
+“Completed” means execution produced a patch and an honest validation report. It does not mean the patch was approved, merged, or deployed. Keep human review as the gate for later pull-request or release actions.
+
 ## Recommended roadmap
 
 Do these as small vertical slices. Keep the app runnable after each slice and document the behavior and limits that actually exist.
 
-### 1. Model task attempts and recovery
+### 1. Harden worker recovery and task operations
 
-Task transitions are enforced and their history is persisted. Next, add per-attempt records with bounded failure summaries and retry metadata. Keep each attempt distinct from the task's current state. Add leases only when a background worker is introduced.
+The single worker and attempt report now exist. Next add leases/heartbeats, recovery of tasks left running after a crash, explicit retry/backoff limits, cancellation, and concurrency controls. Define how retries avoid duplicate side effects. Keep worker logic separate from REST resources so it can later run in its own process. Do not add RabbitMQ until a concrete scaling or isolation requirement calls for it.
 
-### 2. Add a single recoverable worker
+### 2. Improve tool-loop quality and repository support
 
-Claim queued tasks durably; use leases/heartbeats, attempt limits, timeouts, cancellation, and backoff. Decide how a crashed worker's lease expires and how retries avoid duplicate side effects. Start with one local worker. Add a broker only when a concrete scaling or isolation requirement calls for it.
+The first tool loop exists for one local model and Maven repositories. Evaluate it on repeatable real tasks, make tool calls observable, and store appropriately redacted tool inputs/outputs and model usage. Add Gradle and other build support only after defining the sandbox and dependency-cache policy for each.
 
-### 3. Add controlled repository tools and a model loop
+### 3. Harden isolation and dependency management
 
-Start with one model provider and one repository. Define narrowly scoped operations such as `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`. Validate paths, diff size, allowed commands, time, output size, model tokens, and spend in application code. Cap iterations. Preserve tool inputs/outputs and model usage as auditable records with sensitive values redacted.
+Maven tests currently run in a disposable, resource-limited container with no external network and no production secrets. Extend and review the sandbox policy as repository support grows. Decide how to populate a controlled dependency cache or proxy before permitting dependency downloads.
 
-### 4. Isolate code execution
-
-Run clone/build/test steps in a disposable container per attempt. Use a non-root user, restricted filesystem mounts, CPU/memory/time limits, and no network egress by default. Never mount personal or production credentials. Treat sandbox escape and dependency-download requirements as explicit design decisions, not implicit permissions.
-
-### 5. Integrate GitHub narrowly
+### 4. Integrate GitHub narrowly
 
 Begin with a manually submitted task against an allow-listed repository. Then add GitHub issue webhooks, short-lived narrowly scoped installation credentials, branch creation, and draft pull-request creation. Verify webhook signatures and make repeated delivery idempotent. Include validation summaries and failure limitations in the pull request. Keep merging manual.
 
-### 6. Build evaluation and observability
+### 5. Build evaluation and observability
 
 Create a small, versioned benchmark of well-scoped issues with known expected behavior, then grow it toward the proposed 30–50 tasks. Record model/prompt/tool versions, test outcomes, regressions, human acceptance, cost, and elapsed time. Publish sample sizes and limitations; do not infer improvements from a few hand-picked successes. Add structured logs, traces, and metrics for task/attempt lifecycle, model usage, tool calls, and validation results.
 
-### 7. Polish after the workflow works
+### 6. Polish after the workflow works
 
 Only then add a simple status/log/diff/results view, deployment, and a demo. Keep architecture diagrams, setup steps, security assumptions, example runs, evaluation results, and known limitations current. Avoid Kubernetes, a vector database, multiple coding agents, and broad language support unless evidence shows they solve a real problem.
 
@@ -187,19 +247,20 @@ The source brief gives a strong direction, but leaves choices that affect implem
 
 - **Who submits tasks?** Start with the local REST API and one operator. Add authentication/authorization before exposing it beyond localhost or a trusted development network.
 - **Which repository is the first target?** Pick a small, disposable Kotlin/JVM sample repo with deterministic tests. Avoid proprietary or production repositories in the first evaluation set.
-- **Which model/provider?** The brief names Anthropic Claude. Select the first provider and a spend ceiling together; keep the code behind a provider interface for later comparisons.
+- **Which model/provider?** The first adapter targets local Ollama by user choice, behind a provider interface. Select the local model after checking available RAM/GPU and test tool-call quality on a small benchmark. Revisit hosted providers only with an explicit usage budget.
 - **How should builds access dependencies?** A fully offline sandbox is safer, but many builds need dependency downloads. Decide on a controlled artifact cache/proxy or an explicit network allowlist before enabling execution.
 - **How should GitHub authenticate?** Prefer a GitHub App with installation-scoped permissions and short-lived credentials. Keep repository allowlisting and draft PRs as defaults.
 - **Which language is in scope?** Start with one Kotlin/JVM repository and its existing build/test commands. Add language support only when the first workflow is measurable.
 - **What counts as success?** Define benchmark task selection, acceptance checks, regression checks, human review outcomes, and how cost/latency are calculated before publishing scores.
 
-These choices can be discussed while modeling attempts and recovery; they do not need to block that next slice.
+These choices can be discussed while implementing the worker; they do not need to block the attempt/report foundation.
 ## Status and handoff for the next coding session
 
-- The next useful implementation slice is **per-attempt records and retry metadata**, then a recoverable worker. Status transitions and history are implemented.
-- Automated tests cover the complete transition matrix and HTTP/database behavior. Run `mvnw test` after loading `DB_PASSWORD` from `.env` into the process environment.
+- Ollama was selected as the first model backend. The provider contract and HTTP adapter have mock-HTTP coverage. A live smoke task against a disposable Maven repository is in progress; review the task/attempt outcome before claiming model quality is proven.
+- The scheduled single-process worker, tool allowlist, temporary repository workspace, Docker Maven/PostgreSQL validator, and structured attempt reports are implemented. Immediate next steps: finish a successful end-to-end model patch, run `mvnw clean verify` and fix any coverage gaps, then improve crash recovery, observability, supported build systems, and dependency-cache setup.
+- Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces 100% line and branch coverage for measured application code; the HTML report is generated under `target/site/jacoco`.
 - PostgreSQL 18.6 databases `coding_agent_platform` and `coding_agent_platform_test` plus limited login `coding_agent_app` are configured locally. The app role password is in the ignored project `.env`; the administrator password is not used by the app.
-- The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. The lifecycle suite passed against the isolated PostgreSQL test database (8 tests, 0 failures).
+- The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. The isolated PostgreSQL test database is migrated through V4 for attempts.
 - A prior shell lookup resolved `java` to Oracle's `java8path` shim. The IntelliJ JBR at `C:\Program Files\JetBrains\IntelliJ IDEA 2026.1\jbr` ran Maven as Java 25, compiling for the project's Java 21 target. Configure IntelliJ's Maven Runner JRE explicitly.
 - A previous debug-port collision was reported on `5005`. The Maven plugin now has `<debug>false</debug>` configured; reload the Maven project after pulling this change. If JDWP still appears, inspect IntelliJ's run configuration for an explicit `-agentlib:jdwp` VM option.
 

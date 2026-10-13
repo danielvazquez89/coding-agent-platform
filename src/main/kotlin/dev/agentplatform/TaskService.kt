@@ -4,12 +4,31 @@ import jakarta.enterprise.context.ApplicationScoped
 import jakarta.transaction.Transactional
 import java.time.Instant
 import java.util.UUID
+import io.quarkus.panache.common.Sort
+import jakarta.persistence.LockModeType
 
 @ApplicationScoped
 class TaskService(
     private val taskRepository: TaskRepository,
     private val transitionRepository: TaskStatusTransitionRepository
-) {
+) : TaskExecutionState {
+
+    @Transactional
+    override fun claimNextQueued(): CodingTask? {
+        val task = taskRepository.find("status", Sort.ascending("createdAt"), TaskStatus.QUEUED)
+            .withLock(LockModeType.PESSIMISTIC_WRITE)
+            .firstResult() ?: return null
+        markRunning(task)
+        return task
+    }
+
+    @Transactional
+    override fun claim(id: UUID): CodingTask? {
+        val task = taskRepository.findForUpdate(id) ?: return null
+        if (task.status != TaskStatus.QUEUED) return null
+        markRunning(task)
+        return task
+    }
 
     @Transactional
     fun create(request: CreateTaskRequest): CodingTask {
@@ -37,10 +56,10 @@ class TaskService(
 
     fun findAll(): List<CodingTask> = taskRepository.listNewestFirst()
 
-    fun findById(id: UUID): CodingTask? = taskRepository.findById(id)
+    override fun findById(id: UUID): CodingTask? = taskRepository.findById(id)
 
     @Transactional
-    fun transition(id: UUID, target: TaskStatus, reason: String?, actor: String = "API"): CodingTask? {
+    override fun transition(id: UUID, target: TaskStatus, reason: String?, actor: String): CodingTask? {
         val task = taskRepository.findForUpdate(id) ?: return null
         TaskLifecycle.requireAllowed(task.status, target)
 
@@ -57,6 +76,20 @@ class TaskService(
             )
         )
         return task
+    }
+
+    private fun markRunning(task: CodingTask) {
+        task.status = TaskStatus.RUNNING
+        transitionRepository.persist(
+            TaskStatusTransition(
+                taskId = task.id,
+                sequenceNumber = transitionRepository.nextSequenceNumber(task.id),
+                fromStatus = TaskStatus.QUEUED,
+                toStatus = TaskStatus.RUNNING,
+                reason = "Claimed by execution worker",
+                actor = "WORKER"
+            )
+        )
     }
 
     fun history(id: UUID): List<TaskStatusTransitionResponse> =
