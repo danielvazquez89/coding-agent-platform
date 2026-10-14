@@ -51,36 +51,87 @@ QUEUED → RUNNING → VALIDATING → COMPLETED
 
 `COMPLETED`, `FAILED`, and `CANCELLED` are terminal. Invalid and repeated transitions are rejected without changing task state or writing history.
 
-### Code map
+### Architecture and code map
 
-- `src/main/kotlin/dev/agentplatform/TaskModels.kt` — create-task request and status enum.
-- `src/main/kotlin/dev/agentplatform/TaskResource.kt` — REST routes and basic input checks.
-- `src/main/kotlin/dev/agentplatform/TaskService.kt` — task use cases and transactional persistence operations.
-- `src/main/kotlin/dev/agentplatform/TaskLifecycle.kt` — allowed-transition policy and invalid-transition error.
-- `src/main/kotlin/dev/agentplatform/TaskRepository.kt` — PostgreSQL repository backed by Hibernate ORM with Panache.
-- `src/main/kotlin/dev/agentplatform/TaskStatusTransitionRepository.kt` — ordered task history persistence.
-- `src/main/kotlin/dev/agentplatform/CodingTask.kt` — persisted task entity and ordered acceptance criteria.
-- `src/main/kotlin/dev/agentplatform/TaskStatusTransition.kt` — append-only status history entity.
-- `src/main/kotlin/dev/agentplatform/TaskAttempt.kt` — persisted attempt and attempt status.
-- `src/main/kotlin/dev/agentplatform/TaskAttemptService.kt` — attempt lifecycle and report serialization for worker use and read APIs.
-- `src/main/kotlin/dev/agentplatform/TaskAttemptRepository.kt` — ordered attempt persistence.
-- `src/main/kotlin/dev/agentplatform/CodingModelProvider.kt` — provider-neutral model messages, tool definitions, tool calls, and turns.
-- `src/main/kotlin/dev/agentplatform/OllamaCodingModelProvider.kt` — Ollama `/api/chat` adapter; no repository tools are executed by this class.
-- `src/main/kotlin/dev/agentplatform/TaskExecutionWorker.kt` — scheduled task claim, bounded model/tool loop, report generation, and terminal-state handling.
-- `src/main/kotlin/dev/agentplatform/WorkspaceToolExecutor.kt` — path-checked repository inspection, patch application, and validation tool boundary.
-- `src/main/kotlin/dev/agentplatform/GitRepositoryWorkspaceFactory.kt` — authorized local/GitHub repository copy into an isolated temporary workspace and diff collection.
-- `src/main/kotlin/dev/agentplatform/DockerValidationRunner.kt` — disposable Docker Maven/PostgreSQL validation runtime.
-- `src/main/kotlin/dev/agentplatform/LocalCommandExecutor.kt` — argument-vector process runner with bounded output and timeouts.
-- `src/main/resources/application.properties` — app name and HTTP port (`8081`).
+The codebase follows a **hexagonal (ports-and-adapters) architecture** with four layers. Dependencies point inward: infrastructure and API depend on domain and application, but domain has no outward dependencies.
+
+```text
+┌──────────────────────────────────────────────────────────┐
+│                        api                               │
+│   REST resources, DTOs, input validation                 │
+├──────────────────────────────────────────────────────────┤
+│                    application                           │
+│   Use-case services, orchestration, worker loop          │
+├──────────────────────────────────────────────────────────┤
+│                      domain                              │
+│   Entities, value objects, lifecycle policy, ports (SPI) │
+├──────────────────────────────────────────────────────────┤
+│                   infrastructure                         │
+│   Persistence, Ollama HTTP, Git workspaces, Docker,      │
+│   process execution, tool execution                      │
+└──────────────────────────────────────────────────────────┘
+```
+
+#### `dev.agentplatform.api` — Inbound adapters (REST)
+
+- `api/TaskResource.kt` — REST routes, input validation, HTTP status codes.
+- `api/dto/TaskDtos.kt` — API data transfer objects: `CreateTaskRequest`, `TransitionTaskRequest`, `TaskStatusTransitionResponse`, `TaskAttemptResponse`, `ApiError`.
+
+#### `dev.agentplatform.domain` — Core business logic (no framework dependencies)
+
+- `domain/model/CodingTask.kt` — Task entity with UUID, timestamps, and ordered acceptance criteria.
+- `domain/model/TaskStatus.kt` — `TaskStatus` enum (`QUEUED`, `RUNNING`, `VALIDATING`, `COMPLETED`, `FAILED`, `CANCELLED`).
+- `domain/model/TaskStatusTransition.kt` — Append-only status history entity.
+- `domain/model/TaskLifecycle.kt` — State machine policy: allowed transitions and `InvalidTaskTransitionException`.
+- `domain/model/TaskAttempt.kt` — Attempt entity and `AttemptStatus` enum.
+- `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `AgentDecision`, `AgentQuestion`, `ValidationCheck`, `CheckOutcome`.
+- `domain/port/CodingModelProvider.kt` — Provider-neutral LLM chat/tool-calling SPI (messages, tool definitions, tool calls, turns).
+- `domain/port/ExecutionPorts.kt` — Outbound port interfaces: `TaskExecutionState`, `AttemptOperations`, `RepositoryWorkspaceFactory`, `RepositoryWorkspace`, `CommandExecutor`, `CommandResult`, `ValidationRunner`, `ToolExecutionResult`.
+
+#### `dev.agentplatform.application` — Use cases and orchestration
+
+- `application/service/TaskService.kt` — Task CRUD and transition use cases; implements `TaskExecutionState` port.
+- `application/service/TaskAttemptService.kt` — Attempt lifecycle, report serialization; implements `AttemptOperations` port.
+- `application/worker/TaskExecutionWorker.kt` — Scheduled task claim, bounded model/tool reasoning loop, report generation.
+- `application/worker/TaskExecutionFinalizer.kt` — Terminal attempt and task state updates after execution.
+
+#### `dev.agentplatform.infrastructure` — Outbound adapters (frameworks, I/O)
+
+- `infrastructure/persistence/TaskRepository.kt` — Panache repository for `CodingTask`.
+- `infrastructure/persistence/TaskAttemptRepository.kt` — Panache repository for `TaskAttempt`.
+- `infrastructure/persistence/TaskStatusTransitionRepository.kt` — Panache repository for ordered status history.
+- `infrastructure/ollama/OllamaCodingModelProvider.kt` — Ollama `/api/chat` HTTP adapter; implements `CodingModelProvider`.
+- `infrastructure/workspace/GitRepositoryWorkspaceFactory.kt` — Authorized local/GitHub repository cloning into isolated workspaces; implements `RepositoryWorkspaceFactory`.
+- `infrastructure/tool/WorkspaceToolExecutor.kt` — Path-checked, allowlisted tool execution for the model loop.
+- `infrastructure/docker/DockerValidationRunner.kt` — Disposable Docker Maven/PostgreSQL validation runtime; implements `ValidationRunner`.
+- `infrastructure/process/LocalCommandExecutor.kt` — Argument-vector process runner with bounded output and timeouts; implements `CommandExecutor`.
+
+#### Resources and build
+
+- `src/main/resources/application.properties` — App name, HTTP port (`8081`), database configuration.
 - `src/main/resources/db/migration/` — Flyway-managed PostgreSQL schema migrations (V1 tasks, V2 status history, V3 attempts, V4 one-running-attempt constraint).
-- `src/test/kotlin/dev/agentplatform/` — lifecycle policy and Quarkus REST/PostgreSQL integration tests; JaCoCo coverage is enforced during `verify`.
 - `pom.xml` — Maven build, Kotlin compiler, Quarkus platform and extensions. The Quarkus Maven plugin is configured to disable its default dev-mode debugger; the project has had a conflict on debugger port `5005`.
+
+#### Tests (mirror the main source structure under `src/test/kotlin/dev/agentplatform/`)
+
+- `api/TaskResourceTest.kt` — Quarkus REST and PostgreSQL integration tests.
+- `domain/model/TaskLifecycleTest.kt` — State machine transition-policy unit tests.
+- `application/service/TaskServiceTest.kt` — Task service integration tests.
+- `application/service/TaskAttemptTest.kt` — Attempt lifecycle tests.
+- `application/worker/TaskExecutionWorkerTest.kt` — Worker and model/tool loop tests.
+- `application/worker/TaskExecutionFinalizerTest.kt` — Finalizer state-update tests.
+- `infrastructure/ollama/OllamaCodingModelProviderTest.kt` — Ollama adapter mock-HTTP tests.
+- `infrastructure/workspace/GitRepositoryWorkspaceFactoryTest.kt` — Workspace cloning and safety tests.
+- `infrastructure/tool/WorkspaceToolExecutorTest.kt` — Path and patch safety tests.
+- `infrastructure/docker/DockerValidationRunnerTest.kt` — Docker runner tests.
+- `infrastructure/process/LocalCommandExecutorTest.kt` — Process execution tests.
+- `infrastructure/process/CommandFixture.kt` — Test helper for command execution.
 
 Task data, status history, attempts, and attempt reports are durable in PostgreSQL. Flyway creates and evolves the schema; Hibernate validates the mapped schema at startup rather than creating tables implicitly. Reports are stored as JSON text for now; normalize or index report fields when actual query needs are known.
 
 ## Open in IntelliJ IDEA
 
-1. Open `C:\Users\danie\IdeaProjects\coding-agent-platform` with **File → Open**.
+1. Open `C:\\Users\\danie\\IdeaProjects\\coding-agent-platform` with **File → Open**.
 2. Use the Maven wrapper in **Settings → Build Tools → Maven** and set the Maven Runner JRE to JDK 21 or newer. The installed IntelliJ JBR is suitable.
 3. Reload the Maven project after changing `pom.xml` so IntelliJ picks up the Quarkus plugin configuration.
 
@@ -199,7 +250,7 @@ Treat these as architecture guidance, not commitments to add every component now
 
 Given an authorized repository and a task with acceptance criteria, the agent should inspect relevant code, identify related tests, make a focused patch in an isolated working copy, add or update tests when needed, run relevant validation, and return a reviewable report. The report explains what changed, why important implementation choices were made, alternatives considered where useful, unresolved questions, changed files, and the actual validation outcomes. If an unresolved question blocks safe progress, the attempt should finish as `NEEDS_INPUT` with the question and its impact; it must not claim completion. A failed or unavailable check must be reported as such, never as a pass.
 
-“Completed” means execution produced a patch and an honest validation report. It does not mean the patch was approved, merged, or deployed. Keep human review as the gate for later pull-request or release actions.
+"Completed" means execution produced a patch and an honest validation report. It does not mean the patch was approved, merged, or deployed. Keep human review as the gate for later pull-request or release actions.
 
 ## Recommended roadmap
 
@@ -261,7 +312,7 @@ These choices can be discussed while implementing the worker; they do not need t
 - Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces 100% line and branch coverage for measured application code; the HTML report is generated under `target/site/jacoco`.
 - PostgreSQL 18.6 databases `coding_agent_platform` and `coding_agent_platform_test` plus limited login `coding_agent_app` are configured locally. The app role password is in the ignored project `.env`; the administrator password is not used by the app.
 - The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. The isolated PostgreSQL test database is migrated through V4 for attempts.
-- A prior shell lookup resolved `java` to Oracle's `java8path` shim. The IntelliJ JBR at `C:\Program Files\JetBrains\IntelliJ IDEA 2026.1\jbr` ran Maven as Java 25, compiling for the project's Java 21 target. Configure IntelliJ's Maven Runner JRE explicitly.
+- A prior shell lookup resolved `java` to Oracle's `java8path` shim. The IntelliJ JBR at `C:\\Program Files\JetBrains\IntelliJ IDEA 2026.1\jbr` ran Maven as Java 25, compiling for the project's Java 21 target. Configure IntelliJ's Maven Runner JRE explicitly.
 - A previous debug-port collision was reported on `5005`. The Maven plugin now has `<debug>false</debug>` configured; reload the Maven project after pulling this change. If JDWP still appears, inspect IntelliJ's run configuration for an explicit `-agentlib:jdwp` VM option.
 
 ## Technology
@@ -271,5 +322,3 @@ These choices can be discussed while implementing the worker; they do not need t
 - REST with Jackson
 - Maven wrapper (Maven 3.9.16)
 - Java bytecode target 21
-
-
