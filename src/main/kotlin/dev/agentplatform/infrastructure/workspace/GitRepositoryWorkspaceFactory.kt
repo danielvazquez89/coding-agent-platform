@@ -5,6 +5,7 @@ import dev.agentplatform.domain.port.RepositoryWorkspace
 import dev.agentplatform.domain.port.RepositoryWorkspaceFactory
 import jakarta.enterprise.context.ApplicationScoped
 import org.eclipse.microprofile.config.inject.ConfigProperty
+import org.jboss.logging.Logger
 import java.io.IOException
 import java.nio.charset.StandardCharsets
 import java.nio.file.FileVisitResult
@@ -23,12 +24,18 @@ class GitRepositoryWorkspaceFactory(
     @ConfigProperty(name = "agent.execution.workspace-root", defaultValue = "\${java.io.tmpdir}/coding-agent-platform/workspaces")
     private val configuredWorkspaceRoot: String
 ) : RepositoryWorkspaceFactory {
+
+    private val log = Logger.getLogger(GitRepositoryWorkspaceFactory::class.java)
+
     override fun open(repositoryUrl: String): RepositoryWorkspace {
         require(repositoryUrl.isNotBlank()) { "A repository URL or local path is required" }
+        log.infof("Opening workspace for repository: %s", repositoryUrl)
         val source = validateSource(repositoryUrl)
+        log.infof("Validated repository source: %s (%s)", source.value, source.javaClass.simpleName)
         val workspaceRoot = Path.of(configuredWorkspaceRoot).toAbsolutePath().normalize()
         Files.createDirectories(workspaceRoot)
         val cloneDirectory = Files.createTempDirectory(workspaceRoot, "attempt-")
+        log.infof("Created workspace clone directory: %s", cloneDirectory)
         try {
             if (source is RepositorySource.Local) {
                 copyLocalRepository(Path.of(source.value), cloneDirectory)
@@ -43,13 +50,20 @@ class GitRepositoryWorkspaceFactory(
                 check(!result.timedOut && result.exitCode == 0) {
                     "Could not clone repository: ${result.output.take(2000).ifBlank { "git exited with ${result.exitCode}" }}"
                 }
+                runGit(
+                    listOf("git", "config", "core.autocrlf", "false"),
+                    cloneDirectory,
+                    mapOf("GIT_CONFIG_NOSYSTEM" to "1", "GIT_TERMINAL_PROMPT" to "0")
+                )
             }
             val verification = commands.run(listOf("git", "rev-parse", "--is-inside-work-tree"), cloneDirectory)
             check(verification.exitCode == 0 && verification.output.trim() == "true") {
                 "Cloned directory is not a Git working tree"
             }
+            log.infof("Workspace ready at: %s", cloneDirectory)
             return GitRepositoryWorkspace(cloneDirectory, commands)
         } catch (failure: Exception) {
+            log.errorf(failure, "Failed to prepare workspace from %s in %s", repositoryUrl, cloneDirectory)
             deleteTree(cloneDirectory)
             throw failure
         }
@@ -71,19 +85,57 @@ class GitRepositoryWorkspaceFactory(
             }
             return RepositorySource.Remote(uri.toASCIIString().trimEnd('/'))
         }
+
+        // Local repository path validation with diagnostic logging
         val root = allowedLocalRoot.takeIf(String::isNotBlank)?.let { Path.of(it).toAbsolutePath().normalize() }
-            ?: throw IllegalArgumentException("Local repositories are disabled; configure agent.execution.allowed-local-root")
-        val path = try { Path.of(input).toAbsolutePath().normalize() } catch (_: RuntimeException) {
-            throw IllegalArgumentException("Local repository path is invalid")
+            ?: throw IllegalArgumentException(
+                "Local repositories are disabled; configure agent.execution.allowed-local-root " +
+                "(current value is empty; set AGENT_ALLOWED_LOCAL_ROOT environment variable or " +
+                "agent.execution.allowed-local-root in application.properties)"
+            )
+        log.debugf("Allowed local root resolved to: %s", root)
+
+        val path = try { Path.of(input).toAbsolutePath().normalize() } catch (e: RuntimeException) {
+            log.errorf("Local repository path '%s' could not be parsed: %s", input, e.message)
+            throw IllegalArgumentException("Local repository path is invalid: ${e.message}")
         }
-        require(path.startsWith(root) && path != root) { "Local repository must be inside the configured allowed root" }
-        require(!Files.isSymbolicLink(path)) { "Local repository path must not be a symbolic link" }
-        require(Files.isDirectory(path) && Files.exists(path.resolve(".git"))) {
-            "Local repository must be an existing Git working tree inside the allowed root"
+        log.debugf("Repository path resolved to: %s", path)
+
+        if (!path.startsWith(root) || path == root) {
+            log.errorf("Repository path '%s' is not inside allowed root '%s'", path, root)
+            throw IllegalArgumentException(
+                "Local repository must be inside the configured allowed root. " +
+                "Path: $path, Allowed root: $root"
+            )
         }
+
+        if (Files.isSymbolicLink(path)) {
+            log.errorf("Repository path '%s' is a symbolic link", path)
+            throw IllegalArgumentException("Local repository path must not be a symbolic link: $path")
+        }
+
+        val isDirectory = Files.isDirectory(path)
+        val hasGitDir = Files.exists(path.resolve(".git"))
+        if (!isDirectory || !hasGitDir) {
+            log.errorf(
+                "Repository path '%s' failed git working tree check: isDirectory=%s, .git exists=%s",
+                path, isDirectory, hasGitDir
+            )
+            throw IllegalArgumentException(
+                "Local repository must be an existing Git working tree inside the allowed root. " +
+                "Path: $path, isDirectory=$isDirectory, .git exists=$hasGitDir"
+            )
+        }
+
         val realRoot = root.toRealPath()
         val realPath = path.toRealPath()
-        require(realPath.startsWith(realRoot) && realPath != realRoot) { "Local repository must resolve inside the configured allowed root" }
+        if (!realPath.startsWith(realRoot) || realPath == realRoot) {
+            log.errorf("Real path '%s' escapes real root '%s' (symlink traversal)", realPath, realRoot)
+            throw IllegalArgumentException(
+                "Local repository must resolve inside the configured allowed root. " +
+                "Resolved path: $realPath, Resolved root: $realRoot"
+            )
+        }
         return RepositorySource.Local(realPath.toString())
     }
 
@@ -99,6 +151,7 @@ class GitRepositoryWorkspaceFactory(
         require(!listing.output.endsWith("[output truncated]")) { "Local repository file list exceeds the supported size" }
         val files = listing.output.split('\u0000').filter(String::isNotEmpty).distinct()
         require(files.size <= MAX_LOCAL_FILES) { "Local repository exceeds the $MAX_LOCAL_FILES file limit" }
+        log.infof("Copying %d files from local repository %s", files.size, source)
         for (relative in files) {
             val sourceFile = source.resolve(relative).normalize()
             require(sourceFile.startsWith(source) && !Files.isSymbolicLink(sourceFile)) {
@@ -113,6 +166,7 @@ class GitRepositoryWorkspaceFactory(
             Files.createDirectories(destinationFile.parent)
             Files.copy(sourceFile, destinationFile, StandardCopyOption.REPLACE_EXISTING)
         }
+        log.infof("Copied %d bytes from local repository %s", copiedBytes, source)
     }
 
     private fun isSensitiveFile(relative: String): Boolean {
@@ -133,6 +187,7 @@ class GitRepositoryWorkspaceFactory(
             )
             normalizeTextFilesToLf(root)
             runGit(listOf("git", "init", "--initial-branch=main"), root, environment)
+            runGit(listOf("git", "config", "core.autocrlf", "false"), root, environment)
             runGit(listOf("git", "add", "--all"), root, environment)
             runGit(
                 listOf("git", "-c", "user.name=Coding Agent", "-c", "user.email=agent@localhost.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Workspace baseline"),

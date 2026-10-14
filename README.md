@@ -32,24 +32,28 @@ The engineering challenge is making the workflow dependable and safe, not adding
 
 Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list), and `repositoryUrl` (required for execution). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. A scheduled single-process worker claims queued tasks every two seconds and creates a durable attempt. Task creation currently returns `201` with `QUEUED`; the worker executes asynchronously after persistence.
 
-`CodingModelProvider` defines a provider-independent chat/tool-call contract. `OllamaCodingModelProvider` implements Ollama's `/api/chat` protocol, including structured assistant tool-call history and named tool-result messages, tool schemas, usage counts, timeouts, and bounded error messages. For models that return a JSON tool request in message content instead of Ollama's native `tool_calls`, it normalizes that response only when the requested tool was offered to the model. The adapter is configured with `OLLAMA_BASE_URL` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen2.5-coder:7b`), and `OLLAMA_TIMEOUT_SECONDS` (default `120`). It does not download models.
+`CodingModelProvider` defines a provider-independent chat/tool-call contract. `OllamaCodingModelProvider` implements Ollama's `/api/chat` protocol, including structured assistant tool-call history and named tool-result messages, tool schemas, usage counts, timeouts, and bounded error messages. For models that return a JSON tool request in message content instead of Ollama's native `tool_calls`, it normalizes that response only when the requested tool was offered to the model. The adapter is configured with `OLLAMA_BASE_URL` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen3:8b`), and `OLLAMA_TIMEOUT_SECONDS` (default `1200`). It does not download models.
 
-The current local default is `qwen2.5-coder:7b`. If needed, install it with `ollama pull qwen2.5-coder:7b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL.
+The current local default is `qwen3:8b`. If needed, install it with `ollama pull qwen3:8b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL.
 
-The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repositories must be under `AGENT_ALLOWED_LOCAL_ROOT`; public GitHub HTTPS URLs are also accepted. A task report includes implementation summary, choices and rationale, alternatives, open questions and their impact, changed files, validation outcomes, and patch diff. Attempts can finish as `COMPLETED`, `FAILED`, or `NEEDS_INPUT`; failures retain a bounded summary. A task is completed only when the workspace changed and the supported validation passed.
+The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repositories must be under `AGENT_ALLOWED_LOCAL_ROOT`; public GitHub HTTPS URLs are also accepted. A task report includes implementation summary, choices and rationale, alternatives, open questions and their impact, changed files, validation outcomes, and patch diff. Attempts can finish as `COMPLETED`, `FAILED`, or `NEEDS_INPUT`; failures retain a bounded summary. Patch failures receive up to three bounded correction attempts. A task that makes no repository change is `FAILED` unless the agent identifies a genuine blocking decision; it is not turned into a user question automatically. A task is completed only when the workspace changed and the supported validation passed.
 
 Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and the host Maven artifact cache mounted read-only. It cannot download dependencies: if required artifacts are missing from the cache, validation fails or is skipped. Gradle, other build systems, and network-enabled dependency resolution are not supported yet.
 
 Allowed transitions:
 
 ```text
-QUEUED → RUNNING → VALIDATING → COMPLETED
-   │         │             ├──→ FAILED
-   │         └──→ FAILED   └──→ CANCELLED
+QUEUED ──→ RUNNING ──→ VALIDATING ──→ COMPLETED
+   │          │              ├──→ FAILED
+   │          │              ├──→ NEEDS_INPUT
+   │          │              └──→ CANCELLED
+   │          ├──→ FAILED
+   │          ├──→ NEEDS_INPUT
+   │          └──→ CANCELLED
    └──→ CANCELLED
 ```
 
-`COMPLETED`, `FAILED`, and `CANCELLED` are terminal. Invalid and repeated transitions are rejected without changing task state or writing history.
+`COMPLETED`, `FAILED`, `NEEDS_INPUT`, and `CANCELLED` are terminal. Invalid and repeated transitions are rejected without changing task state or writing history.
 
 ### Architecture and code map
 
@@ -80,7 +84,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 #### `dev.agentplatform.domain` — Core business logic (no framework dependencies)
 
 - `domain/model/CodingTask.kt` — Task entity with UUID, timestamps, and ordered acceptance criteria.
-- `domain/model/TaskStatus.kt` — `TaskStatus` enum (`QUEUED`, `RUNNING`, `VALIDATING`, `COMPLETED`, `FAILED`, `CANCELLED`).
+- `domain/model/TaskStatus.kt` — `TaskStatus` enum (`QUEUED`, `RUNNING`, `VALIDATING`, `COMPLETED`, `FAILED`, `NEEDS_INPUT`, `CANCELLED`).
 - `domain/model/TaskStatusTransition.kt` — Append-only status history entity.
 - `domain/model/TaskLifecycle.kt` — State machine policy: allowed transitions and `InvalidTaskTransitionException`.
 - `domain/model/TaskAttempt.kt` — Attempt entity and `AttemptStatus` enum.

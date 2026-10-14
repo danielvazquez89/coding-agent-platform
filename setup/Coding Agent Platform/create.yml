@@ -11,13 +11,11 @@ http:
     data: |-
       {
           "title": "Update greeting plus regression test, final smoke",
-        "description": "In Greeting.java, change the returned string from Hello to Hello from Qwen. In GreetingTest.java, update its expected string to Hello from Qwen. Do not change anything else. Read both files, apply a complete unified diff, and run Maven validation.",
+        "description": "In TaskResource.kt, add a comment saying // Hello at the top of the file.",
         "acceptanceCriteria": [
-          "Greeting.message returns Hello from Qwen",
-          "GreetingTest expects Hello from Qwen",
-          "Maven tests pass"
+          "TaskResource.kt has // Hello comment addition"
         ],
-          "repositoryUrl": "C:\\Users\\danie\\IdeaProjects\\coding-agent-platform\\target\\agent-smoke-repo"
+          "repositoryUrl": "C:\\Users\\danie\\IdeaProjects\\coding-agent-platform\\src\\main\\kotlin\\dev\\agentplatform\\api"
       }
   auth: inherit
 

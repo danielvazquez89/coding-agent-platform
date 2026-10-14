@@ -158,7 +158,7 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
-    fun `offers one corrected patch attempt after git rejects the first diff`() {
+    fun `retries rejected patches and completes when a corrected diff applies`() {
         val task = task()
         val attempts = FakeAttempts()
         Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
@@ -173,6 +173,8 @@ class TaskExecutionWorkerTest {
         val provider = ScriptedProvider(
             ModelTurn(null, listOf(call("apply_patch", """{"patch":"not a diff"}""")), "tool_calls", null, null),
             ModelTurn("The first patch was malformed.", emptyList(), "stop", null, null),
+            ModelTurn(null, listOf(call("apply_patch", """{"patch":"still not a diff"}""")), "tool_calls", null, null),
+            ModelTurn("The second patch was malformed.", emptyList(), "stop", null, null),
             ModelTurn(
                 null,
                 listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to validPatch)))),
@@ -191,7 +193,37 @@ class TaskExecutionWorkerTest {
 
         assertEquals("Hello from Qwen\n", Files.readString(temporary.resolve("Greeting.java")))
         assertTrue(provider.messages.any { it.role == "user" && it.content.contains("complete git-compatible unified diff") })
+        assertEquals(2, provider.messages.count { it.role == "user" && it.content.contains("Your apply_patch tool call failed") })
         assertEquals(TaskStatus.COMPLETED, task.status)
+    }
+
+    @Test
+    fun `fails after patch recovery is exhausted instead of asking the user to repair it`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", """{"patch":"bad diff 1"}""")), "tool_calls", null, null),
+            ModelTurn("First patch failed.", emptyList(), "stop", null, null),
+            ModelTurn(null, listOf(call("apply_patch", """{"patch":"bad diff 2"}""")), "tool_calls", null, null),
+            ModelTurn("Second patch failed.", emptyList(), "stop", null, null),
+            ModelTurn(null, listOf(call("apply_patch", """{"patch":"bad diff 3"}""")), "tool_calls", null, null),
+            ModelTurn("Third patch failed.", emptyList(), "stop", null, null),
+            ModelTurn(null, listOf(call("apply_patch", """{"patch":"bad diff 4"}""")), "tool_calls", null, null),
+            ModelTurn("Fourth patch failed.", emptyList(), "stop", null, null),
+            ModelTurn("I cannot apply this patch.", emptyList(), "stop", null, null),
+            ModelTurn("I still cannot apply this patch.", emptyList(), "stop", null, null),
+            ModelTurn("""{"summary":"Unable to apply patch","implementation":"The patch could not be applied."}""", emptyList(), "stop", null, null)
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, emptyList())).execute(task.id)
+
+        assertEquals(TaskStatus.FAILED, task.status)
+        assertEquals(AttemptStatus.FAILED, attempts.finished?.status)
+        assertEquals("The agent did not produce a repository change", attempts.finished?.errorSummary)
+        assertTrue(attempts.finishedReport!!.openQuestions.isEmpty())
+        assertEquals(3, provider.messages.count { it.role == "user" && it.content.contains("Your apply_patch tool call failed") })
+        assertTrue(attempts.finishedReport!!.implementation.contains("Patch application still failed"))
     }
 
     @Test
@@ -268,8 +300,8 @@ class TaskExecutionWorkerTest {
         )
         val rejectedWorker = worker(FakeState(rejected), rejectedAttempts, rejectedProvider, FakeWorkspace(temporary, emptyList()))
         rejectedWorker.execute(rejected.id)
-        assertEquals(TaskStatus.NEEDS_INPUT, rejected.status)
-        assertTrue(rejectedAttempts.finishedReport!!.openQuestions.single().blocking)
+        assertEquals(TaskStatus.FAILED, rejected.status)
+        assertTrue(rejectedAttempts.finishedReport!!.openQuestions.isEmpty())
         assertTrue(rejectedProvider.messages.last().content.contains("not in the allowlist"))
 
         val overBudget = task()

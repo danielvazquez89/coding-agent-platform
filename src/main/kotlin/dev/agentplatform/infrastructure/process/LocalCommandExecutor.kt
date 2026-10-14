@@ -6,6 +6,7 @@ import jakarta.enterprise.context.ApplicationScoped
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.nio.charset.StandardCharsets
+import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
 import java.util.concurrent.CompletableFuture
@@ -24,12 +25,15 @@ class LocalCommandExecutor : CommandExecutor {
         require(command.isNotEmpty() && command.none(String::isBlank)) { "Command must contain non-blank arguments" }
         require(!timeout.isNegative && !timeout.isZero) { "Command timeout must be positive" }
         require(maxOutputChars > 0) { "Output limit must be positive" }
-        val builder = ProcessBuilder(command).redirectErrorStream(true)
+        val javaArgumentFile = createJavaArgumentFileIfNeeded(command)
+        val processCommand = if (javaArgumentFile == null) command else listOf(command.first(), "@$javaArgumentFile")
+        val builder = ProcessBuilder(processCommand).redirectErrorStream(true)
         if (workingDirectory != null) builder.directory(workingDirectory.toFile())
         builder.environment().putAll(environment)
         val process = try {
             builder.start()
         } catch (exception: IOException) {
+            javaArgumentFile?.let { deleteArgumentFile(it, exception) }
             throw IllegalStateException("Could not start command '${command.first()}': ${exception.message}", exception)
         }
         val output = CompletableFuture.supplyAsync {
@@ -54,6 +58,39 @@ class LocalCommandExecutor : CommandExecutor {
             throw IllegalStateException("Command execution was interrupted", exception)
         } finally {
             if (process.isAlive) process.destroyForcibly()
+            javaArgumentFile?.let { Files.deleteIfExists(it) }
+        }
+    }
+
+    private fun createJavaArgumentFileIfNeeded(command: List<String>): Path? {
+        val executableName = Path.of(command.first()).fileName.toString()
+        if (!System.getProperty("os.name").startsWith("Windows", ignoreCase = true) ||
+            (!executableName.equals("java.exe", ignoreCase = true) && !executableName.equals("java", ignoreCase = true)) ||
+            command.sumOf { it.length + 1 } <= WINDOWS_COMMAND_LENGTH_LIMIT
+        ) {
+            return null
+        }
+
+        val argumentFile = Files.createTempFile("agent-java-", ".args")
+        try {
+            val contents = command.drop(1).joinToString(System.lineSeparator()) { it.toJavaArgumentFileEntry() } +
+                System.lineSeparator()
+            Files.writeString(argumentFile, contents, StandardCharsets.UTF_8)
+            return argumentFile
+        } catch (failure: IOException) {
+            deleteArgumentFile(argumentFile, failure)
+            throw IllegalStateException("Could not prepare Java argument file: ${failure.message}", failure)
+        }
+    }
+
+    private fun String.toJavaArgumentFileEntry(): String =
+        "\"" + replace("\\", "\\\\").replace("\"", "\\\"") + "\""
+
+    private fun deleteArgumentFile(path: Path, failure: Throwable) {
+        try {
+            Files.deleteIfExists(path)
+        } catch (cleanupFailure: IOException) {
+            failure.addSuppressed(cleanupFailure)
         }
     }
 
@@ -78,5 +115,9 @@ class LocalCommandExecutor : CommandExecutor {
         }
         val text = bytes.toString(StandardCharsets.UTF_8)
         return if (truncated) text + "\n[output truncated]" else text
+    }
+
+    private companion object {
+        const val WINDOWS_COMMAND_LENGTH_LIMIT = 30_000
     }
 }

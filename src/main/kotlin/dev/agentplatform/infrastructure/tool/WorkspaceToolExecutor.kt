@@ -90,9 +90,9 @@ class WorkspaceToolExecutor(
             .distinct().toList()
         require(paths.isNotEmpty() && paths.size <= PATCH_FILE_LIMIT) { "Patch must change between 1 and $PATCH_FILE_LIMIT files" }
         paths.forEach { relative -> resolve(workspace, relative) }
-        val applyCommand = listOf("git", "apply", "--recount", "--whitespace=nowarn", "-")
+        val applyCommand = listOf("git", "-c", "core.autocrlf=false", "apply", "--recount", "--whitespace=nowarn", "-")
         val check = commands.run(
-            listOf("git", "apply", "--check", "--recount", "--whitespace=nowarn", "-"),
+            listOf("git", "-c", "core.autocrlf=false", "apply", "--check", "--recount", "--whitespace=nowarn", "-"),
             workspace,
             normalized,
             timeout = Duration.ofSeconds(20),

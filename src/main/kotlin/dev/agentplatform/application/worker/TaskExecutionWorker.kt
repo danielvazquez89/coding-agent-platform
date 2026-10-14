@@ -64,17 +64,23 @@ class TaskExecutionWorker(
     }
 
     private fun executeClaimed(task: CodingTask) {
+        log.infof("Task %s starting execution: title='%s', repositoryUrl='%s'",
+            task.id, task.title.take(120), task.repositoryUrl ?: "(none)")
         val attempt = attempts.start(task.id)
         if (attempt == null) {
+            log.errorf("Task %s could not create an execution attempt", task.id)
             taskState.transition(task.id, TaskStatus.FAILED, "Could not create an execution attempt", "WORKER")
             return
         }
+        log.infof("Task %s attempt %s created", task.id, attempt.id)
         var workspace: RepositoryWorkspace? = null
         val validation = mutableListOf<ValidationCheck>()
         try {
             val repositoryUrl = task.repositoryUrl
             if (repositoryUrl.isNullOrBlank()) throw NeedsInputException("Choose a repository before asking the agent to make a change.")
+            log.infof("Task %s opening workspace for repository: %s", task.id, repositoryUrl)
             workspace = workspaces.open(repositoryUrl)
+            log.infof("Task %s workspace opened at: %s", task.id, workspace.root)
             val finalText = runModelLoop(task, workspace.root, validation)
             if (validation.isEmpty()) validation += tools.execute("run_validation", objectMapper.createObjectNode(), workspace.root).validation!!
             val changedFiles = workspace.changedFiles()
@@ -83,7 +89,7 @@ class TaskExecutionWorker(
             val lastValidation = validation.lastOrNull()
             val taskStatus = when {
                 blockingQuestions.isNotEmpty() || lastValidation?.outcome == CheckOutcome.SKIPPED -> TaskStatus.NEEDS_INPUT
-                changedFiles.isEmpty() -> TaskStatus.NEEDS_INPUT
+                changedFiles.isEmpty() -> TaskStatus.FAILED
                 lastValidation?.outcome == CheckOutcome.PASSED -> TaskStatus.COMPLETED
                 else -> TaskStatus.FAILED
             }
@@ -91,26 +97,32 @@ class TaskExecutionWorker(
                 TaskStatus.NEEDS_INPUT -> when {
                     blockingQuestions.isNotEmpty() -> "Agent needs a user decision"
                     lastValidation?.outcome == CheckOutcome.SKIPPED -> "No supported validation could run"
-                    else -> "The agent did not produce a repository change"
+                    else -> null
                 }
                 TaskStatus.COMPLETED -> null
-                else -> lastValidation?.details?.take(500) ?: "Agent could not produce a validated result"
+                TaskStatus.FAILED -> when {
+                    changedFiles.isEmpty() -> "The agent did not produce a repository change"
+                    else -> lastValidation?.details?.take(500) ?: "Agent could not produce a validated result"
+                }
+                else -> null
             }
             val questions = when {
                 lastValidation?.outcome == CheckOutcome.SKIPPED && blockingQuestions.isEmpty() -> modelQuestions + AgentQuestion(
                     "Which supported validation should run for this repository?", lastValidation.details.orEmpty(), true
                 )
-                changedFiles.isEmpty() && blockingQuestions.isEmpty() -> modelQuestions + AgentQuestion(
-                    "Should the agent try a different approach to make the requested change?",
-                    "The repository workspace has no changed files, so the task cannot be marked completed.",
-                    true
-                )
                 else -> modelQuestions
             }
             val report = buildReport(task, finalText, workspace, changedFiles, validation, questions, taskStatus)
             if (taskStatus != TaskStatus.NEEDS_INPUT) {
-                taskState.transition(task.id, TaskStatus.VALIDATING, "Agent changes are ready for validation", "WORKER")
+                val validationReason = when {
+                    changedFiles.isEmpty() -> "No repository changes were produced"
+                    taskStatus == TaskStatus.FAILED -> "Agent changes failed validation"
+                    else -> "Agent changes are ready for validation"
+                }
+                taskState.transition(task.id, TaskStatus.VALIDATING, validationReason, "WORKER")
             }
+            log.infof("Task %s attempt %s finishing with taskStatus=%s, changedFiles=%d, validationChecks=%d",
+                task.id, attempt.id, taskStatus, changedFiles.size, validation.size)
             finalizer.finish(
                 task.id,
                 attempt.id,
@@ -124,6 +136,7 @@ class TaskExecutionWorker(
                 reason
             )
         } catch (failure: NeedsInputException) {
+            log.warnf("Task %s attempt %s needs input: %s", task.id, attempt.id, failure.message)
             val report = TaskExecutionReport(
                 summary = "The task needs more information before it can execute.",
                 implementation = failure.message.orEmpty(),
@@ -145,8 +158,16 @@ class TaskExecutionWorker(
             )
             finalizer.finish(task.id, attempt.id, TaskStatus.NEEDS_INPUT, AttemptStatus.NEEDS_INPUT, report, failure.message)
         } catch (failure: Exception) {
+            log.errorf(failure, "Task %s attempt %s failed with exception", task.id, attempt.id)
             val details = failure.message?.take(4000) ?: failure.javaClass.simpleName
-            val files = workspace?.changedFiles().orEmpty()
+            val files = try { workspace?.changedFiles().orEmpty() } catch (e: Exception) {
+                log.warnf(e, "Task %s could not list changed files after failure", task.id)
+                emptyList()
+            }
+            val diff = try { workspace?.patchDiff(MAX_DIFF_CHARS) } catch (e: Exception) {
+                log.warnf(e, "Task %s could not collect diff after failure", task.id)
+                null
+            }
             val report = TaskExecutionReport(
                 summary = "The agent execution failed before it could report a validated change.",
                 implementation = details,
@@ -159,11 +180,15 @@ class TaskExecutionWorker(
                 ),
                 changedFiles = files,
                 validation = validation.toList(),
-                patchDiff = workspace?.patchDiff(MAX_DIFF_CHARS)
+                patchDiff = diff
             )
             finalizer.finish(task.id, attempt.id, TaskStatus.FAILED, AttemptStatus.FAILED, report, details)
         } finally {
-            workspace?.close()
+            try {
+                workspace?.close()
+            } catch (e: Exception) {
+                log.warnf(e, "Task %s failed to clean up workspace", task.id)
+            }
         }
     }
 
@@ -180,18 +205,18 @@ class TaskExecutionWorker(
         var lastToolResult: String? = null
         var patchApplied = false
         var lastModelText: String? = null
-        repeat(maxToolCalls + 4) {
+        repeat(maxToolCalls + MAX_PATCH_FAILURE_RETRIES + 4) {
             val turn = model.chat(messages, definitions)
             log.infof("Task %s model turn returned %d tool call(s)", task.id, turn.toolCalls.size)
             if (turn.toolCalls.isEmpty()) {
                 turn.content?.takeIf(String::isNotBlank)?.let { lastModelText = it }
                 val patchFailure = lastPatchFailure
-                if (patchFailure != null && patchFailureRetries == 0) {
+                if (patchFailure != null && patchFailureRetries < MAX_PATCH_FAILURE_RETRIES) {
                     patchFailureRetries++
                     messages += ModelMessage("assistant", turn.content.orEmpty())
                     messages += ModelMessage(
                         "user",
-                        "Your apply_patch tool call failed: ${patchFailure.take(2000)}. Inspect the reported issue and make one corrected apply_patch call. The patch must be a complete git-compatible unified diff with diff --git, --- and +++ headers and valid hunk ranges; send only the diff in the patch argument without Markdown fences."
+                        "Your apply_patch tool call failed: ${patchFailure.take(2000)}. Inspect the exact target file with read_file if needed, correct the diff, and call apply_patch again. Do not ask the user to repair a patch failure. The patch must be a complete git-compatible unified diff with diff --git, --- and +++ headers and valid hunk ranges; send only the diff in the patch argument without Markdown fences."
                     )
                     lastPatchFailure = null
                     return@repeat
@@ -211,7 +236,16 @@ class TaskExecutionWorker(
                     )
                     return@repeat
                 }
-                return (turn.content?.takeIf(String::isNotBlank) ?: lastModelText).orEmpty().take(MAX_FINAL_TEXT_CHARS)
+                val response = (turn.content?.takeIf(String::isNotBlank) ?: lastModelText).orEmpty()
+                val remainingPatchFailure = lastPatchFailure
+                val finalText = if (remainingPatchFailure == null) response else buildString {
+                    append(response)
+                    append("\n\nPatch application still failed after ")
+                    append(patchFailureRetries)
+                    append(" correction attempts: ")
+                    append(remainingPatchFailure.take(2000))
+                }
+                return finalText.take(MAX_FINAL_TEXT_CHARS)
             }
             val toolResults = mutableListOf<Pair<ModelToolCall, ToolExecutionResult>>()
             for (call in turn.toolCalls) {
@@ -225,6 +259,7 @@ class TaskExecutionWorker(
                         tools.execute(call.name, call.arguments, root)
                     }
                 } catch (failure: Exception) {
+                    log.warnf(failure, "Task %s tool %s threw exception", task.id, call.name)
                     ToolExecutionResult(
                         "Tool failed safely: ${
                             (failure.message ?: failure.javaClass.simpleName).take(
@@ -339,5 +374,6 @@ class TaskExecutionWorker(
         const val MAX_TOOL_RESULT_CHARS = 12_000
         const val MAX_FINAL_TEXT_CHARS = 15_000
         const val MAX_DIFF_CHARS = 30_000
+        const val MAX_PATCH_FAILURE_RETRIES = 3
     }
 }

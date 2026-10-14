@@ -23,9 +23,9 @@ import kotlin.sequences.plus
 class OllamaCodingModelProvider(
     @ConfigProperty(name = "agent.model.ollama.base-url", defaultValue = "http://localhost:11434")
     private val baseUrl: String,
-    @ConfigProperty(name = "agent.model.ollama.model", defaultValue = "qwen2.5-coder:7b")
+    @ConfigProperty(name = "agent.model.ollama.model", defaultValue = "qwen3:8b")
     private val model: String,
-    @ConfigProperty(name = "agent.model.ollama.timeout-seconds", defaultValue = "120")
+    @ConfigProperty(name = "agent.model.ollama.timeout-seconds", defaultValue = "1200")
     private val timeoutSeconds: Long,
     private val objectMapper: ObjectMapper
 ) : CodingModelProvider {
