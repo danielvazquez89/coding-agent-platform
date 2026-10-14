@@ -24,6 +24,23 @@ data class ValidationCheck(
     val durationMillis: Long? = null
 )
 
+enum class AcceptanceOutcome { PASSED, FAILED, UNVERIFIED }
+
+data class AcceptanceCheck(
+    val criterion: String,
+    val outcome: AcceptanceOutcome,
+    val evidence: String? = null
+)
+
+data class ModelUsage(
+    val model: String,
+    val promptTokens: Int?,
+    val completionTokens: Int?,
+    val callCount: Int,
+    val durationMillis: Long,
+    val estimatedCostUsd: Double?
+)
+
 data class TaskExecutionReport(
     val summary: String,
     val implementation: String,
@@ -31,5 +48,9 @@ data class TaskExecutionReport(
     val openQuestions: List<AgentQuestion> = emptyList(),
     val changedFiles: List<String> = emptyList(),
     val validation: List<ValidationCheck> = emptyList(),
-    val patchDiff: String? = null
+    val patchDiff: String? = null,
+    val acceptanceChecks: List<AcceptanceCheck> = emptyList(),
+    val patchFailures: List<String> = emptyList(),
+    val modelUsage: ModelUsage? = null,
+    val executionDurationMillis: Long? = null
 )

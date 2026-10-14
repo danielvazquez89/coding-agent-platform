@@ -2,25 +2,16 @@ package dev.agentplatform.application.service
 
 import dev.agentplatform.api.dto.CreateTaskRequest
 import dev.agentplatform.api.dto.TransitionTaskRequest
-import dev.agentplatform.domain.model.AgentDecision
-import dev.agentplatform.domain.model.AgentQuestion
-import dev.agentplatform.domain.model.AttemptStatus
-import dev.agentplatform.domain.model.CheckOutcome
-import dev.agentplatform.domain.model.TaskExecutionReport
-import dev.agentplatform.domain.model.TaskStatus
-import dev.agentplatform.domain.model.ValidationCheck
+import dev.agentplatform.domain.model.*
 import io.quarkus.test.junit.QuarkusTest
 import io.restassured.RestAssured.given
 import io.restassured.http.ContentType
 import jakarta.inject.Inject
 import org.hamcrest.CoreMatchers.equalTo
 import org.hamcrest.CoreMatchers.notNullValue
-import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertNotNull
-import org.junit.jupiter.api.Assertions.assertNull
-import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
-import java.util.UUID
+import java.util.*
 
 @QuarkusTest
 class TaskAttemptTest {
@@ -59,7 +50,13 @@ class TaskAttemptTest {
             validation = listOf(
                 ValidationCheck("RetryPolicyTest", "./mvnw test", CheckOutcome.PASSED, 0, "All assertions passed", 1280)
             ),
-            patchDiff = "diff --git a/src/main/kotlin/RetryPolicy.kt b/src/main/kotlin/RetryPolicy.kt"
+            patchDiff = "diff --git a/src/main/kotlin/RetryPolicy.kt b/src/main/kotlin/RetryPolicy.kt",
+            acceptanceChecks = listOf(
+                AcceptanceCheck("Retries stop at the configured limit", AcceptanceOutcome.PASSED, "RetryPolicyTest passed")
+            ),
+            patchFailures = listOf("The first diff was rejected; a corrected patch applied."),
+            modelUsage = ModelUsage("qwen3:8b", 1200, 350, 4, 2100, 0.0),
+            executionDurationMillis = 4500
         )
         val finishedFirst = attemptService.finish(taskId, first.id, AttemptStatus.COMPLETED, report)!!
 
@@ -96,6 +93,12 @@ class TaskAttemptTest {
             .body("[0].report.openQuestions[0].impact", equalTo("Provider-specific limits could improve reliability and cost control."))
             .body("[0].report.openQuestions[0].blocking", equalTo(false))
             .body("[0].report.validation[0].outcome", equalTo("PASSED"))
+            .body("[0].report.acceptanceChecks[0].outcome", equalTo("PASSED"))
+            .body("[0].report.acceptanceChecks[0].evidence", equalTo("RetryPolicyTest passed"))
+            .body("[0].report.patchFailures[0]", equalTo("The first diff was rejected; a corrected patch applied."))
+            .body("[0].report.modelUsage.promptTokens", equalTo(1200))
+            .body("[0].report.modelUsage.estimatedCostUsd", notNullValue())
+            .body("[0].report.executionDurationMillis", equalTo(4500))
             .body("[1].attemptNumber", equalTo(2))
             .body("[1].status", equalTo("NEEDS_INPUT"))
 

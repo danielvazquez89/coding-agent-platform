@@ -7,7 +7,7 @@ import dev.agentplatform.domain.port.AttemptOperations
 import dev.agentplatform.domain.port.TaskExecutionState
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.transaction.Transactional
-import java.util.UUID
+import java.util.*
 
 @ApplicationScoped
 class TaskExecutionFinalizer(

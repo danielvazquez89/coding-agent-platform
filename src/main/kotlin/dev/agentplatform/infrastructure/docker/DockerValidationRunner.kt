@@ -10,7 +10,7 @@ import org.eclipse.microprofile.config.inject.ConfigProperty
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
-import java.util.UUID
+import java.util.*
 
 @ApplicationScoped
 class DockerValidationRunner(

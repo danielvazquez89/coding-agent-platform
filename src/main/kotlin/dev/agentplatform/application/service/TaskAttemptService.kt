@@ -12,7 +12,7 @@ import dev.agentplatform.infrastructure.persistence.TaskRepository
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.transaction.Transactional
 import java.time.Instant
-import java.util.UUID
+import java.util.*
 
 @ApplicationScoped
 class TaskAttemptService(

@@ -4,7 +4,7 @@ import dev.agentplatform.domain.model.TaskStatusTransition
 import io.quarkus.hibernate.orm.panache.kotlin.PanacheRepositoryBase
 import io.quarkus.panache.common.Sort
 import jakarta.enterprise.context.ApplicationScoped
-import java.util.UUID
+import java.util.*
 
 @ApplicationScoped
 class TaskStatusTransitionRepository : PanacheRepositoryBase<TaskStatusTransition, UUID> {

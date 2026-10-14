@@ -1,15 +1,12 @@
 package dev.agentplatform.infrastructure.tool
 
-import dev.agentplatform.domain.port.ValidationRunner
-import dev.agentplatform.infrastructure.process.LocalCommandExecutor
-
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.agentplatform.domain.model.CheckOutcome
 import dev.agentplatform.domain.model.ValidationCheck
-import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertThrows
-import org.junit.jupiter.api.Assertions.assertTrue
+import dev.agentplatform.domain.port.ValidationRunner
+import dev.agentplatform.infrastructure.process.LocalCommandExecutor
 import org.junit.jupiter.api.AfterEach
+import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
 import java.nio.file.Files

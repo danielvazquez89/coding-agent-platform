@@ -30,15 +30,17 @@ The engineering challenge is making the workflow dependable and safe, not adding
 | `GET` | `/api/tasks/{id}/attempts` | Return attempts in attempt-number order, with status, report, and failure summary. |
 | `GET` | `/api/tasks/{id}/attempts/{attemptId}` | Return one attempt and its structured execution report. |
 
-Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list), and `repositoryUrl` (required for execution). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. A scheduled single-process worker claims queued tasks every two seconds and creates a durable attempt. Task creation currently returns `201` with `QUEUED`; the worker executes asynchronously after persistence.
+Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list of up to 30 items, each at most 1000 characters), and `repositoryUrl` (required for execution). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. The Quarkus scheduler invokes a single-process worker every two seconds; startup, poll ticks, and successful claims are logged, including whether agent execution is enabled. The worker claims queued tasks and creates a durable attempt. Task creation currently returns `201` with `QUEUED`; the worker executes asynchronously after persistence. `AGENT_EXECUTION_ENABLED=false` leaves polling active but skips task execution; Quarkus scheduler configuration can independently disable all scheduled jobs.
 
 `CodingModelProvider` defines a provider-independent chat/tool-call contract. `OllamaCodingModelProvider` implements Ollama's `/api/chat` protocol, including structured assistant tool-call history and named tool-result messages, tool schemas, usage counts, timeouts, and bounded error messages. For models that return a JSON tool request in message content instead of Ollama's native `tool_calls`, it normalizes that response only when the requested tool was offered to the model. The adapter is configured with `OLLAMA_BASE_URL` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen3:8b`), and `OLLAMA_TIMEOUT_SECONDS` (default `1200`). It does not download models.
 
 The current local default is `qwen3:8b`. If needed, install it with `ollama pull qwen3:8b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL.
 
-The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repositories must be under `AGENT_ALLOWED_LOCAL_ROOT`; public GitHub HTTPS URLs are also accepted. A task report includes implementation summary, choices and rationale, alternatives, open questions and their impact, changed files, validation outcomes, and patch diff. Attempts can finish as `COMPLETED`, `FAILED`, or `NEEDS_INPUT`; failures retain a bounded summary. Patch failures receive up to three bounded correction attempts. A task that makes no repository change is `FAILED` unless the agent identifies a genuine blocking decision; it is not turned into a user question automatically. A task is completed only when the workspace changed and the supported validation passed.
+The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff, validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, and elapsed time. Attempts can finish as `COMPLETED`, `FAILED`, or `NEEDS_INPUT`; failures retain a bounded summary and the report. Patch failures receive up to three bounded correction attempts and are retained even when a later patch succeeds. A task that makes no repository change is `FAILED` unless it needs a genuine blocking decision.
 
-Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and the host Maven artifact cache mounted read-only. It cannot download dependencies: if required artifacts are missing from the cache, validation fails or is skipped. Gradle, other build systems, and network-enabled dependency resolution are not supported yet.
+When acceptance criteria are supplied, the agent must return one evidence-bearing assessment per criterion. Missing or evidence-free checks prevent completion; failed criteria fail the task, and unverified criteria require input. This is a model assessment, not independent proof: Maven tests and benchmark-specific expected-diff checks provide separate machine-verifiable evidence. A task is completed only when the workspace changed, all supplied criteria are reported as passed, and supported validation passed.
+
+Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and the host Maven artifact cache mounted read-only. Repository tests run without external network access. If required artifacts are missing, a separate bounded dependency-fetch container may download only Maven coordinates parsed from the missing-artifact diagnostics into the host cache before the test container is retried offline. Gradle, other build systems, and network-enabled builds are not supported.
 
 Allowed transitions:
 
@@ -88,7 +90,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `domain/model/TaskStatusTransition.kt` — Append-only status history entity.
 - `domain/model/TaskLifecycle.kt` — State machine policy: allowed transitions and `InvalidTaskTransitionException`.
 - `domain/model/TaskAttempt.kt` — Attempt entity and `AttemptStatus` enum.
-- `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `AgentDecision`, `AgentQuestion`, `ValidationCheck`, `CheckOutcome`.
+- `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `AgentDecision`, `AgentQuestion`, `AcceptanceCheck`, `ModelUsage`, `ValidationCheck`, `CheckOutcome`.
 - `domain/port/CodingModelProvider.kt` — Provider-neutral LLM chat/tool-calling SPI (messages, tool definitions, tool calls, turns).
 - `domain/port/ExecutionPorts.kt` — Outbound port interfaces: `TaskExecutionState`, `AttemptOperations`, `RepositoryWorkspaceFactory`, `RepositoryWorkspace`, `CommandExecutor`, `CommandResult`, `ValidationRunner`, `ToolExecutionResult`.
 
@@ -109,6 +111,8 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `infrastructure/tool/WorkspaceToolExecutor.kt` — Path-checked, allowlisted tool execution for the model loop.
 - `infrastructure/docker/DockerValidationRunner.kt` — Disposable Docker Maven/PostgreSQL validation runtime; implements `ValidationRunner`.
 - `infrastructure/process/LocalCommandExecutor.kt` — Argument-vector process runner with bounded output and timeouts; implements `CommandExecutor`.
+- `benchmarks/v1/cases.json` and `benchmarks/v1/Invoke-Benchmark.ps1` — Versioned coding benchmark cases and API-driven evaluator.
+- `scripts/Apply-TaskPatch.ps1` — Export a completed attempt's patch and optionally apply it to a clean local Git worktree.
 
 #### Resources and build
 
@@ -131,7 +135,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `infrastructure/process/LocalCommandExecutorTest.kt` — Process execution tests.
 - `infrastructure/process/CommandFixture.kt` — Test helper for command execution.
 
-Task data, status history, attempts, and attempt reports are durable in PostgreSQL. Flyway creates and evolves the schema; Hibernate validates the mapped schema at startup rather than creating tables implicitly. Reports are stored as JSON text for now; normalize or index report fields when actual query needs are known.
+Task data, status history, attempts, and attempt reports are durable in PostgreSQL. Flyway creates and evolves the schema; Hibernate validates the mapped schema at startup rather than creating tables implicitly. Reports are stored as JSON text and include the generated patch diff, validation details, failure and patch-recovery details, acceptance assessments, and model usage. Estimated costs use optional configured per-million-token rates; they default to zero for local Ollama and are estimates, not provider invoices.
 
 ## Open in IntelliJ IDEA
 
@@ -148,6 +152,25 @@ $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 ```
 
 The app listens on <http://localhost:8081>. Quarkus Dev UI is at <http://localhost:8081/q/dev/>. Stop dev mode with `Ctrl+C`.
+
+### Reviewing and applying a completed patch
+
+The generated diff is stored in PostgreSQL as `report.patchDiff` on the attempt. Retrieve the latest attempt and display its patch with:
+
+```powershell
+$taskId = '00000000-0000-0000-0000-000000000000'
+$attempts = Invoke-RestMethod -Uri "http://localhost:8081/api/tasks/$taskId/attempts"
+$attempt = $attempts | Sort-Object attemptNumber -Descending | Select-Object -First 1
+$attempt.report.patchDiff
+```
+
+To export a selected completed attempt to a patch file and check it against a clean target worktree without changing repository files:
+
+```powershell
+.\scripts\Apply-TaskPatch.ps1 -TaskId $taskId -AttemptId $attempt.id -RepositoryPath 'C:\path\to\your\repository'
+```
+
+Add `-Apply` to apply the patch after the same checks pass. The helper requires a completed task and attempt, all validation checks passed, matching evidence-bearing passing acceptance checks, a clean Git worktree, and a successful `git apply --check`. It exports the patch under the system temporary directory by default. It does not commit, push, create a branch, or open a pull request; inspect and test the applied changes yourself. If the task had no acceptance criteria, there are no criterion checks to verify.
 
 ### PostgreSQL persistence
 
@@ -178,6 +201,18 @@ Remove-Item Env:DB_PASSWORD
 ```
 
 The suite includes transition-policy and REST/database tests, provider protocol tests, worker/report lifecycle tests, path and patch safety tests, repository workspace tests, command execution tests, and Docker-runner tests. `mvnw verify` enforces 100% line and branch coverage for measured application code.
+
+### Repeatable coding benchmark
+
+`benchmarks/v1/cases.json` is a small, versioned benchmark of three deterministic Java/Maven coding tasks against a common fixture. The PowerShell runner creates a Git baseline for the fixture on first use, submits each task through the API, and evaluates task status, Maven validation, reported acceptance checks, expected changed files, expected diff content, elapsed time, token usage, and estimated cost. Each task runs from a fresh workspace copy of that same committed fixture. Results are written to `benchmarks/v1/results-v1.json`.
+
+Before running it:
+
+1. Set `AGENT_ALLOWED_LOCAL_ROOT` to a parent directory containing `benchmarks/v1/fixture`, and set `AGENT_WORKSPACE_ROOT` to a separate workspace directory.
+2. Ensure the host Maven cache contains the fixture's Maven/JUnit dependencies. The tests themselves execute offline in Docker.
+3. Start the API and Ollama model, then run `.\benchmarks\v1\Invoke-Benchmark.ps1`. For paid model comparisons, set `AGENT_MODEL_INPUT_COST_PER_MILLION_USD` and `AGENT_MODEL_OUTPUT_COST_PER_MILLION_USD` to the current provider rates before starting the API.
+
+The first run initializes and commits the benchmark fixture locally; later runs require that fixture to be clean. Estimated token costs are zero by default for Ollama. Set `AGENT_MODEL_INPUT_COST_PER_MILLION_USD` and `AGENT_MODEL_OUTPUT_COST_PER_MILLION_USD` to the chosen model's rates when comparing paid models. The benchmark is only a smoke-sized baseline (three cases), not a statistically meaningful model-quality claim; report the sample size and benchmark version with any success rate.
 
 ### Try the API
 
@@ -262,7 +297,7 @@ Do these as small vertical slices. Keep the app runnable after each slice and do
 
 ### 1. Harden worker recovery and task operations
 
-The single worker and attempt report now exist. Next add leases/heartbeats, recovery of tasks left running after a crash, explicit retry/backoff limits, cancellation, and concurrency controls. Define how retries avoid duplicate side effects. Keep worker logic separate from REST resources so it can later run in its own process. Do not add RabbitMQ until a concrete scaling or isolation requirement calls for it.
+The single worker and attempt report now exist, including bounded patch correction, criterion assessment, validation details, and usage metrics. Still add leases/heartbeats, recovery of tasks left running after a crash, explicit task-level retry/backoff limits, cancellation, and concurrency controls. Define how retries avoid duplicate side effects. Keep worker logic separate from REST resources so it can later run in its own process. Do not add RabbitMQ until a concrete scaling or isolation requirement calls for it.
 
 ### 2. Improve tool-loop quality and repository support
 
@@ -278,7 +313,7 @@ Begin with a manually submitted task against an allow-listed repository. Then ad
 
 ### 5. Build evaluation and observability
 
-Create a small, versioned benchmark of well-scoped issues with known expected behavior, then grow it toward the proposed 30–50 tasks. Record model/prompt/tool versions, test outcomes, regressions, human acceptance, cost, and elapsed time. Publish sample sizes and limitations; do not infer improvements from a few hand-picked successes. Add structured logs, traces, and metrics for task/attempt lifecycle, model usage, tool calls, and validation results.
+The initial versioned three-task benchmark is in `benchmarks/v1`. Expand it toward 30–50 independently checked tasks; record model/prompt/tool versions, test outcomes, regressions, human acceptance, cost, and elapsed time. Publish sample sizes and limitations; do not infer improvements from a few hand-picked successes. Add structured logs, traces, and metrics for task/attempt lifecycle, model usage, tool calls, and validation results.
 
 ### 6. Polish after the workflow works
 
@@ -311,8 +346,8 @@ The source brief gives a strong direction, but leaves choices that affect implem
 These choices can be discussed while implementing the worker; they do not need to block the attempt/report foundation.
 ## Status and handoff for the next coding session
 
-- Ollama was selected as the first model backend. The provider contract and HTTP adapter have mock-HTTP coverage. A live smoke task against a disposable Maven repository is in progress; review the task/attempt outcome before claiming model quality is proven.
-- The scheduled single-process worker, tool allowlist, temporary repository workspace, Docker Maven/PostgreSQL validator, and structured attempt reports are implemented. Immediate next steps: finish a successful end-to-end model patch, run `mvnw clean verify` and fix any coverage gaps, then improve crash recovery, observability, supported build systems, and dependency-cache setup.
+- Ollama is the first model backend. The provider contract and HTTP adapter have mock-HTTP coverage; run the versioned benchmark before making model-quality claims.
+- The scheduled single-process worker, fail-closed local repository-root configuration, tool allowlist, temporary repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, and benchmark runner are implemented. Continue with crash recovery, broader benchmark coverage, observability, supported build systems, and dependency-cache policy.
 - Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces 100% line and branch coverage for measured application code; the HTML report is generated under `target/site/jacoco`.
 - PostgreSQL 18.6 databases `coding_agent_platform` and `coding_agent_platform_test` plus limited login `coding_agent_app` are configured locally. The app role password is in the ignored project `.env`; the administrator password is not used by the app.
 - The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. The isolated PostgreSQL test database is migrated through V4 for attempts.

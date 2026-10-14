@@ -1,14 +1,9 @@
 package dev.agentplatform.domain.port
 
-import dev.agentplatform.domain.model.AttemptStatus
-import dev.agentplatform.domain.model.CodingTask
-import dev.agentplatform.domain.model.TaskAttempt
-import dev.agentplatform.domain.model.TaskExecutionReport
-import dev.agentplatform.domain.model.TaskStatus
-import dev.agentplatform.domain.model.ValidationCheck
+import dev.agentplatform.domain.model.*
 import java.nio.file.Path
 import java.time.Duration
-import java.util.UUID
+import java.util.*
 
 interface TaskExecutionState {
     fun claimNextQueued(): CodingTask?

@@ -1,17 +1,13 @@
 package dev.agentplatform.application.worker
 
-import dev.agentplatform.domain.model.AttemptStatus
-import dev.agentplatform.domain.model.CodingTask
-import dev.agentplatform.domain.model.TaskAttempt
-import dev.agentplatform.domain.model.TaskExecutionReport
-import dev.agentplatform.domain.model.TaskStatus
+import dev.agentplatform.domain.model.*
 import dev.agentplatform.domain.port.AttemptOperations
 import dev.agentplatform.domain.port.TaskExecutionState
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
 import java.time.Instant
-import java.util.UUID
+import java.util.*
 
 class TaskExecutionFinalizerTest {
     @Test

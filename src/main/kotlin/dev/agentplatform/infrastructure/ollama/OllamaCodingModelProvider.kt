@@ -2,12 +2,7 @@ package dev.agentplatform.infrastructure.ollama
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
-import dev.agentplatform.domain.port.CodingModelProvider
-import dev.agentplatform.domain.port.ModelMessage
-import dev.agentplatform.domain.port.ModelProviderException
-import dev.agentplatform.domain.port.ModelToolCall
-import dev.agentplatform.domain.port.ModelToolDefinition
-import dev.agentplatform.domain.port.ModelTurn
+import dev.agentplatform.domain.port.*
 import jakarta.enterprise.context.ApplicationScoped
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import java.io.IOException
@@ -16,8 +11,7 @@ import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
-import java.util.UUID
-import kotlin.sequences.plus
+import java.util.*
 
 @ApplicationScoped
 class OllamaCodingModelProvider(

@@ -14,7 +14,7 @@ import jakarta.enterprise.context.ApplicationScoped
 import jakarta.persistence.LockModeType
 import jakarta.transaction.Transactional
 import java.time.Instant
-import java.util.UUID
+import java.util.*
 
 @ApplicationScoped
 class TaskService(

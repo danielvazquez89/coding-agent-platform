@@ -1,9 +1,8 @@
 package dev.agentplatform.infrastructure.docker
 
+import dev.agentplatform.domain.model.CheckOutcome
 import dev.agentplatform.domain.port.CommandExecutor
 import dev.agentplatform.domain.port.CommandResult
-
-import dev.agentplatform.domain.model.CheckOutcome
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
@@ -46,8 +45,11 @@ class DockerValidationRunnerTest {
                 command.contains("mvn") -> {
                     assertTrue(command.contains("--internal").not())
                     assertTrue(command.contains("--network"))
-                    assertTrue(command.contains("--read-only"))
+                    assertTrue(command.none { it == "--network=host" })
                     assertTrue(command.contains("--cap-drop=ALL"))
+                    assertTrue(command.contains("--security-opt=no-new-privileges"))
+                    assertTrue(command.contains("--pids-limit=1024"))
+                    assertTrue(command.contains("--read-only"))
                     assertTrue(command.contains("--memory=2g"))
                     assertTrue(command.contains("QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://agent-db:5432/postgres"))
                     assertTrue(command.contains("-o"))

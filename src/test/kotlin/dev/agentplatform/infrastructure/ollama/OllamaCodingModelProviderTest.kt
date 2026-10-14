@@ -1,20 +1,10 @@
 package dev.agentplatform.infrastructure.ollama
 
-import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.databind.JsonNode
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.HttpServer
-import dev.agentplatform.domain.port.ModelMessage
-import dev.agentplatform.domain.port.ModelProviderException
-import dev.agentplatform.domain.port.ModelToolCall
-import dev.agentplatform.domain.port.ModelToolDefinition
-import dev.agentplatform.domain.port.ModelTurn
-
-import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertFalse
-import org.junit.jupiter.api.Assertions.assertNotNull
-import org.junit.jupiter.api.Assertions.assertNull
-import org.junit.jupiter.api.Assertions.assertThrows
-import org.junit.jupiter.api.Assertions.assertTrue
+import dev.agentplatform.domain.port.*
+import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicBoolean

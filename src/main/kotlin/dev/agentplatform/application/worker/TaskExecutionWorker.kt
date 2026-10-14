@@ -2,29 +2,15 @@ package dev.agentplatform.application.worker
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
-import dev.agentplatform.domain.model.AgentDecision
-import dev.agentplatform.domain.model.AgentQuestion
-import dev.agentplatform.domain.model.AttemptStatus
-import dev.agentplatform.domain.model.CheckOutcome
-import dev.agentplatform.domain.model.CodingTask
-import dev.agentplatform.domain.model.TaskExecutionReport
-import dev.agentplatform.domain.model.TaskStatus
-import dev.agentplatform.domain.model.ValidationCheck
-import dev.agentplatform.domain.port.AttemptOperations
-import dev.agentplatform.domain.port.CodingModelProvider
-import dev.agentplatform.domain.port.ModelMessage
-import dev.agentplatform.domain.port.ModelToolCall
-import dev.agentplatform.domain.port.RepositoryWorkspace
-import dev.agentplatform.domain.port.RepositoryWorkspaceFactory
-import dev.agentplatform.domain.port.TaskExecutionState
-import dev.agentplatform.domain.port.ToolExecutionResult
+import dev.agentplatform.domain.model.*
+import dev.agentplatform.domain.port.*
 import dev.agentplatform.infrastructure.tool.WorkspaceToolExecutor
 import io.quarkus.scheduler.Scheduled
 import jakarta.enterprise.context.ApplicationScoped
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.jboss.logging.Logger
 import java.nio.file.Path
-import java.util.UUID
+import java.util.*
 
 @ApplicationScoped
 class TaskExecutionWorker(
@@ -38,21 +24,36 @@ class TaskExecutionWorker(
     @ConfigProperty(name = "agent.execution.enabled", defaultValue = "true")
     private val enabled: Boolean,
     @ConfigProperty(name = "agent.execution.max-tool-calls", defaultValue = "24")
-    private val maxToolCalls: Int
+    private val maxToolCalls: Int,
+    @ConfigProperty(name = "agent.model.ollama.model", defaultValue = "qwen3:8b")
+    private val modelName: String,
+    @ConfigProperty(name = "agent.model.cost.input-per-million-usd", defaultValue = "0")
+    private val inputCostPerMillionUsd: Double,
+    @ConfigProperty(name = "agent.model.cost.output-per-million-usd", defaultValue = "0")
+    private val outputCostPerMillionUsd: Double
 ) {
     private val log = Logger.getLogger(TaskExecutionWorker::class.java)
 
     init {
         require(maxToolCalls > 0) { "Maximum tool calls must be positive" }
+        require(inputCostPerMillionUsd.isFinite() && inputCostPerMillionUsd >= 0.0) { "Input token cost must be finite and non-negative" }
+        require(outputCostPerMillionUsd.isFinite() && outputCostPerMillionUsd >= 0.0) { "Output token cost must be finite and non-negative" }
     }
 
     @Scheduled(every = "2s", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)
     fun poll() {
-        if (enabled) processNext()
+        log.infof("Task execution worker poll tick; executionEnabled=%s", enabled)
+        if (!enabled) return
+        try {
+            if (!processNext()) log.debug("Task execution worker found no queued tasks")
+        } catch (failure: Exception) {
+            log.error("Task execution worker poll failed", failure)
+        }
     }
 
     fun processNext(): Boolean {
         val task = taskState.claimNextQueued() ?: return false
+        log.infof("Task execution worker claimed queued task %s", task.id)
         executeClaimed(task)
         return true
     }
@@ -75,20 +76,26 @@ class TaskExecutionWorker(
         log.infof("Task %s attempt %s created", task.id, attempt.id)
         var workspace: RepositoryWorkspace? = null
         val validation = mutableListOf<ValidationCheck>()
+        val trace = ExecutionTrace(modelName, inputCostPerMillionUsd, outputCostPerMillionUsd)
+        val executionStartedAt = System.nanoTime()
         try {
             val repositoryUrl = task.repositoryUrl
             if (repositoryUrl.isNullOrBlank()) throw NeedsInputException("Choose a repository before asking the agent to make a change.")
             log.infof("Task %s opening workspace for repository: %s", task.id, repositoryUrl)
             workspace = workspaces.open(repositoryUrl)
             log.infof("Task %s workspace opened at: %s", task.id, workspace.root)
-            val finalText = runModelLoop(task, workspace.root, validation)
+            val finalText = runModelLoop(task, workspace.root, validation, trace)
             if (validation.isEmpty()) validation += tools.execute("run_validation", objectMapper.createObjectNode(), workspace.root).validation!!
             val changedFiles = workspace.changedFiles()
-            val modelQuestions = parseReport(finalText).second
+            val parsedReport = parseReport(finalText)
+            val modelQuestions = parsedReport.questions
             val blockingQuestions = modelQuestions.filter(AgentQuestion::blocking)
             val lastValidation = validation.lastOrNull()
+            val acceptanceChecks = acceptanceChecks(task, parsedReport.acceptanceChecks)
             val taskStatus = when {
                 blockingQuestions.isNotEmpty() || lastValidation?.outcome == CheckOutcome.SKIPPED -> TaskStatus.NEEDS_INPUT
+                acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } -> TaskStatus.FAILED
+                acceptanceChecks.any { it.outcome != AcceptanceOutcome.PASSED } -> TaskStatus.NEEDS_INPUT
                 changedFiles.isEmpty() -> TaskStatus.FAILED
                 lastValidation?.outcome == CheckOutcome.PASSED -> TaskStatus.COMPLETED
                 else -> TaskStatus.FAILED
@@ -97,10 +104,12 @@ class TaskExecutionWorker(
                 TaskStatus.NEEDS_INPUT -> when {
                     blockingQuestions.isNotEmpty() -> "Agent needs a user decision"
                     lastValidation?.outcome == CheckOutcome.SKIPPED -> "No supported validation could run"
+                    acceptanceChecks.any { it.outcome == AcceptanceOutcome.UNVERIFIED } -> "Acceptance criteria could not be verified"
                     else -> null
                 }
                 TaskStatus.COMPLETED -> null
                 TaskStatus.FAILED -> when {
+                    acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } -> "One or more acceptance criteria were reported as not met"
                     changedFiles.isEmpty() -> "The agent did not produce a repository change"
                     else -> lastValidation?.details?.take(500) ?: "Agent could not produce a validated result"
                 }
@@ -110,12 +119,24 @@ class TaskExecutionWorker(
                 lastValidation?.outcome == CheckOutcome.SKIPPED && blockingQuestions.isEmpty() -> modelQuestions + AgentQuestion(
                     "Which supported validation should run for this repository?", lastValidation.details.orEmpty(), true
                 )
+                acceptanceChecks.any { it.outcome == AcceptanceOutcome.UNVERIFIED } && blockingQuestions.isEmpty() ->
+                    modelQuestions + AgentQuestion(
+                        "Acceptance criteria were not verified",
+                        acceptanceChecks.filter { it.outcome == AcceptanceOutcome.UNVERIFIED }
+                            .joinToString("; ") { it.criterion },
+                        true
+                    )
                 else -> modelQuestions
             }
-            val report = buildReport(task, finalText, workspace, changedFiles, validation, questions, taskStatus)
+            val report = buildReport(
+                task, finalText, workspace, changedFiles, validation, questions, taskStatus,
+                acceptanceChecks, trace, elapsedMillis(executionStartedAt)
+            )
             if (taskStatus != TaskStatus.NEEDS_INPUT) {
                 val validationReason = when {
                     changedFiles.isEmpty() -> "No repository changes were produced"
+                    taskStatus == TaskStatus.FAILED && acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } ->
+                        "One or more acceptance criteria were reported as not met"
                     taskStatus == TaskStatus.FAILED -> "Agent changes failed validation"
                     else -> "Agent changes are ready for validation"
                 }
@@ -154,7 +175,10 @@ class TaskExecutionWorker(
                         true
                     )
                 ),
-                validation = validation.toList()
+                validation = validation.toList(),
+                acceptanceChecks = acceptanceChecks(task, emptyList()),
+                modelUsage = trace.usage(),
+                executionDurationMillis = elapsedMillis(executionStartedAt)
             )
             finalizer.finish(task.id, attempt.id, TaskStatus.NEEDS_INPUT, AttemptStatus.NEEDS_INPUT, report, failure.message)
         } catch (failure: Exception) {
@@ -180,7 +204,11 @@ class TaskExecutionWorker(
                 ),
                 changedFiles = files,
                 validation = validation.toList(),
-                patchDiff = diff
+                patchDiff = diff,
+                acceptanceChecks = acceptanceChecks(task, emptyList()),
+                patchFailures = trace.patchFailures.toList(),
+                modelUsage = trace.usage(),
+                executionDurationMillis = elapsedMillis(executionStartedAt)
             )
             finalizer.finish(task.id, attempt.id, TaskStatus.FAILED, AttemptStatus.FAILED, report, details)
         } finally {
@@ -192,7 +220,7 @@ class TaskExecutionWorker(
         }
     }
 
-    private fun runModelLoop(task: CodingTask, root: Path, validation: MutableList<ValidationCheck>): String {
+    private fun runModelLoop(task: CodingTask, root: Path, validation: MutableList<ValidationCheck>, trace: ExecutionTrace): String {
         val messages = mutableListOf(
             ModelMessage("system", systemPrompt()),
             ModelMessage("user", taskPrompt(task))
@@ -204,9 +232,17 @@ class TaskExecutionWorker(
         var lastPatchFailure: String? = null
         var lastToolResult: String? = null
         var patchApplied = false
+        var validationCurrent = false
         var lastModelText: String? = null
         repeat(maxToolCalls + MAX_PATCH_FAILURE_RETRIES + 4) {
-            val turn = model.chat(messages, definitions)
+            val modelCallStartedAt = System.nanoTime()
+            val turn = try {
+                model.chat(messages, definitions)
+            } catch (failure: Exception) {
+                trace.recordModelFailure(elapsedMillis(modelCallStartedAt))
+                throw failure
+            }
+            trace.recordModelTurn(turn, elapsedMillis(modelCallStartedAt))
             log.infof("Task %s model turn returned %d tool call(s)", task.id, turn.toolCalls.size)
             if (turn.toolCalls.isEmpty()) {
                 turn.content?.takeIf(String::isNotBlank)?.let { lastModelText = it }
@@ -245,6 +281,9 @@ class TaskExecutionWorker(
                     append(" correction attempts: ")
                     append(remainingPatchFailure.take(2000))
                 }
+                if (!validationCurrent) {
+                    validation += tools.execute("run_validation", objectMapper.createObjectNode(), root).validation!!
+                }
                 return finalText.take(MAX_FINAL_TEXT_CHARS)
             }
             val toolResults = mutableListOf<Pair<ModelToolCall, ToolExecutionResult>>()
@@ -268,11 +307,16 @@ class TaskExecutionWorker(
                         }"
                     )
                 }
-                result.validation?.let(validation::add)
+                result.validation?.let {
+                    validation += it
+                    validationCurrent = true
+                }
                 lastToolResult = result.content.take(MAX_TOOL_RESULT_CHARS)
                 if (call.name == "apply_patch") {
                     lastPatchFailure = if (result.content.startsWith("Patch applied to ")) null else result.content
+                    if (lastPatchFailure != null) trace.patchFailures += lastPatchFailure!!.take(2000)
                     patchApplied = lastPatchFailure == null
+                    if (patchApplied) validationCurrent = false
                 }
                 log.infof("Task %s tool %s returned %d characters", task.id, call.name, result.content.length)
                 toolResults += call to result
@@ -290,8 +334,8 @@ class TaskExecutionWorker(
         append("Task description:\n").append(task.description.take(10_000)).append("\n\n")
         append("Acceptance criteria:\n")
         if (task.acceptanceCriteria.isEmpty()) append("(none supplied)\n")
-        else task.acceptanceCriteria.take(30).forEachIndexed { index, item -> append(index + 1).append(". ").append(item.take(1000)).append('\n') }
-        append("\nInspect relevant files and tests, make a focused patch, and run validation. End with one JSON object containing summary, implementation, decisions (topic, choice, rationale, alternatives), and openQuestions (question, impact, blocking). Do not claim a check passed unless its tool result says it passed.")
+        else task.acceptanceCriteria.forEachIndexed { index, item -> append(index + 1).append(". ").append(item).append('\n') }
+        append("\nInspect relevant files and tests, make a focused patch, and run validation. End with one JSON object containing summary, implementation, decisions (topic, choice, rationale, alternatives), openQuestions (question, impact, blocking), and acceptanceChecks (criterion, outcome: PASSED/FAILED/UNVERIFIED, evidence) with exactly one entry for each supplied acceptance criterion. Evidence must cite concrete code or test results; do not claim criteria passed solely because Maven passed. These checks are your assessment, not an independent machine verification. Do not claim a check passed unless its tool result says it passed.")
     }
 
     private fun systemPrompt(): String = """
@@ -310,7 +354,10 @@ class TaskExecutionWorker(
         changedFiles: List<String>,
         validation: List<ValidationCheck>,
         questions: List<AgentQuestion>,
-        status: TaskStatus
+        status: TaskStatus,
+        acceptanceChecks: List<AcceptanceCheck>,
+        trace: ExecutionTrace,
+        executionDurationMillis: Long
     ): TaskExecutionReport {
         val parsed = parseReport(finalText)
         val defaultDecision = AgentDecision(
@@ -319,31 +366,45 @@ class TaskExecutionWorker(
             rationale = "Repository code can be unsafe; tool inputs are constrained and tests run without external network access.",
             alternatives = listOf("Run arbitrary host commands", "Allow unrestricted network access during tests")
         )
-        val finalQuestions = if (questions.isNotEmpty()) questions else parsed.second
-        val summary = parsed.first?.take(1000) ?: finalText.lineSequence().firstOrNull()?.take(1000)?.ifBlank { null }
-            ?: when (status) {
-                TaskStatus.COMPLETED -> "The requested changes were applied and Maven tests passed."
-                TaskStatus.NEEDS_INPUT -> "The task needs a user decision before it can be completed."
-                else -> "The task did not pass validation."
-            }
-        val implementation = parsed.third?.take(10_000) ?: finalText.take(10_000).ifBlank {
+        val finalQuestions = questions.ifEmpty { parsed.questions }
+        val summary = when (status) {
+            TaskStatus.COMPLETED -> "Changes were applied, reported acceptance criteria passed, and validation passed."
+            TaskStatus.NEEDS_INPUT -> "Execution needs a user decision or additional verification before completion."
+            else -> "Execution did not satisfy all completion requirements."
+        }
+        val modelNarrative = parsed.implementation ?: finalText.take(10_000).ifBlank {
             "No final explanation was returned by the model for task '${task.title}'."
         }
+        val implementation = buildString {
+            append("Observed outcome: ").append(summary)
+            if (trace.patchFailures.isNotEmpty()) {
+                append("\nPatch recovery: ").append(trace.patchFailures.size)
+                    .append(" patch attempt(s) failed before the final outcome.")
+            }
+            if (acceptanceChecks.isNotEmpty()) {
+                append("\nAcceptance criteria are model-assessed; see acceptanceChecks and evidence.")
+            }
+            append("\n\nModel-provided narrative (not independently verified):\n")
+            append(modelNarrative)
+        }.take(10_000)
         return TaskExecutionReport(
             summary = summary,
             implementation = implementation,
-            decisions = parsed.fourth.ifEmpty { listOf(defaultDecision) },
+            decisions = parsed.decisions.ifEmpty { listOf(defaultDecision) },
             openQuestions = finalQuestions,
             changedFiles = changedFiles.take(250),
             validation = validation.toList(),
-            patchDiff = workspace.patchDiff(MAX_DIFF_CHARS).takeIf(String::isNotBlank)
+            patchDiff = workspace.patchDiff(MAX_DIFF_CHARS).takeIf(String::isNotBlank),
+            acceptanceChecks = acceptanceChecks,
+            patchFailures = trace.patchFailures.toList(),
+            modelUsage = trace.usage(),
+            executionDurationMillis = executionDurationMillis
         )
     }
 
     private fun parseReport(text: String): ParsedReport {
         val json = try { objectMapper.readTree(text) } catch (_: Exception) { null }
-        if (json == null || !json.isObject) return ParsedReport(null, emptyList(), null, emptyList())
-        val summary = json.path("summary").textOrNull()
+        if (json == null || !json.isObject) return ParsedReport(emptyList(), null, emptyList(), emptyList())
         val implementation = json.path("implementation").textOrNull()
         val questions = json.path("openQuestions").takeIf(JsonNode::isArray)?.mapNotNull { node ->
             val question = node.path("question").textOrNull() ?: return@mapNotNull null
@@ -356,17 +417,80 @@ class TaskExecutionWorker(
             val alternatives = node.path("alternatives").takeIf(JsonNode::isArray)?.mapNotNull { it.textOrNull() }.orEmpty()
             AgentDecision(topic, choice, rationale, alternatives)
         }.orEmpty()
-        return ParsedReport(summary, questions, implementation, decisions)
+        val acceptanceChecks = json.path("acceptanceChecks").takeIf(JsonNode::isArray)?.mapNotNull { node ->
+            val criterion = node.path("criterion").textOrNull() ?: return@mapNotNull null
+            val outcome = runCatching { AcceptanceOutcome.valueOf(node.path("outcome").asText("").uppercase()) }
+                .getOrNull() ?: AcceptanceOutcome.UNVERIFIED
+            AcceptanceCheck(criterion, outcome, node.path("evidence").textOrNull())
+        }.orEmpty()
+        return ParsedReport(questions, implementation, decisions, acceptanceChecks)
     }
+
+    private fun acceptanceChecks(task: CodingTask, reported: List<AcceptanceCheck>): List<AcceptanceCheck> {
+        val byCriterion = reported.groupBy(AcceptanceCheck::criterion)
+        return task.acceptanceCriteria.map { criterion ->
+            val matches = byCriterion[criterion].orEmpty()
+            val check = matches.singleOrNull()
+            when {
+                check == null -> AcceptanceCheck(criterion, AcceptanceOutcome.UNVERIFIED)
+                check.outcome == AcceptanceOutcome.PASSED && check.evidence.isNullOrBlank() ->
+                    check.copy(outcome = AcceptanceOutcome.UNVERIFIED)
+                else -> check
+            }
+        }
+    }
+
+    private fun elapsedMillis(startedAt: Long) = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
 
     private fun JsonNode.textOrNull(): String? = takeIf(JsonNode::isTextual)?.asText()?.takeIf(String::isNotBlank)
 
     private data class ParsedReport(
-        val first: String?,
-        val second: List<AgentQuestion>,
-        val third: String?,
-        val fourth: List<AgentDecision>
+        val questions: List<AgentQuestion>,
+        val implementation: String?,
+        val decisions: List<AgentDecision>,
+        val acceptanceChecks: List<AcceptanceCheck>
     )
+
+    private class ExecutionTrace(
+        private val modelName: String,
+        private val inputCostPerMillionUsd: Double,
+        private val outputCostPerMillionUsd: Double
+    ) {
+        val patchFailures = mutableListOf<String>()
+        private var promptTokens = 0
+        private var completionTokens = 0
+        private var tokenCountsAvailable = true
+        private var callCount = 0
+        private var modelDurationMillis = 0L
+
+        fun recordModelTurn(turn: dev.agentplatform.domain.port.ModelTurn, durationMillis: Long) {
+            callCount++
+            modelDurationMillis += durationMillis
+            if (turn.promptTokens == null || turn.completionTokens == null) {
+                tokenCountsAvailable = false
+            } else {
+                promptTokens += turn.promptTokens
+                completionTokens += turn.completionTokens
+            }
+        }
+
+        fun recordModelFailure(durationMillis: Long) {
+            callCount++
+            modelDurationMillis += durationMillis
+            tokenCountsAvailable = false
+        }
+
+        fun usage(): ModelUsage = ModelUsage(
+            model = modelName,
+            promptTokens = promptTokens.takeIf { tokenCountsAvailable },
+            completionTokens = completionTokens.takeIf { tokenCountsAvailable },
+            callCount = callCount,
+            durationMillis = modelDurationMillis,
+            estimatedCostUsd = if (tokenCountsAvailable) {
+                (promptTokens * inputCostPerMillionUsd + completionTokens * outputCostPerMillionUsd) / 1_000_000.0
+            } else null
+        )
+    }
 
     private class NeedsInputException(message: String) : RuntimeException(message)
 

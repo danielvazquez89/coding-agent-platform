@@ -1,37 +1,17 @@
 package dev.agentplatform.application.worker
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import dev.agentplatform.domain.model.AttemptStatus
-import dev.agentplatform.domain.model.CheckOutcome
-import dev.agentplatform.domain.model.CodingTask
-import dev.agentplatform.domain.model.TaskAttempt
-import dev.agentplatform.domain.model.TaskExecutionReport
-import dev.agentplatform.domain.model.TaskLifecycle
-import dev.agentplatform.domain.model.TaskStatus
-import dev.agentplatform.domain.model.ValidationCheck
-import dev.agentplatform.domain.port.AttemptOperations
-import dev.agentplatform.domain.port.CodingModelProvider
-import dev.agentplatform.domain.port.ModelMessage
-import dev.agentplatform.domain.port.ModelToolCall
-import dev.agentplatform.domain.port.ModelToolDefinition
-import dev.agentplatform.domain.port.ModelTurn
-import dev.agentplatform.domain.port.RepositoryWorkspace
-import dev.agentplatform.domain.port.RepositoryWorkspaceFactory
-import dev.agentplatform.domain.port.TaskExecutionState
-import dev.agentplatform.domain.port.ValidationRunner
+import dev.agentplatform.domain.model.*
+import dev.agentplatform.domain.port.*
 import dev.agentplatform.infrastructure.process.LocalCommandExecutor
 import dev.agentplatform.infrastructure.tool.WorkspaceToolExecutor
-import org.junit.jupiter.api.Assertions.assertEquals
-import org.junit.jupiter.api.Assertions.assertFalse
-import org.junit.jupiter.api.Assertions.assertNull
-import org.junit.jupiter.api.Assertions.assertThrows
-import org.junit.jupiter.api.Assertions.assertTrue
+import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Instant
-import java.util.UUID
+import java.util.*
 
 class TaskExecutionWorkerTest {
     @TempDir
@@ -40,10 +20,11 @@ class TaskExecutionWorkerTest {
 
     @Test
     fun `claims and runs a task through inspection and model returned report`() {
-        val task = task()
+        val criterion = "README includes the updated project context"
+        val task = task(acceptanceCriteria = listOf(criterion))
         val state = FakeState(task)
         val attempts = FakeAttempts()
-        val workspace = FakeWorkspace(temporary)
+        val workspace = FakeWorkspace(temporary, listOf("README.md"))
         Files.writeString(temporary.resolve("README.md"), "project context\n")
         val patch = listOf(
             "diff --git a/README.md b/README.md",
@@ -63,18 +44,32 @@ class TaskExecutionWorkerTest {
                 5
             ),
             ModelTurn(
-                """{"summary":"Improved project","implementation":"Read the project and made the requested change.","decisions":[{"topic":"Testing","choice":"Keep the regression test","rationale":"The behavior needs a durable check.","alternatives":["Manual verification"]}],"openQuestions":[{"question":"Should this support Java too?","impact":"That expands the target matrix.","blocking":false}]}""",
+                """{"summary":"Improved project","implementation":"Read the project and made the requested change.","decisions":[{"topic":"Testing","choice":"Keep the regression test","rationale":"The behavior needs a durable check.","alternatives":["Manual verification"]}],"openQuestions":[{"question":"Should this support Java too?","impact":"That expands the target matrix.","blocking":false}],"acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"The README now contains the updated project context."}]}""",
                 emptyList(), "stop", 20, 8
             )
         )
-        val worker = worker(state, attempts, provider, workspace)
+        val worker = worker(
+            state, attempts, provider, workspace,
+            inputCostPerMillionUsd = 2.0,
+            outputCostPerMillionUsd = 4.0
+        )
 
         assertTrue(worker.processNext())
         assertEquals(TaskStatus.COMPLETED, task.status)
         assertEquals(listOf(TaskStatus.RUNNING, TaskStatus.VALIDATING, TaskStatus.COMPLETED), state.transitions)
         assertEquals(AttemptStatus.COMPLETED, attempts.finished?.status)
         val report = attempts.finishedReport!!
-        assertEquals("Improved project", report.summary)
+        assertEquals(
+            "Changes were applied, reported acceptance criteria passed, and validation passed.",
+            report.summary
+        )
+        assertEquals(criterion, report.acceptanceChecks.single().criterion)
+        assertEquals(AcceptanceOutcome.PASSED, report.acceptanceChecks.single().outcome)
+        assertTrue(report.acceptanceChecks.single().evidence!!.contains("README"))
+        assertEquals(3, report.modelUsage!!.callCount)
+        assertEquals(42, report.modelUsage!!.promptTokens)
+        assertEquals(18, report.modelUsage!!.completionTokens)
+        assertEquals(0.000156, report.modelUsage!!.estimatedCostUsd)
         assertEquals("Testing", report.decisions.single().topic)
         assertEquals(false, report.openQuestions.single().blocking)
         assertTrue(provider.messages.any { it.role == "tool" && it.content.contains("project context") })
@@ -84,7 +79,8 @@ class TaskExecutionWorkerTest {
         assertEquals("apply_patch", provider.messages.last().toolName)
         assertTrue(provider.messages.last().content.contains("Patch applied"))
         assertEquals(CheckOutcome.PASSED, report.validation.single().outcome)
-        assertEquals("src/main/Example.kt", report.changedFiles.single())
+        assertEquals("README.md", report.changedFiles.single())
+        assertEquals("updated project context\n", Files.readString(temporary.resolve("README.md")))
         assertTrue(workspace.closed)
     }
 
@@ -181,7 +177,7 @@ class TaskExecutionWorkerTest {
                 "tool_calls", null, null
             ),
             ModelTurn(
-                """{"summary":"Updated greeting","implementation":"Applied corrected patch."}""",
+                """{"summary":"Patch failed","implementation":"The patch could not be applied."}""",
                 emptyList(),
                 "stop",
                 null,
@@ -192,6 +188,10 @@ class TaskExecutionWorkerTest {
         worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
 
         assertEquals("Hello from Qwen\n", Files.readString(temporary.resolve("Greeting.java")))
+        assertEquals(2, attempts.finishedReport!!.patchFailures.size)
+        assertTrue(attempts.finishedReport!!.implementation.contains("Patch recovery: 2"))
+        assertTrue(attempts.finishedReport!!.implementation.contains("not independently verified"))
+        assertTrue(attempts.finishedReport!!.summary.contains("validation passed"))
         assertTrue(provider.messages.any { it.role == "user" && it.content.contains("complete git-compatible unified diff") })
         assertEquals(2, provider.messages.count { it.role == "user" && it.content.contains("Your apply_patch tool call failed") })
         assertEquals(TaskStatus.COMPLETED, task.status)
@@ -291,6 +291,173 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `does not complete a changed and validated task when acceptance criteria are unverified`() {
+        val criterion = "README documents the new behavior"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", null, null),
+            ModelTurn("""{"summary":"Updated README","implementation":"Updated the file."}""", emptyList(), "stop", null, null)
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        assertEquals(AcceptanceOutcome.UNVERIFIED, attempts.finishedReport!!.acceptanceChecks.single().outcome)
+        assertTrue(attempts.finishedReport!!.openQuestions.any { it.blocking && it.question.contains("Acceptance") })
+        assertEquals(CheckOutcome.PASSED, attempts.finishedReport!!.validation.single().outcome)
+    }
+
+    @Test
+    fun `reruns validation when the model patches after a successful validation`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val patch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello world"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("run_validation", "{}")), "tool_calls", null, null),
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls",
+                null,
+                null
+            ),
+            ModelTurn(
+                """{"summary":"Updated greeting","implementation":"Updated the greeting after validation."}""",
+                emptyList(),
+                "stop",
+                null,
+                null
+            )
+        )
+        var validationCalls = 0
+        val validationRunner = object : ValidationRunner {
+            override fun validate(workspace: Path): ValidationCheck {
+                validationCalls++
+                return ValidationCheck(
+                    "Maven tests",
+                    outcome = if (validationCalls == 1) CheckOutcome.PASSED else CheckOutcome.FAILED,
+                    details = if (validationCalls == 1) null else "Post-patch tests failed"
+                )
+            }
+        }
+
+        worker(
+            FakeState(task), attempts, provider, FakeWorkspace(temporary),
+            validationRunner = validationRunner
+        ).execute(task.id)
+
+        assertEquals(2, validationCalls)
+        assertEquals(TaskStatus.FAILED, task.status)
+        assertEquals(2, attempts.finishedReport!!.validation.size)
+        assertEquals(CheckOutcome.FAILED, attempts.finishedReport!!.validation.last().outcome)
+        assertEquals("Post-patch tests failed", attempts.finished?.errorSummary)
+    }
+
+    @Test
+    fun `fails a changed and validated task when an acceptance criterion is reported as failed`() {
+        val criterion = "Greeting returns the requested exact text"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", null, null),
+            ModelTurn(
+                """{"summary":"Incomplete","implementation":"The requested behavior is not present.","acceptanceChecks":[{"criterion":"$criterion","outcome":"FAILED","evidence":"The expected text was not found."}]}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        assertEquals(TaskStatus.FAILED, task.status)
+        assertEquals(AcceptanceOutcome.FAILED, attempts.finishedReport!!.acceptanceChecks.single().outcome)
+        assertTrue(attempts.finished?.errorSummary!!.contains("acceptance criteria"))
+    }
+
+    @Test
+    fun `rejects duplicate or evidence-free acceptance assessments as unverified`() {
+        val criterion = "README documents the new behavior"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", null, null),
+            ModelTurn(
+                """{"summary":"Updated","implementation":"Updated the file.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"It was updated."},{"criterion":"$criterion","outcome":"PASSED","evidence":"Duplicate assertion."}]}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        assertEquals(AcceptanceOutcome.UNVERIFIED, attempts.finishedReport!!.acceptanceChecks.single().outcome)
+    }
+
+    @Test
+    fun `requires evidence and recognized outcomes for acceptance assessments`() {
+        val first = "README explains the behavior"
+        val second = "README includes an example"
+        val task = task(acceptanceCriteria = listOf(first, second))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", null, null),
+            ModelTurn(
+                """{"summary":"Updated","implementation":"Updated the file.","acceptanceChecks":[{"criterion":"$first","outcome":"PASSED"},{"criterion":"$second","outcome":"UNKNOWN","evidence":"Claimed without a valid outcome."}]}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        assertTrue(attempts.finishedReport!!.acceptanceChecks.all { it.outcome == AcceptanceOutcome.UNVERIFIED })
+    }
+
+    @Test
     fun `rejects unapproved tools and stops after the configured tool call budget`() {
         val rejected = task()
         val rejectedAttempts = FakeAttempts()
@@ -345,7 +512,7 @@ class TaskExecutionWorkerTest {
             ScriptedProvider(), object : RepositoryWorkspaceFactory {
                 override fun open(repositoryUrl: String): RepositoryWorkspace =
                     throw IllegalArgumentException("invalid repository")
-            }, tools(), mapper, true, 2
+            }, tools(), mapper, true, 2, "qwen3:8b", 0.0, 0.0
         )
         badWorkspaceWorker.execute(badWorkspaceTask.id)
         assertEquals(TaskStatus.FAILED, badWorkspaceTask.status)
@@ -362,8 +529,23 @@ class TaskExecutionWorkerTest {
                 tools(),
                 mapper,
                 true,
-                0
+                0,
+                "qwen3:8b",
+                0.0,
+                0.0
             )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary), inputCostPerMillionUsd = -1.0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary), inputCostPerMillionUsd = Double.NaN)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary), outputCostPerMillionUsd = -1.0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary), outputCostPerMillionUsd = Double.NaN)
         }
     }
 
@@ -374,18 +556,22 @@ class TaskExecutionWorkerTest {
         workspace: FakeWorkspace,
         validation: ValidationCheck = ValidationCheck("Maven tests", outcome = CheckOutcome.PASSED),
         enabled: Boolean = true,
-        maxToolCalls: Int = 5
+        maxToolCalls: Int = 5,
+        inputCostPerMillionUsd: Double = 0.0,
+        outputCostPerMillionUsd: Double = 0.0,
+        validationRunner: ValidationRunner? = null
     ): TaskExecutionWorker {
-        val validationRunner = object : ValidationRunner {
+        val defaultValidationRunner = object : ValidationRunner {
             override fun validate(workspace: Path) = validation
         }
-        val toolExecutor = WorkspaceToolExecutor(validationRunner, LocalCommandExecutor(), mapper)
+        val toolExecutor = WorkspaceToolExecutor(validationRunner ?: defaultValidationRunner, LocalCommandExecutor(), mapper)
         val workspaceFactory = object : RepositoryWorkspaceFactory {
             override fun open(repositoryUrl: String) = workspace
         }
         return TaskExecutionWorker(
             state, attempts, TaskExecutionFinalizer(state, attempts), provider, workspaceFactory,
-            toolExecutor, mapper, enabled, maxToolCalls
+            toolExecutor, mapper, enabled, maxToolCalls, "qwen3:8b",
+            inputCostPerMillionUsd, outputCostPerMillionUsd
         )
     }
 
@@ -393,11 +579,14 @@ class TaskExecutionWorkerTest {
         override fun validate(workspace: Path) = ValidationCheck("Maven tests", outcome = CheckOutcome.PASSED)
     }, LocalCommandExecutor(), mapper)
 
-    private fun task(repository: String? = "local-repo") = CodingTask(
+    private fun task(
+        repository: String? = "local-repo",
+        acceptanceCriteria: List<String> = emptyList()
+    ) = CodingTask(
         id = UUID.randomUUID(),
         title = "Add request validation",
         description = "Inspect the project and make the requested change.",
-        acceptanceCriteria = mutableListOf("existing tests pass"),
+        acceptanceCriteria = acceptanceCriteria.toMutableList(),
         repositoryUrl = repository,
         status = TaskStatus.QUEUED,
         createdAt = Instant.now()

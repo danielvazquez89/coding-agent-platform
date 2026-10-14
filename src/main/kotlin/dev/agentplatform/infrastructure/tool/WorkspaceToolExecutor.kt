@@ -2,18 +2,13 @@ package dev.agentplatform.infrastructure.tool
 
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
-import dev.agentplatform.domain.model.ValidationCheck
 import dev.agentplatform.domain.port.CommandExecutor
 import dev.agentplatform.domain.port.ModelToolDefinition
 import dev.agentplatform.domain.port.ToolExecutionResult
 import dev.agentplatform.domain.port.ValidationRunner
 import jakarta.enterprise.context.ApplicationScoped
 import java.io.IOException
-import java.nio.file.FileVisitResult
-import java.nio.file.Files
-import java.nio.file.LinkOption
-import java.nio.file.Path
-import java.nio.file.SimpleFileVisitor
+import java.nio.file.*
 import java.nio.file.attribute.BasicFileAttributes
 import java.time.Duration
 

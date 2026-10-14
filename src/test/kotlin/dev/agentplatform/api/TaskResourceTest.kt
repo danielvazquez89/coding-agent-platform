@@ -1,9 +1,9 @@
 package dev.agentplatform.api
 
 import dev.agentplatform.api.dto.CreateTaskRequest
+import io.quarkus.test.junit.QuarkusTest
 import io.restassured.RestAssured.given
 import io.restassured.http.ContentType
-import io.quarkus.test.junit.QuarkusTest
 import jakarta.inject.Inject
 import jakarta.ws.rs.BadRequestException
 import jakarta.ws.rs.NotFoundException
@@ -13,7 +13,7 @@ import org.hamcrest.Matchers.hasItem
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertThrows
 import org.junit.jupiter.api.Test
-import java.util.UUID
+import java.util.*
 
 @QuarkusTest
 class TaskResourceTest {
@@ -27,6 +27,12 @@ class TaskResourceTest {
         }
         assertThrows(BadRequestException::class.java) {
             taskResource.create(CreateTaskRequest("Title", " "))
+        }
+        assertThrows(BadRequestException::class.java) {
+            taskResource.create(CreateTaskRequest("Title", "Description", List(31) { "criterion $it" }))
+        }
+        assertThrows(BadRequestException::class.java) {
+            taskResource.create(CreateTaskRequest("Title", "Description", listOf("x".repeat(1001))))
         }
 
         val created = taskResource.create(CreateTaskRequest("Title", "Description"))
