@@ -30,6 +30,7 @@ The engineering challenge is making the workflow dependable and safe, not adding
 | `GET` | `/api/tasks/{id}/history` | Return ordered, append-only status history, including the initial `QUEUED` entry. |
 | `GET` | `/api/tasks/{id}/attempts` | Return attempts in attempt-number order, with status, report, and failure summary. |
 | `GET` | `/api/tasks/{id}/attempts/{attemptId}` | Return one attempt and its structured execution report. |
+| `GET` | `/api/tasks/{id}/attempts/{attemptId}/tool-executions` | Return redacted, ordered tool audit events, including events recorded before an attempt finishes. |
 
 Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list of up to 30 items, each at most 1000 characters), and `repositoryUrl` (required for execution). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. The Quarkus scheduler invokes a single-process worker every two seconds; startup, poll ticks, and successful claims are logged, including whether agent execution is enabled. The worker claims queued tasks and creates a durable attempt. Task creation currently returns `201` with `QUEUED`; the worker executes asynchronously after persistence. `AGENT_EXECUTION_ENABLED=false` leaves polling active but skips task execution; Quarkus scheduler configuration can independently disable all scheduled jobs.
 
@@ -37,7 +38,7 @@ Create-task fields are `title`, `description`, `acceptanceCriteria` (optional li
 
 The current local default is `qwen3:8b`. If needed, install it with `ollama pull qwen3:8b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL.
 
-The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff, validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, elapsed time, configured budgets, and per-tool audit records. Audit records retain tool name, a redacted argument summary, outcome, duration, and a short result summary; they deliberately omit source contents, full patches, and tool outputs. Records are stored with the completed attempt report, so a crash before finalization can lose the in-memory audit trail.
+The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff, validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, elapsed time, configured budgets, and per-tool audit summaries. Before an allowed tool runs, its invocation is committed to a separate audit-event table; after it returns, the event is updated with its outcome and duration. Events remain readable if the process stops before finalizing the attempt report. A `STARTED` event left after a crash means the operation's final outcome is unknown, not proof that it did or did not take effect. Audit records retain tool name, a redacted argument summary, outcome, duration, and a short result summary; they deliberately omit source contents, full patches, and tool outputs.
 
 `AGENT_MAX_TASK_DURATION_SECONDS` defaults to `1800`; `AGENT_MAX_TASK_COST_USD` defaults to `1.0`. Budgets are cumulative across completed attempts for one task, including clarification/resume attempts; queue waiting time is excluded. Time is checked between model/tool operations and after each model response; cost is checked against cumulative reported token usage after each response. These are operation-boundary guardrails, not hard preemptive ceilings: an in-progress operation is not forcibly interrupted when a limit is reached. Cost enforcement requires non-zero input/output rates (`AGENT_MODEL_INPUT_COST_PER_MILLION_USD` and `AGENT_MODEL_OUTPUT_COST_PER_MILLION_USD`) and reported token counts; if rates are set but current or prior token usage is unavailable, the attempt fails closed. Time enforcement also fails closed when prior attempt duration is unavailable. With the default zero rates, estimated cost is zero and the cost ceiling cannot represent actual inference costs.
 
@@ -55,7 +56,7 @@ Validation currently supports Maven projects only and runs `mvn -B -o test` in a
 
 ### Local review page
 
-Open <http://localhost:8081/> to list tasks and inspect the latest attempt, report, diff, validation checks, tool-audit summaries, open questions, and draft-PR link. For a `NEEDS_INPUT` task, submit a clarification there; the task is requeued and the worker starts another attempt. This is a local operator view, not an embedded GitHub review client. Protect the app from untrusted network access because the API and page are unauthenticated.
+Open <http://localhost:8081/> to list tasks and inspect the latest attempt, report, diff, validation checks, persisted tool-audit events, open questions, and draft-PR link. Tool events are loaded from their own endpoint rather than only from the final report, so events from an unfinished attempt remain visible. For a `NEEDS_INPUT` task, submit a clarification there; the task is requeued and the worker starts another attempt. This is a local operator view, not an embedded GitHub review client. Protect the app from untrusted network access because the API and page are unauthenticated.
 
 Allowed transitions:
 
@@ -109,6 +110,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `domain/model/TaskLifecycle.kt` — State machine policy: allowed transitions and `InvalidTaskTransitionException`.
 - `domain/model/TaskAttempt.kt` — Attempt entity and `AttemptStatus` enum.
 - `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `ToolExecutionAudit`, `ToolExecutionOutcome`, `AgentDecision`, `AgentQuestion`, `AcceptanceCheck`, `ModelUsage`, `PullRequestReference`, `ValidationCheck`, `CheckOutcome`.
+- `domain/model/ToolExecutionEvent.kt` — Durable per-call audit entity linked to its task and attempt.
 - `domain/port/CodingModelProvider.kt` — Provider-neutral LLM chat/tool-calling SPI (messages, tool definitions, tool calls, turns).
 - `domain/port/ExecutionPorts.kt` — Outbound port interfaces: `TaskExecutionState`, `AttemptOperations`, `RepositoryWorkspaceFactory`, `RepositoryWorkspace`, `CommandExecutor`, `CommandResult`, `ValidationRunner`, `PullRequestPublisher`, `ToolExecutionResult`.
 
@@ -123,6 +125,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 
 - `infrastructure/persistence/TaskRepository.kt` — Panache repository for `CodingTask`.
 - `infrastructure/persistence/TaskAttemptRepository.kt` — Panache repository for `TaskAttempt`.
+- `infrastructure/persistence/ToolExecutionEventRepository.kt` — Ordered durable tool-event queries.
 - `infrastructure/persistence/TaskStatusTransitionRepository.kt` — Panache repository for ordered status history.
 - `infrastructure/ollama/OllamaCodingModelProvider.kt` — Ollama `/api/chat` HTTP adapter; implements `CodingModelProvider`.
 - `infrastructure/github/GitHubPullRequestPublisher.kt` — allowlisted branch push and GitHub draft-PR creation; implements `PullRequestPublisher`.
@@ -136,7 +139,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 #### Resources and build
 
 - `src/main/resources/application.properties` — App name, HTTP port (`8081`), database configuration.
-- `src/main/resources/db/migration/` — Flyway-managed PostgreSQL schema migrations (V1 tasks, V2 status history, V3 attempts, V4 one-running-attempt constraint).
+- `src/main/resources/db/migration/` — Flyway-managed PostgreSQL schema migrations (V1 tasks, V2 status history, V3 attempts, V4 one-running-attempt constraint, V5 tool execution events).
 - `pom.xml` — Maven build, Kotlin compiler, Quarkus platform and extensions. The Quarkus Maven plugin is configured to disable its default dev-mode debugger; the project has had a conflict on debugger port `5005`.
 
 #### Tests (mirror the main source structure under `src/test/kotlin/dev/agentplatform/`)
@@ -381,7 +384,7 @@ These choices can be discussed while implementing the worker; they do not need t
 ## Status and handoff for the next coding session
 
 - Ollama is the first model backend. The provider contract and HTTP adapter have mock-HTTP coverage; run the versioned benchmark before making model-quality claims.
-- The scheduled single-process worker, fail-closed local repository-root configuration, tool allowlist, temporary repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, answer-and-requeue flow, local review page, per-tool audit summaries, task time/cost guardrails, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. Model/tool orchestration still runs in the application process; GitHub issue intake, private-repository clone authentication, and durable recovery from partial publication are not implemented. Next priorities are to validate publishing against a dedicated test repository, expand the benchmark, and isolate orchestration with durable per-tool audit persistence.
+- The scheduled single-process worker, fail-closed local repository-root configuration, tool allowlist, temporary repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, answer-and-requeue flow, local review page, durable per-tool audit events, cumulative task time/cost guardrails, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. Model/tool orchestration still runs in the application process; GitHub issue intake, private-repository clone authentication, and durable recovery from partial publication are not implemented. Next priorities are to validate publishing against a dedicated test repository, expand the benchmark, and design an isolated orchestration runtime that does not expose the host Docker socket or publishing credentials.
 - Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces 100% line and branch coverage for measured application code; the HTML report is generated under `target/site/jacoco`.
 - PostgreSQL 18.6 databases `coding_agent_platform` and `coding_agent_platform_test` plus limited login `coding_agent_app` are configured locally. The app role password is in the ignored project `.env`; the administrator password is not used by the app.
 - The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. The isolated PostgreSQL test database is migrated through V4 for attempts.

@@ -94,6 +94,19 @@ class TaskResource @Inject constructor(
     ): TaskAttemptResponse = attemptService.find(id, attemptId)
         ?: throw NotFoundException("Attempt $attemptId was not found for task $id")
 
+    @GET
+    @Path("/{id}/attempts/{attemptId}/tool-executions")
+    fun toolExecutions(
+        @PathParam("id") id: UUID,
+        @PathParam("attemptId") attemptId: UUID
+    ): List<dev.agentplatform.domain.model.ToolExecutionAudit> {
+        if (taskService.findById(id) == null) throw NotFoundException("Task $id was not found")
+        if (attemptService.find(id, attemptId) == null) {
+            throw NotFoundException("Attempt $attemptId was not found for task $id")
+        }
+        return attemptService.toolExecutions(id, attemptId)
+    }
+
     private companion object {
         const val MAX_ACCEPTANCE_CRITERIA = 30
         const val MAX_ACCEPTANCE_CRITERION_LENGTH = 1000

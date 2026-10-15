@@ -2,6 +2,7 @@ package dev.agentplatform.application.worker
 
 import dev.agentplatform.domain.model.*
 import dev.agentplatform.domain.port.AttemptOperations
+import dev.agentplatform.domain.port.TaskBudgetUsage
 import dev.agentplatform.domain.port.TaskExecutionState
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
@@ -60,6 +61,10 @@ class TaskExecutionFinalizerTest {
 
     private class Attempts : AttemptOperations {
         var finished: TaskAttempt? = null
+        override fun priorBudgetUsage(taskId: UUID) = TaskBudgetUsage()
+        override fun recordToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit) {}
+        override fun finishToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit) {}
+        override fun toolExecutions(taskId: UUID, attemptId: UUID) = emptyList<ToolExecutionAudit>()
         override fun start(taskId: UUID) = null
         override fun finish(
             taskId: UUID, attemptId: UUID, status: AttemptStatus, report: TaskExecutionReport?, errorSummary: String?

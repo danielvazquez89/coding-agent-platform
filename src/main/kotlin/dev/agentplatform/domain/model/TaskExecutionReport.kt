@@ -49,7 +49,7 @@ data class PullRequestReference(
     val draft: Boolean = true
 )
 
-enum class ToolExecutionOutcome { SUCCEEDED, FAILED, REJECTED }
+enum class ToolExecutionOutcome { STARTED, SUCCEEDED, FAILED, REJECTED }
 
 data class ToolExecutionAudit(
     val sequenceNumber: Int,

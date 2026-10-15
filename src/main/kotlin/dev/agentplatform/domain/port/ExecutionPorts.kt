@@ -14,6 +14,9 @@ interface TaskExecutionState {
 
 interface AttemptOperations {
     fun priorBudgetUsage(taskId: UUID): TaskBudgetUsage = TaskBudgetUsage()
+    fun recordToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit)
+    fun finishToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit)
+    fun toolExecutions(taskId: UUID, attemptId: UUID): List<ToolExecutionAudit>
     fun start(taskId: UUID): TaskAttempt?
     fun finish(
         taskId: UUID,

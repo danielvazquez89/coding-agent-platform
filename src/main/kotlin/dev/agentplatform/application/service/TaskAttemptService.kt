@@ -6,10 +6,13 @@ import dev.agentplatform.domain.model.AttemptStatus
 import dev.agentplatform.domain.model.TaskAttempt
 import dev.agentplatform.domain.model.TaskExecutionReport
 import dev.agentplatform.domain.model.TaskStatus
+import dev.agentplatform.domain.model.ToolExecutionAudit
+import dev.agentplatform.domain.model.ToolExecutionEvent
 import dev.agentplatform.domain.port.AttemptOperations
 import dev.agentplatform.domain.port.TaskBudgetUsage
 import dev.agentplatform.infrastructure.persistence.TaskAttemptRepository
 import dev.agentplatform.infrastructure.persistence.TaskRepository
+import dev.agentplatform.infrastructure.persistence.ToolExecutionEventRepository
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.transaction.Transactional
 import java.time.Instant
@@ -19,6 +22,7 @@ import java.util.*
 class TaskAttemptService(
     private val taskRepository: TaskRepository,
     private val attemptRepository: TaskAttemptRepository,
+    private val toolExecutionEventRepository: ToolExecutionEventRepository,
     private val objectMapper: ObjectMapper
 ) : AttemptOperations {
     override fun priorBudgetUsage(taskId: UUID): TaskBudgetUsage {
@@ -45,6 +49,64 @@ class TaskAttemptService(
             }
         return TaskBudgetUsage(elapsedMillis, estimatedCostUsd)
     }
+
+    @Transactional
+    override fun recordToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit) {
+        val attempt = attemptRepository.findForUpdate(attemptId)
+            ?: throw IllegalStateException("Attempt $attemptId does not exist")
+        check(attempt.taskId == taskId && attempt.status == AttemptStatus.RUNNING) {
+            "Tool execution can only be recorded for a running attempt belonging to task $taskId"
+        }
+        val expectedSequence = toolExecutionEventRepository.nextSequenceNumber(attemptId)
+        check(audit.sequenceNumber == expectedSequence) {
+            "Tool event sequence ${audit.sequenceNumber} does not match expected sequence $expectedSequence"
+        }
+        toolExecutionEventRepository.persist(
+            ToolExecutionEvent(
+                taskId = taskId,
+                attemptId = attemptId,
+                sequenceNumber = audit.sequenceNumber,
+                toolName = audit.toolName.take(100),
+                argumentsSummary = audit.argumentsSummary.take(500),
+                outcome = audit.outcome,
+                durationMillis = audit.durationMillis.coerceAtLeast(0),
+                resultSummary = audit.resultSummary.take(300),
+                recordedAt = Instant.now()
+            )
+        )
+    }
+
+    @Transactional
+    override fun finishToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit) {
+        val attempt = attemptRepository.findForUpdate(attemptId)
+            ?: throw IllegalStateException("Attempt $attemptId does not exist")
+        check(attempt.taskId == taskId && attempt.status == AttemptStatus.RUNNING) {
+            "Tool execution can only be completed for a running attempt belonging to task $taskId"
+        }
+        val event = toolExecutionEventRepository.findForAttemptSequence(attemptId, audit.sequenceNumber)
+            ?: throw IllegalStateException("Tool event ${audit.sequenceNumber} does not exist")
+        check(event.taskId == taskId && event.outcome == dev.agentplatform.domain.model.ToolExecutionOutcome.STARTED) {
+            "Tool event ${audit.sequenceNumber} is not a pending execution for task $taskId"
+        }
+        check(audit.outcome != dev.agentplatform.domain.model.ToolExecutionOutcome.STARTED) {
+            "A tool execution completion must have a terminal outcome"
+        }
+        event.outcome = audit.outcome
+        event.durationMillis = audit.durationMillis.coerceAtLeast(0)
+        event.resultSummary = audit.resultSummary.take(300)
+    }
+
+    override fun toolExecutions(taskId: UUID, attemptId: UUID): List<ToolExecutionAudit> =
+        toolExecutionEventRepository.forAttemptInOrder(taskId, attemptId).map {
+            ToolExecutionAudit(
+                sequenceNumber = it.sequenceNumber,
+                toolName = it.toolName,
+                argumentsSummary = it.argumentsSummary,
+                outcome = it.outcome,
+                durationMillis = it.durationMillis,
+                resultSummary = it.resultSummary
+            )
+        }
 
     /** Called by the execution worker after it has durably claimed a RUNNING task. */
     @Transactional

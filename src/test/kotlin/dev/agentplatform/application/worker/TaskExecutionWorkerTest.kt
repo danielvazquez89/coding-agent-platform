@@ -95,6 +95,7 @@ class TaskExecutionWorkerTest {
             listOf("list_files", "search_code", "read_file", "apply_patch", "run_validation"),
             report.toolExecutions.map { it.toolName }
         )
+        assertEquals(report.toolExecutions, attempts.persistedToolEvents)
         assertTrue(report.toolExecutions.all { it.outcome == ToolExecutionOutcome.SUCCEEDED })
         assertTrue(report.toolExecutions.none { it.argumentsSummary.contains(patch) })
         assertEquals(1, report.toolExecutions.first().sequenceNumber)
@@ -564,6 +565,7 @@ class TaskExecutionWorkerTest {
         assertTrue(rejectedAttempts.finishedReport!!.openQuestions.isEmpty())
         assertTrue(rejectedProvider.messages.last().content.contains("not in the allowlist"))
         assertEquals(ToolExecutionOutcome.REJECTED, rejectedAttempts.finishedReport!!.toolExecutions.single().outcome)
+        assertEquals(rejectedAttempts.finishedReport!!.toolExecutions, rejectedAttempts.persistedToolEvents)
 
         val overBudget = task()
         val budgetAttempts = FakeAttempts()
@@ -582,6 +584,10 @@ class TaskExecutionWorkerTest {
         budgetWorker.execute(overBudget.id)
         assertEquals(TaskStatus.FAILED, overBudget.status)
         assertTrue(budgetAttempts.finishedReport!!.implementation.contains("exceeded its limit"))
+        assertEquals(
+            listOf(ToolExecutionOutcome.SUCCEEDED, ToolExecutionOutcome.REJECTED),
+            budgetAttempts.persistedToolEvents.map { it.outcome }
+        )
     }
 
     @Test
@@ -821,7 +827,17 @@ class TaskExecutionWorkerTest {
         var started: TaskAttempt? = null
         var finished: TaskAttempt? = null
         var finishedReport: TaskExecutionReport? = null
+        val persistedToolEvents = mutableListOf<ToolExecutionAudit>()
         override fun priorBudgetUsage(taskId: UUID) = previousBudgetUsage
+        override fun recordToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit) {
+            persistedToolEvents += audit
+        }
+        override fun finishToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit) {
+            val index = persistedToolEvents.indexOfFirst { it.sequenceNumber == audit.sequenceNumber }
+            check(index >= 0)
+            persistedToolEvents[index] = audit
+        }
+        override fun toolExecutions(taskId: UUID, attemptId: UUID) = persistedToolEvents.toList()
         override fun start(taskId: UUID): TaskAttempt? {
             if (startFails) return null
             return TaskAttempt(taskId = taskId).also { started = it }

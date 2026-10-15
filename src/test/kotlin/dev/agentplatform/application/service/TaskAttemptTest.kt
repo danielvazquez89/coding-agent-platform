@@ -159,6 +159,44 @@ class TaskAttemptTest {
     }
 
     @Test
+    fun `tool events persist independently of the final attempt report`() {
+        val taskId = createTask()
+        taskService.transition(taskId, TaskStatus.RUNNING, "Worker claimed task")
+        val attempt = attemptService.start(taskId)!!
+        val event = ToolExecutionAudit(
+            sequenceNumber = 1,
+            toolName = "read_file",
+            argumentsSummary = "path=src/Main.kt",
+            outcome = ToolExecutionOutcome.STARTED,
+            durationMillis = 0,
+            resultSummary = "Tool execution started"
+        )
+
+        attemptService.recordToolExecution(taskId, attempt.id, event)
+
+        assertEquals(listOf(event), attemptService.toolExecutions(taskId, attempt.id))
+        attemptService.finishToolExecution(
+            taskId, attempt.id,
+            event.copy(
+                outcome = ToolExecutionOutcome.SUCCEEDED,
+                durationMillis = 24,
+                resultSummary = "Returned 120 characters"
+            )
+        )
+        assertEquals(ToolExecutionOutcome.SUCCEEDED, attemptService.toolExecutions(taskId, attempt.id).single().outcome)
+        assertNull(attempt.reportJson)
+        given()
+            .`when`().get("/api/tasks/$taskId/attempts/${attempt.id}/tool-executions")
+            .then()
+            .statusCode(200)
+            .body("size()", equalTo(1))
+            .body("[0].sequenceNumber", equalTo(1))
+            .body("[0].toolName", equalTo("read_file"))
+            .body("[0].outcome", equalTo("SUCCEEDED"))
+            .body("[0].resultSummary", equalTo("Returned 120 characters"))
+    }
+
+    @Test
     fun `prior budget usage is unknown when a saved attempt report omits measurements`() {
         val taskId = createTask()
         taskService.transition(taskId, TaskStatus.RUNNING, "Worker claimed task")

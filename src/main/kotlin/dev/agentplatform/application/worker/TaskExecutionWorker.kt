@@ -89,7 +89,10 @@ class TaskExecutionWorker(
         var workspace: RepositoryWorkspace? = null
         val validation = mutableListOf<ValidationCheck>()
         val executionStartedAt = System.nanoTime()
-        val trace = ExecutionTrace(modelName, inputCostPerMillionUsd, outputCostPerMillionUsd, executionStartedAt)
+        val trace = ExecutionTrace(
+            modelName, inputCostPerMillionUsd, outputCostPerMillionUsd,
+            task.id, attempt.id, executionStartedAt
+        )
         try {
             trace.priorBudgetUsage = attempts.priorBudgetUsage(task.id)
             val repositoryUrl = task.repositoryUrl
@@ -156,7 +159,9 @@ class TaskExecutionWorker(
                         body = pullRequestBody(task, validation, acceptanceChecks),
                         changedFiles = changedFiles
                     )
+                    checkBudget(executionStartedAt, trace)
                 } catch (failure: Exception) {
+                    if (failure is ExecutionBudgetExceededException) throw failure
                     log.errorf(failure, "Task %s validated but draft pull request publication failed", task.id)
                     pullRequestError = (failure.message ?: failure.javaClass.simpleName).take(2000)
                     taskStatus = TaskStatus.FAILED
@@ -344,19 +349,28 @@ class TaskExecutionWorker(
             for (call in turn.toolCalls) {
                 checkBudget(trace.startedAtNanos, trace)
                 toolCallCount++
-                check(toolCallCount <= maxToolCalls) { "The agent exceeded its limit of $maxToolCalls tool calls" }
+                if (toolCallCount > maxToolCalls) {
+                    recordToolAudit(
+                        task.id, trace.attemptId, trace, call.name,
+                        summarizeToolArguments(call.name, call.arguments),
+                        ToolExecutionOutcome.REJECTED, "Tool-call budget exceeded", 0
+                    )
+                    throw IllegalStateException("The agent exceeded its limit of $maxToolCalls tool calls")
+                }
                 log.infof("Task %s requested allow-listed tool %s (%d/%d)", task.id, call.name, toolCallCount, maxToolCalls)
                 val result = try {
                     if (definitions.none { it.name == call.name }) {
-                        trace.recordTool(
+                        recordToolAudit(
+                            task.id, trace.attemptId, trace,
                             call.name, summarizeToolArguments(call.name, call.arguments),
-                            ToolExecutionOutcome.REJECTED, "Tool is not allowlisted"
+                            ToolExecutionOutcome.REJECTED, "Tool is not allowlisted", 0
                         )
                         ToolExecutionResult("Rejected: tool '${call.name}' is not in the allowlist.")
                     } else {
                         executeAuditedTool(call.name, call.arguments, root, trace)
                     }
                 } catch (failure: Exception) {
+                    if (failure is AuditPersistenceException) throw failure
                     log.warnf(failure, "Task %s tool %s threw exception", task.id, call.name)
                     ToolExecutionResult(
                         "Tool failed safely: ${
@@ -488,21 +502,74 @@ class TaskExecutionWorker(
     ): ToolExecutionResult {
         val startedAt = System.nanoTime()
         val argumentSummary = summarizeToolArguments(name, arguments)
-        return try {
-            tools.execute(name, arguments, root).also { result ->
-                val summary = result.validation?.let { "${it.name}: ${it.outcome}" }
-                    ?: "Returned ${result.content.length} characters"
-                trace.recordTool(
-                    name, argumentSummary, ToolExecutionOutcome.SUCCEEDED, summary, elapsedMillis(startedAt)
-                )
-            }
+        val pending = trace.nextToolAudit(
+            name, argumentSummary, ToolExecutionOutcome.STARTED, "Tool execution started", 0
+        )
+        try {
+            attempts.recordToolExecution(trace.taskId, trace.attemptId, pending)
         } catch (failure: Exception) {
-            trace.recordTool(
-                name, argumentSummary, ToolExecutionOutcome.FAILED,
-                "Failed with ${failure.javaClass.simpleName}", elapsedMillis(startedAt)
-            )
+            throw AuditPersistenceException("Could not persist tool execution audit event", failure)
+        }
+        trace.toolExecutions += pending
+        val result = try {
+            tools.execute(name, arguments, root)
+        } catch (failure: Exception) {
+            if (failure is AuditPersistenceException) throw failure
+            try {
+                finishToolAudit(
+                    trace, pending, ToolExecutionOutcome.FAILED,
+                    "Failed with ${failure.javaClass.simpleName}", elapsedMillis(startedAt)
+                )
+            } catch (auditFailure: Exception) {
+                throw AuditPersistenceException("Could not persist tool execution audit event", auditFailure)
+            }
             throw failure
         }
+        val summary = result.validation?.let { "${it.name}: ${it.outcome}" }
+            ?: "Returned ${result.content.length} characters"
+        finishToolAudit(trace, pending, ToolExecutionOutcome.SUCCEEDED, summary, elapsedMillis(startedAt))
+        return result
+    }
+
+    private fun recordToolAudit(
+        taskId: UUID,
+        attemptId: UUID,
+        trace: ExecutionTrace,
+        name: String,
+        argumentsSummary: String,
+        outcome: ToolExecutionOutcome,
+        resultSummary: String,
+        durationMillis: Long
+    ) {
+        val audit = trace.nextToolAudit(name, argumentsSummary, outcome, resultSummary, durationMillis)
+        try {
+            attempts.recordToolExecution(taskId, attemptId, audit)
+        } catch (failure: Exception) {
+            throw AuditPersistenceException("Could not persist tool execution audit event", failure)
+        }
+        trace.toolExecutions += audit
+    }
+
+    private fun finishToolAudit(
+        trace: ExecutionTrace,
+        pending: ToolExecutionAudit,
+        outcome: ToolExecutionOutcome,
+        resultSummary: String,
+        durationMillis: Long
+    ) {
+        val completed = pending.copy(
+            outcome = outcome,
+            durationMillis = durationMillis,
+            resultSummary = resultSummary.take(300)
+        )
+        try {
+            attempts.finishToolExecution(trace.taskId, trace.attemptId, completed)
+        } catch (failure: Exception) {
+            throw AuditPersistenceException("Could not persist tool execution audit event", failure)
+        }
+        val index = trace.toolExecutions.indexOfFirst { it.sequenceNumber == pending.sequenceNumber }
+        check(index >= 0) { "Pending tool audit event ${pending.sequenceNumber} is missing from the execution trace" }
+        trace.toolExecutions[index] = completed
     }
 
     private fun summarizeToolArguments(name: String, arguments: JsonNode): String = when (name) {
@@ -612,6 +679,8 @@ class TaskExecutionWorker(
         private val modelName: String,
         private val inputCostPerMillionUsd: Double,
         private val outputCostPerMillionUsd: Double,
+        val taskId: UUID,
+        val attemptId: UUID,
         val startedAtNanos: Long = System.nanoTime(),
         var priorBudgetUsage: TaskBudgetUsage = TaskBudgetUsage()
     ) {
@@ -640,14 +709,14 @@ class TaskExecutionWorker(
             tokenCountsAvailable = false
         }
 
-        fun recordTool(
+        fun nextToolAudit(
             name: String,
             argumentsSummary: String,
             outcome: ToolExecutionOutcome,
             resultSummary: String,
-            durationMillis: Long = 0
-        ) {
-            toolExecutions += ToolExecutionAudit(
+            durationMillis: Long
+        ): ToolExecutionAudit =
+            ToolExecutionAudit(
                 sequenceNumber = toolExecutions.size + 1,
                 toolName = name.take(100),
                 argumentsSummary = argumentsSummary.take(500),
@@ -655,7 +724,6 @@ class TaskExecutionWorker(
                 durationMillis = durationMillis,
                 resultSummary = resultSummary.take(300)
             )
-        }
 
         fun estimatedCostUsd(): Double? = if (tokenCountsAvailable) {
             (promptTokens * inputCostPerMillionUsd + completionTokens * outputCostPerMillionUsd) / 1_000_000.0
@@ -679,6 +747,7 @@ class TaskExecutionWorker(
 
     private class NeedsInputException(message: String) : RuntimeException(message)
     private class ExecutionBudgetExceededException(message: String) : RuntimeException(message)
+    private class AuditPersistenceException(message: String, cause: Throwable) : RuntimeException(message, cause)
 
     private companion object {
         const val MAX_TOOL_RESULT_CHARS = 12_000
