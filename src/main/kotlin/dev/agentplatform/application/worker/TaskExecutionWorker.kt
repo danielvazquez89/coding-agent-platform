@@ -7,13 +7,14 @@ import dev.agentplatform.domain.port.*
 import dev.agentplatform.infrastructure.tool.WorkspaceToolExecutor
 import io.quarkus.scheduler.Scheduled
 import jakarta.enterprise.context.ApplicationScoped
+import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.jboss.logging.Logger
 import java.nio.file.Path
 import java.util.*
 
 @ApplicationScoped
-class TaskExecutionWorker(
+class TaskExecutionWorker @Inject constructor(
     private val taskState: TaskExecutionState,
     private val attempts: AttemptOperations,
     private val finalizer: TaskExecutionFinalizer,

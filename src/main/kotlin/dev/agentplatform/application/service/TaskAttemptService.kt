@@ -25,6 +25,7 @@ class TaskAttemptService(
     private val toolExecutionEventRepository: ToolExecutionEventRepository,
     private val objectMapper: ObjectMapper
 ) : AttemptOperations {
+    @Transactional
     override fun priorBudgetUsage(taskId: UUID): TaskBudgetUsage {
         var elapsedMillis: Long? = 0
         var estimatedCostUsd: Double? = 0.0
@@ -94,8 +95,10 @@ class TaskAttemptService(
         event.outcome = audit.outcome
         event.durationMillis = audit.durationMillis.coerceAtLeast(0)
         event.resultSummary = audit.resultSummary.take(300)
+        toolExecutionEventRepository.flush()
     }
 
+    @Transactional
     override fun toolExecutions(taskId: UUID, attemptId: UUID): List<ToolExecutionAudit> =
         toolExecutionEventRepository.forAttemptInOrder(taskId, attemptId).map {
             ToolExecutionAudit(
@@ -137,15 +140,21 @@ class TaskAttemptService(
         if (attempt.taskId != taskId) return null
         check(attempt.status == AttemptStatus.RUNNING) { "Attempt ${attempt.id} is already finished" }
 
+        val finishedAt = Instant.now()
+        val boundedError = errorSummary?.take(4000)
+        val reportJson = report?.let(objectMapper::writeValueAsString)
         attempt.status = status
-        attempt.finishedAt = Instant.now()
-        attempt.errorSummary = errorSummary?.take(4000)
-        attempt.reportJson = report?.let(objectMapper::writeValueAsString)
+        attempt.finishedAt = finishedAt
+        attempt.errorSummary = boundedError
+        attempt.reportJson = reportJson
+        attemptRepository.flush()
         return attempt
     }
 
+    @Transactional
     fun list(taskId: UUID): List<TaskAttemptResponse> = attemptRepository.forTaskInOrder(taskId).map(::toResponse)
 
+    @Transactional
     fun find(taskId: UUID, attemptId: UUID): TaskAttemptResponse? =
         attemptRepository.findById(attemptId)
             ?.takeIf { it.taskId == taskId }

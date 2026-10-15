@@ -68,11 +68,11 @@ class TaskServiceTest {
         val resumed = taskService.answerAndRequeue(task.id, "Use cursor pagination")
 
         assertEquals(TaskStatus.QUEUED, resumed!!.status)
-        assertEquals("User clarification:\nUse cursor pagination\n\nOriginal request", resumed.description)
+        assertEquals("\n\nUser clarification:\nUse cursor pagination\n\nOriginal request", resumed.description)
         val history = taskService.history(task.id)
-        assertEquals(TaskStatus.NEEDS_INPUT, history[2].fromStatus)
-        assertEquals(TaskStatus.QUEUED, history[2].toStatus)
-        assertEquals("API", history[2].actor)
+        assertEquals(TaskStatus.NEEDS_INPUT, history[3].fromStatus)
+        assertEquals(TaskStatus.QUEUED, history[3].toStatus)
+        assertEquals("API", history[3].actor)
         assertNull(taskService.answerAndRequeue(UUID.randomUUID(), "answer"))
     }
 

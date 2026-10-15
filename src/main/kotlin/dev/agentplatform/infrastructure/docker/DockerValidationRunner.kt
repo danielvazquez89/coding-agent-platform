@@ -7,6 +7,7 @@ import dev.agentplatform.domain.port.CommandResult
 import dev.agentplatform.domain.port.ValidationRunner
 import dev.agentplatform.infrastructure.ExecutionControlHttp
 import jakarta.enterprise.context.ApplicationScoped
+import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import java.nio.file.Files
 import java.nio.file.Path
@@ -14,7 +15,7 @@ import java.time.Duration
 import java.util.*
 
 @ApplicationScoped
-class DockerValidationRunner(
+open class DockerValidationRunner @Inject constructor(
     private val commands: CommandExecutor,
     @ConfigProperty(name = "agent.execution.docker.maven-image", defaultValue = "maven:3.9.13-eclipse-temurin-21-noble")
     private val mavenImage: String,
@@ -28,14 +29,14 @@ class DockerValidationRunner(
     private val databaseReadyAttempts: Int,
     @ConfigProperty(name = "agent.execution.docker.database-ready-delay-millis", defaultValue = "500")
     private val databaseReadyDelayMillis: Long,
-    @ConfigProperty(name = "agent.execution.docker.maven-cache-volume", defaultValue = "")
-    private val mavenCacheVolume: String = "",
-    @ConfigProperty(name = "agent.execution.docker.workspace-volume", defaultValue = "")
-    private val workspaceVolume: String = "",
+    @ConfigProperty(name = "agent.execution.docker.maven-cache-volume", defaultValue = "disabled")
+    private val mavenCacheVolume: String = "disabled",
+    @ConfigProperty(name = "agent.execution.docker.workspace-volume", defaultValue = "disabled")
+    private val workspaceVolume: String = "disabled",
     @ConfigProperty(name = "agent.execution.workspace-root", defaultValue = "")
     private val configuredWorkspaceRoot: String = "",
-    @ConfigProperty(name = "agent.execution.control-plane-url", defaultValue = "")
-    private val controlPlaneUrl: String = "",
+    @ConfigProperty(name = "agent.execution.control-plane-url", defaultValue = "disabled")
+    private val controlPlaneUrl: String = "disabled",
     @ConfigProperty(name = "agent.execution.control-plane-token", defaultValue = "")
     private val controlPlaneToken: String = "",
     @ConfigProperty(name = "agent.execution.control-plane-timeout-seconds", defaultValue = "7200")
@@ -46,15 +47,15 @@ class DockerValidationRunner(
         require(databaseReadyAttempts > 0) { "Database readiness attempts must be positive" }
         require(databaseReadyDelayMillis >= 0) { "Database readiness delay cannot be negative" }
         require(controlPlaneTimeoutSeconds > 0) { "Control-plane timeout must be positive" }
-        require(controlPlaneUrl.isBlank() || controlPlaneToken.isNotBlank()) {
+        require(!isConfigured(controlPlaneUrl) || controlPlaneToken.isNotBlank()) {
             "Execution control-plane token is required when a control-plane URL is configured"
         }
-        require((workspaceVolume.isBlank()) == (mavenCacheVolume.isBlank())) {
+        require(isConfigured(workspaceVolume) == isConfigured(mavenCacheVolume)) {
             "Workspace and Maven cache Docker volumes must be configured together"
         }
     }
-    override fun validate(workspace: Path): ValidationCheck {
-        if (controlPlaneUrl.isNotBlank()) {
+    open override fun validate(workspace: Path): ValidationCheck {
+        if (isConfigured(controlPlaneUrl)) {
             return ExecutionControlHttp.validate(
                 controlPlaneUrl, controlPlaneToken, workspace, controlPlaneTimeoutSeconds
             )
@@ -162,7 +163,7 @@ class DockerValidationRunner(
     )
 
     private fun offlineMavenCommand(id: String, network: String, workspacePath: String, cachePath: String): List<String> {
-        val workspaceMount = if (workspaceVolume.isBlank()) {
+        val workspaceMount = if (!isConfigured(workspaceVolume)) {
             listOf("--mount", "type=bind,source=$workspacePath,target=/workspace", "--workdir", "/workspace")
         } else {
             val root = Path.of(configuredWorkspaceRoot).toAbsolutePath().normalize()
@@ -179,7 +180,7 @@ class DockerValidationRunner(
                 "/workspace"
             )
         }
-        val cacheMount = if (mavenCacheVolume.isBlank()) {
+        val cacheMount = if (!isConfigured(mavenCacheVolume)) {
             listOf("--mount", "type=bind,source=$cachePath,target=/m2/repository,readonly")
         } else {
             listOf("--mount", "type=volume,source=$mavenCacheVolume,target=/m2/repository,readonly")
@@ -200,7 +201,7 @@ class DockerValidationRunner(
 
     private fun dependencyGetCommand(id: String, cachePath: String, artifact: String): List<String> {
         val suffix = Integer.toHexString(artifact.hashCode())
-        val cacheMount = if (mavenCacheVolume.isBlank()) {
+        val cacheMount = if (!isConfigured(mavenCacheVolume)) {
             listOf("--mount", "type=bind,source=$cachePath,target=/m2/repository")
         } else {
             listOf("--mount", "type=volume,source=$mavenCacheVolume,target=/m2/repository")
@@ -250,6 +251,11 @@ class DockerValidationRunner(
     }
 
     internal companion object {
+        private const val DISABLED_CONFIGURATION_VALUE = "disabled"
+
+        private fun isConfigured(value: String): Boolean =
+            value.isNotBlank() && !value.equals(DISABLED_CONFIGURATION_VALUE, ignoreCase = true)
+
         const val MAX_VALIDATION_OUTPUT = 12_000
         const val MAX_DEPENDENCY_ROUNDS = 3
         const val MAX_ARTIFACTS_PER_ROUND = 8

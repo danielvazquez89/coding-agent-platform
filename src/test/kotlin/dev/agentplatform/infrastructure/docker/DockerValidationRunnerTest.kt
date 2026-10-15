@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import com.sun.net.httpserver.HttpServer
+import org.junit.jupiter.api.Assertions.assertThrows
 import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
@@ -17,6 +18,97 @@ import java.util.concurrent.atomic.AtomicInteger
 class DockerValidationRunnerTest {
     @TempDir
     lateinit var temporary: Path
+
+    @Test
+    fun `validates configuration bounds and paired Docker volumes`() {
+        val commands = fakeCommands()
+
+        assertThrows(IllegalArgumentException::class.java) {
+            DockerValidationRunner(commands, "maven:test", "postgres:test", "cache", 0, 1, 0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DockerValidationRunner(commands, "maven:test", "postgres:test", "cache", 1, 0, 0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DockerValidationRunner(commands, "maven:test", "postgres:test", "cache", 1, 1, -1)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DockerValidationRunner(
+                commands, "maven:test", "postgres:test", "cache", 1, 1, 0,
+                controlPlaneTimeoutSeconds = 0
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DockerValidationRunner(
+                commands, "maven:test", "postgres:test", "cache", 1, 1, 0,
+                controlPlaneUrl = "http://localhost:8080",
+                controlPlaneToken = ""
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DockerValidationRunner(
+                commands, "maven:test", "postgres:test", "cache", 1, 1, 0,
+                mavenCacheVolume = "maven-cache"
+            )
+        }
+    }
+
+    @Test
+    fun `extracts unique valid Maven artifact coordinates from failure output`() {
+        val output = """
+            Could not resolve dependencies:
+            dependency: org.example:library:jar:1.2.3
+            artifact org.example:parent:pom:4.5
+            artifact descriptor for org.example:plugin:maven-plugin:runner:6.7
+            dependency: org.example:library:jar:1.2.3
+            dependency: org.example:bad:invalid:1.2
+            dependency: org.example:too:few
+        """.trimIndent()
+
+        assertEquals(
+            listOf(
+                "org.example:library:1.2.3",
+                "org.example:parent:4.5:pom",
+                "org.example:plugin:6.7:maven-plugin:runner"
+            ),
+            DockerValidationRunner.missingArtifactCoordinates(output)
+        )
+        assertTrue(DockerValidationRunner.missingArtifactCoordinates("build succeeded").isEmpty())
+    }
+
+    @Test
+    fun `downloads missing Maven artifacts once and retries offline validation`() {
+        val repo = mavenRepository()
+        val validationCalls = AtomicInteger()
+        val dependencyCalls = AtomicInteger()
+        val commands = object : CommandExecutor {
+            override fun run(
+                command: List<String>, workingDirectory: Path?, standardInput: String?, timeout: Duration,
+                maxOutputChars: Int, environment: Map<String, String>
+            ): CommandResult = when {
+                command.take(3) == listOf("docker", "network", "create") -> CommandResult(0, "network")
+                command.take(3) == listOf("docker", "run", "-d") -> CommandResult(0, "db")
+                command.take(2) == listOf("docker", "exec") -> CommandResult(0, "ready")
+                "maven-dependency-plugin:3.8.1:get" in command -> {
+                    dependencyCalls.incrementAndGet()
+                    CommandResult(0, "downloaded")
+                }
+                command.contains("mvn") -> if (validationCalls.incrementAndGet() == 1) {
+                    CommandResult(1, "Could not find artifact org.example:library:jar:1.2.3")
+                } else {
+                    CommandResult(0, "Tests passed")
+                }
+                else -> CommandResult(0, "removed")
+            }
+        }
+
+        val result = runner(commands, temporary.resolve("m2").toString()).validate(repo)
+
+        assertEquals(CheckOutcome.PASSED, result.outcome)
+        assertEquals(2, validationCalls.get())
+        assertEquals(1, dependencyCalls.get())
+        assertTrue(result.details!!.contains("Retrying offline Maven tests"))
+    }
 
     @Test
     fun `skips unsupported repositories and offline caches`() {

@@ -83,11 +83,15 @@ class TaskAttemptTest {
                     )
                 )
             )
-        )
+        )!!
 
         assertEquals(1, first.attemptNumber)
         assertEquals(2, second.attemptNumber)
         assertNotNull(finishedFirst.finishedAt)
+        assertEquals(
+            4500,
+            attemptService.find(taskId, second.id)?.report?.path("executionDurationMillis")?.asInt()
+        )
         assertEquals(TaskBudgetUsage(9000, 0.0), attemptService.priorBudgetUsage(taskId))
 
         given()
@@ -193,7 +197,72 @@ class TaskAttemptTest {
             .body("[0].sequenceNumber", equalTo(1))
             .body("[0].toolName", equalTo("read_file"))
             .body("[0].outcome", equalTo("SUCCEEDED"))
+            .body("[0].durationMillis", equalTo(24))
             .body("[0].resultSummary", equalTo("Returned 120 characters"))
+    }
+
+    @Test
+    fun `tool event audit operations reject missing mismatched and already completed records`() {
+        val taskId = createTask()
+        val otherTaskId = createTask()
+        taskService.transition(taskId, TaskStatus.RUNNING, "Worker claimed task")
+        val attempt = attemptService.start(taskId)!!
+        val audit = ToolExecutionAudit(
+            sequenceNumber = 1,
+            toolName = "read_file",
+            argumentsSummary = "path=README.md",
+            outcome = ToolExecutionOutcome.STARTED,
+            durationMillis = 0,
+            resultSummary = "Started"
+        )
+
+        assertThrows(IllegalStateException::class.java) {
+            attemptService.recordToolExecution(taskId, UUID.randomUUID(), audit)
+        }
+        assertThrows(IllegalStateException::class.java) {
+            attemptService.recordToolExecution(otherTaskId, attempt.id, audit)
+        }
+        assertThrows(IllegalStateException::class.java) {
+            attemptService.recordToolExecution(taskId, attempt.id, audit.copy(sequenceNumber = 2))
+        }
+        attemptService.recordToolExecution(taskId, attempt.id, audit)
+        assertThrows(IllegalStateException::class.java) {
+            attemptService.finishToolExecution(taskId, UUID.randomUUID(), audit)
+        }
+        assertThrows(IllegalStateException::class.java) {
+            attemptService.finishToolExecution(otherTaskId, attempt.id, audit)
+        }
+        assertThrows(IllegalStateException::class.java) {
+            attemptService.finishToolExecution(taskId, attempt.id, audit.copy(sequenceNumber = 2))
+        }
+        assertThrows(IllegalStateException::class.java) {
+            attemptService.finishToolExecution(
+                taskId,
+                attempt.id,
+                audit.copy(outcome = ToolExecutionOutcome.STARTED)
+            )
+        }
+
+        attemptService.finishToolExecution(
+            taskId,
+            attempt.id,
+            audit.copy(outcome = ToolExecutionOutcome.SUCCEEDED)
+        )
+        assertThrows(IllegalStateException::class.java) {
+            attemptService.finishToolExecution(
+                taskId,
+                attempt.id,
+                audit.copy(outcome = ToolExecutionOutcome.FAILED)
+            )
+        }
+        attemptService.finish(taskId, attempt.id, AttemptStatus.COMPLETED, null)
+        assertThrows(IllegalStateException::class.java) {
+            attemptService.finishToolExecution(
+                taskId,
+                attempt.id,
+                audit.copy(outcome = ToolExecutionOutcome.FAILED)
+            )
+        }
     }
 
     @Test

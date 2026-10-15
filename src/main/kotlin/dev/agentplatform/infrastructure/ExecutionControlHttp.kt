@@ -41,6 +41,7 @@ object ExecutionControlHttp {
             .header("Authorization", "Bearer $token")
             .header("Content-Type", "application/json")
             .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(body)))
+            .setHeader("Authorization", "Bearer $token")
             .build()
         val response = try {
             client.send(request, HttpResponse.BodyHandlers.ofString())

@@ -5,6 +5,7 @@ import dev.agentplatform.domain.model.PullRequestReference
 import dev.agentplatform.domain.port.CommandExecutor
 import dev.agentplatform.domain.port.PullRequestPublisher
 import jakarta.enterprise.context.ApplicationScoped
+import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import java.io.IOException
 import java.net.URI
@@ -19,21 +20,22 @@ import java.time.Duration
 import java.util.Base64
 
 @ApplicationScoped
-class GitHubPullRequestPublisher(
+open class GitHubPullRequestPublisher @Inject constructor(
     private val commands: CommandExecutor,
     private val objectMapper: ObjectMapper,
-    @ConfigProperty(name = "agent.github.token", defaultValue = "")
-    private val token: String,
-    @ConfigProperty(name = "agent.github.allowed-repositories", defaultValue = "")
+    @ConfigProperty(name = "agent.github.token", defaultValue = "not-configured")
+    configuredToken: String,
+    @ConfigProperty(name = "agent.github.allowed-repositories", defaultValue = "not-configured")
     configuredAllowedRepositories: String,
     @ConfigProperty(name = "agent.github.api-url", defaultValue = "https://api.github.com")
     private val apiUrl: String,
     @ConfigProperty(name = "agent.github.pull-requests.enabled", defaultValue = "false")
     private val enabled: Boolean
 ) : PullRequestPublisher {
+    private val token = configuredToken.takeUnless { it.equals(NOT_CONFIGURED, ignoreCase = true) }.orEmpty()
     private val allowedRepositories = configuredAllowedRepositories.split(',')
         .map(String::trim)
-        .filter(String::isNotEmpty)
+        .filter { it.isNotEmpty() && !it.equals(NOT_CONFIGURED, ignoreCase = true) }
         .map { it.lowercase() }
         .toSet()
 
@@ -57,7 +59,7 @@ class GitHubPullRequestPublisher(
         }
     }
 
-    override fun createDraft(
+    open override fun createDraft(
         repositoryUrl: String,
         workspace: Path,
         branchName: String,
@@ -320,6 +322,7 @@ class GitHubPullRequestPublisher(
     }
 
     private companion object {
+        const val NOT_CONFIGURED = "not-configured"
         val REPOSITORY_PATH = Regex("""^/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?$""")
         val REPOSITORY_NAME = Regex("""^[a-z0-9_.-]+/[a-z0-9_.-]+$""")
         val BRANCH_NAME = Regex("""^agent/task-[0-9a-fA-F-]{36}$""")

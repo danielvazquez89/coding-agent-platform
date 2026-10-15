@@ -28,7 +28,7 @@ class InternalExecutionResource(
     data class ValidationRequest(val workspacePath: String)
 
     @POST
-    @jakarta.ws.rs.Path("/validate")
+    @Path("/validate")
     fun validate(
         @HeaderParam("Authorization") authorization: String?,
         request: ValidationRequest
@@ -42,17 +42,17 @@ class InternalExecutionResource(
         val root = FilePath.of(workspaceRoot).toAbsolutePath().normalize()
         val realRoot = try {
             root.toRealPath()
-        } catch (failure: Exception) {
+        } catch (_: Exception) {
             throw WebApplicationException("Configured workspace root is unavailable", Response.Status.SERVICE_UNAVAILABLE)
         }
         val requested = try {
             FilePath.of(path).toAbsolutePath().normalize()
-        } catch (failure: Exception) {
+        } catch (_: Exception) {
             throw WebApplicationException("Workspace path is invalid", Response.Status.BAD_REQUEST)
         }
         val realPath = try {
             requested.toRealPath()
-        } catch (failure: Exception) {
+        } catch (_: Exception) {
             throw WebApplicationException("Workspace path does not exist", Response.Status.BAD_REQUEST)
         }
         if (realPath == realRoot || !realPath.startsWith(realRoot) || !Files.isDirectory(realPath)) {
