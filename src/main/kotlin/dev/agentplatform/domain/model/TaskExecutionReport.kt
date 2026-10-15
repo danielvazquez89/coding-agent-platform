@@ -41,6 +41,14 @@ data class ModelUsage(
     val estimatedCostUsd: Double?
 )
 
+data class PullRequestReference(
+    val number: Int,
+    val url: String,
+    val title: String,
+    val state: String = "open",
+    val draft: Boolean = true
+)
+
 data class TaskExecutionReport(
     val summary: String,
     val implementation: String,
@@ -52,5 +60,7 @@ data class TaskExecutionReport(
     val acceptanceChecks: List<AcceptanceCheck> = emptyList(),
     val patchFailures: List<String> = emptyList(),
     val modelUsage: ModelUsage? = null,
-    val executionDurationMillis: Long? = null
+    val executionDurationMillis: Long? = null,
+    val pullRequest: PullRequestReference? = null,
+    val pullRequestError: String? = null
 )

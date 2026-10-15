@@ -48,8 +48,10 @@ class TaskExecutionWorkerTest {
                 emptyList(), "stop", 20, 8
             )
         )
+        val publisher = FakePullRequestPublisher()
         val worker = worker(
             state, attempts, provider, workspace,
+            publisher = publisher,
             inputCostPerMillionUsd = 2.0,
             outputCostPerMillionUsd = 4.0
         )
@@ -81,7 +83,77 @@ class TaskExecutionWorkerTest {
         assertEquals(CheckOutcome.PASSED, report.validation.single().outcome)
         assertEquals("README.md", report.changedFiles.single())
         assertEquals("updated project context\n", Files.readString(temporary.resolve("README.md")))
+        assertTrue(publisher.calls.isEmpty())
         assertTrue(workspace.closed)
+    }
+
+    @Test
+    fun `publishes a draft pull request only after a successful validated task`() {
+        val task = task()
+        val state = FakeState(task)
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        val workspace = FakeWorkspace(temporary, listOf("README.md"))
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", 1, 1),
+            ModelTurn("""{"implementation":"Applied the change."}""", emptyList(), "stop", 1, 1)
+        )
+        val publisher = FakePullRequestPublisher()
+
+        worker(
+            state, attempts, provider, workspace,
+            publisher = publisher,
+            publishPullRequests = true
+        ).execute(task.id)
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(1, publisher.calls.size)
+        assertEquals("agent/task-${task.id}", publisher.calls.single().branchName)
+        assertEquals(listOf("README.md"), publisher.calls.single().changedFiles)
+        assertEquals(42, attempts.finishedReport!!.pullRequest!!.number)
+        assertEquals("https://github.com/example/repo/pull/42", attempts.finishedReport!!.pullRequest!!.url)
+        assertTrue(attempts.finishedReport!!.summary.contains("pull request #42 (open, draft)"))
+    }
+
+    @Test
+    fun `fails task and records publication error when draft PR cannot be opened`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", 1, 1),
+            ModelTurn("""{"implementation":"Applied the change."}""", emptyList(), "stop", 1, 1)
+        )
+        val publisher = FakePullRequestPublisher(IllegalStateException("GitHub denied branch push"))
+
+        worker(
+            FakeState(task), attempts, provider, FakeWorkspace(temporary),
+            publisher = publisher,
+            publishPullRequests = true
+        ).execute(task.id)
+
+        assertEquals(TaskStatus.FAILED, task.status)
+        assertEquals(AttemptStatus.FAILED, attempts.finished!!.status)
+        assertTrue(attempts.finishedReport!!.summary.contains("publication failed"))
+        assertEquals("GitHub denied branch push", attempts.finishedReport!!.pullRequestError)
+        assertNull(attempts.finishedReport!!.pullRequest)
+        assertEquals(CheckOutcome.PASSED, attempts.finishedReport!!.validation.single().outcome)
     }
 
     @Test
@@ -512,7 +584,7 @@ class TaskExecutionWorkerTest {
             ScriptedProvider(), object : RepositoryWorkspaceFactory {
                 override fun open(repositoryUrl: String): RepositoryWorkspace =
                     throw IllegalArgumentException("invalid repository")
-            }, tools(), mapper, true, 2, "qwen3:8b", 0.0, 0.0
+            }, tools(), FakePullRequestPublisher(), mapper, true, false, 2, "qwen3:8b", 0.0, 0.0
         )
         badWorkspaceWorker.execute(badWorkspaceTask.id)
         assertEquals(TaskStatus.FAILED, badWorkspaceTask.status)
@@ -527,8 +599,10 @@ class TaskExecutionWorkerTest {
                     override fun open(repositoryUrl: String) = FakeWorkspace(temporary)
                 },
                 tools(),
+                FakePullRequestPublisher(),
                 mapper,
                 true,
+                false,
                 0,
                 "qwen3:8b",
                 0.0,
@@ -559,7 +633,9 @@ class TaskExecutionWorkerTest {
         maxToolCalls: Int = 5,
         inputCostPerMillionUsd: Double = 0.0,
         outputCostPerMillionUsd: Double = 0.0,
-        validationRunner: ValidationRunner? = null
+        validationRunner: ValidationRunner? = null,
+        publisher: FakePullRequestPublisher = FakePullRequestPublisher(),
+        publishPullRequests: Boolean = false
     ): TaskExecutionWorker {
         val defaultValidationRunner = object : ValidationRunner {
             override fun validate(workspace: Path) = validation
@@ -570,7 +646,7 @@ class TaskExecutionWorkerTest {
         }
         return TaskExecutionWorker(
             state, attempts, TaskExecutionFinalizer(state, attempts), provider, workspaceFactory,
-            toolExecutor, mapper, enabled, maxToolCalls, "qwen3:8b",
+            toolExecutor, publisher, mapper, enabled, publishPullRequests, maxToolCalls, "qwen3:8b",
             inputCostPerMillionUsd, outputCostPerMillionUsd
         )
     }
@@ -642,6 +718,31 @@ class TaskExecutionWorkerTest {
             finished = attempt
             finishedReport = report
             return attempt
+        }
+    }
+
+    private class FakePullRequestPublisher(private val failure: Exception? = null) : PullRequestPublisher {
+        data class Request(
+            val repositoryUrl: String,
+            val branchName: String,
+            val title: String,
+            val body: String,
+            val changedFiles: List<String>
+        )
+
+        val calls = mutableListOf<Request>()
+
+        override fun createDraft(
+            repositoryUrl: String,
+            workspace: Path,
+            branchName: String,
+            title: String,
+            body: String,
+            changedFiles: List<String>
+        ): PullRequestReference {
+            calls += Request(repositoryUrl, branchName, title, body, changedFiles)
+            failure?.let { throw it }
+            return PullRequestReference(42, "https://github.com/example/repo/pull/42", title)
         }
     }
 

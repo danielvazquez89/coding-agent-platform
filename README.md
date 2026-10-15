@@ -2,7 +2,7 @@
 
 A Kotlin + Quarkus project for a controlled software engineering agent. The intended product takes a GitHub issue, inspects one repository, proposes a patch, runs validation in isolation, and opens a pull request for a person to review.
 
-The project now runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks local Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and runs Maven tests in an isolated Docker environment. It returns a report with changed files, a diff, validation results, decisions, and open questions. GitHub issue ingestion and pull-request creation are not implemented.
+The project now runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks local Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and runs Maven tests in an isolated Docker environment. When explicitly enabled and configured for an allow-listed public GitHub repository, it can push a task branch and open a draft pull request after validation. It returns a report with changed files, a diff, validation results, decisions, open questions, and (when enabled) the pull-request URL. GitHub issue ingestion and private-repository clone authentication are not implemented.
 
 ## Product goals
 
@@ -39,6 +39,12 @@ The current local default is `qwen3:8b`. If needed, install it with `ollama pull
 The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff, validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, and elapsed time. Attempts can finish as `COMPLETED`, `FAILED`, or `NEEDS_INPUT`; failures retain a bounded summary and the report. Patch failures receive up to three bounded correction attempts and are retained even when a later patch succeeds. A task that makes no repository change is `FAILED` unless it needs a genuine blocking decision.
 
 When acceptance criteria are supplied, the agent must return one evidence-bearing assessment per criterion. Missing or evidence-free checks prevent completion; failed criteria fail the task, and unverified criteria require input. This is a model assessment, not independent proof: Maven tests and benchmark-specific expected-diff checks provide separate machine-verifiable evidence. A task is completed only when the workspace changed, all supplied criteria are reported as passed, and supported validation passed.
+
+#### Draft pull-request publishing
+
+Pull-request publishing is disabled by default. Set `AGENT_GITHUB_PULL_REQUESTS_ENABLED=true`, `AGENT_GITHUB_TOKEN` to a fine-grained token with **Contents: Read and write** and **Pull requests: Read and write**, and `AGENT_GITHUB_ALLOWED_REPOSITORIES=owner/repository` before starting the app. Keep the token outside source control. The task must use the matching HTTPS GitHub repository URL, and the repository must be publicly cloneable. Publishing commits only the changed paths, pushes a task-specific branch, and creates a draft PR against the repository default branch. If publication is retried after a PR was created, it records the existing PR rather than opening a duplicate; the report includes whether that PR is still open and in draft. The PR contains task context and reported checks; acceptance checks are explicitly labeled as model-assessed. The token is not sent to the model or test container. Pull requests are never merged automatically.
+
+If branch push or PR creation fails, the task is marked `FAILED` with `pullRequestError` in its persisted attempt report; a successfully pushed branch may remain and require manual cleanup. This first slice does not yet provide GitHub issue webhooks, GitHub App installation tokens, durable retry/recovery after partial publication, or a UI for reviewing the PR from the task page.
 
 Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and the host Maven artifact cache mounted read-only. Repository tests run without external network access. If required artifacts are missing, a separate bounded dependency-fetch container may download only Maven coordinates parsed from the missing-artifact diagnostics into the host cache before the test container is retried offline. Gradle, other build systems, and network-enabled builds are not supported.
 
@@ -90,9 +96,9 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `domain/model/TaskStatusTransition.kt` — Append-only status history entity.
 - `domain/model/TaskLifecycle.kt` — State machine policy: allowed transitions and `InvalidTaskTransitionException`.
 - `domain/model/TaskAttempt.kt` — Attempt entity and `AttemptStatus` enum.
-- `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `AgentDecision`, `AgentQuestion`, `AcceptanceCheck`, `ModelUsage`, `ValidationCheck`, `CheckOutcome`.
+- `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `AgentDecision`, `AgentQuestion`, `AcceptanceCheck`, `ModelUsage`, `PullRequestReference`, `ValidationCheck`, `CheckOutcome`.
 - `domain/port/CodingModelProvider.kt` — Provider-neutral LLM chat/tool-calling SPI (messages, tool definitions, tool calls, turns).
-- `domain/port/ExecutionPorts.kt` — Outbound port interfaces: `TaskExecutionState`, `AttemptOperations`, `RepositoryWorkspaceFactory`, `RepositoryWorkspace`, `CommandExecutor`, `CommandResult`, `ValidationRunner`, `ToolExecutionResult`.
+- `domain/port/ExecutionPorts.kt` — Outbound port interfaces: `TaskExecutionState`, `AttemptOperations`, `RepositoryWorkspaceFactory`, `RepositoryWorkspace`, `CommandExecutor`, `CommandResult`, `ValidationRunner`, `PullRequestPublisher`, `ToolExecutionResult`.
 
 #### `dev.agentplatform.application` — Use cases and orchestration
 
@@ -107,6 +113,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `infrastructure/persistence/TaskAttemptRepository.kt` — Panache repository for `TaskAttempt`.
 - `infrastructure/persistence/TaskStatusTransitionRepository.kt` — Panache repository for ordered status history.
 - `infrastructure/ollama/OllamaCodingModelProvider.kt` — Ollama `/api/chat` HTTP adapter; implements `CodingModelProvider`.
+- `infrastructure/github/GitHubPullRequestPublisher.kt` — allowlisted branch push and GitHub draft-PR creation; implements `PullRequestPublisher`.
 - `infrastructure/workspace/GitRepositoryWorkspaceFactory.kt` — Authorized local/GitHub repository cloning into isolated workspaces; implements `RepositoryWorkspaceFactory`.
 - `infrastructure/tool/WorkspaceToolExecutor.kt` — Path-checked, allowlisted tool execution for the model loop.
 - `infrastructure/docker/DockerValidationRunner.kt` — Disposable Docker Maven/PostgreSQL validation runtime; implements `ValidationRunner`.
@@ -214,6 +221,17 @@ Before running it:
 
 The first run initializes and commits the benchmark fixture locally; later runs require that fixture to be clean. Estimated token costs are zero by default for Ollama. Set `AGENT_MODEL_INPUT_COST_PER_MILLION_USD` and `AGENT_MODEL_OUTPUT_COST_PER_MILLION_USD` to the chosen model's rates when comparing paid models. The benchmark is only a smoke-sized baseline (three cases), not a statistically meaningful model-quality claim; report the sample size and benchmark version with any success rate.
 
+`benchmarks/v2/cases.json` retains those three cases and adds a no-change clarification control. Run it against the shared fixture with:
+
+```powershell
+.\benchmarks\v1\Invoke-Benchmark.ps1 `
+  -ManifestPath .\benchmarks\v2\cases.json `
+  -RepositoryPath .\benchmarks\v1\fixture `
+  -OutputPath .\benchmarks\v2\results-v2.json
+```
+
+The scorecard uses the **last** validation result, requires exactly one evidence-bearing passing assessment for each supplied criterion, can require an exact changed-file set, and checks that a clarification case produced neither changed files nor a diff. It reports false-success count/rate for expected non-completion cases, per-case patch failures, elapsed time, model usage, and validation outcomes. The diff/file checks are lightweight benchmark oracles, not proof of behavior; acceptance assessments remain model-authored. The prompt version is currently marked `unversioned`, and four cases are still only a smoke suite. Expand the suite with independently tested outcomes and diverse maintenance tasks before making quality claims.
+
 ### Try the API
 
 ```powershell
@@ -295,29 +313,25 @@ Given an authorized repository and a task with acceptance criteria, the agent sh
 
 Do these as small vertical slices. Keep the app runnable after each slice and document the behavior and limits that actually exist.
 
-### 1. Harden worker recovery and task operations
+### 1. Establish a measurable baseline
 
-The single worker and attempt report now exist, including bounded patch correction, criterion assessment, validation details, and usage metrics. Still add leases/heartbeats, recovery of tasks left running after a crash, explicit task-level retry/backoff limits, cancellation, and concurrency controls. Define how retries avoid duplicate side effects. Keep worker logic separate from REST resources so it can later run in its own process. Do not add RabbitMQ until a concrete scaling or isolation requirement calls for it.
+Run the v2 smoke suite and expand it to 15–30 varied Kotlin/JVM maintenance tasks. Include independently checked bug fixes and regressions, no-op and malformed patches, ambiguous requests, and explicit refusal/clarification controls. Keep evaluator oracles outside the workspace the agent can edit. Version the benchmark, system prompt, tool policy, and model; record final validation, changed files, false-successes, patch retries, human acceptance, cost, and elapsed time. **Exit gate:** reproducible runs and no false successes in the known negative controls. The four-case v2 suite is only a first slice of this phase.
 
-### 2. Improve tool-loop quality and repository support
+### 2. Harden completion and worker reliability
 
-The first tool loop exists for one local model and Maven repositories. Evaluate it on repeatable real tasks, make tool calls observable, and store appropriately redacted tool inputs/outputs and model usage. Add Gradle and other build support only after defining the sandbox and dependency-cache policy for each.
+The worker already requires a non-empty patch and successful supported validation, but acceptance criteria are still model-authored assessments, not independent verification. Preserve that distinction in API/report wording and never treat arbitrary model evidence as machine proof. Add tests for no-op patches, failed final validation, missing/duplicate criterion results, unsupported validation, and malformed patches. Then add leases/heartbeats, recovery of attempts left running after a crash, bounded task retries/backoff, cancellation, and concurrency controls. **Exit gate:** none of those failure cases can reach `COMPLETED`, and recovery cannot execute duplicate work. Keep worker logic separate from REST resources; do not add RabbitMQ until a concrete scaling need justifies it.
 
-### 3. Harden isolation and dependency management
+### 3. Make execution reviewable and close isolation gaps
 
-Maven tests currently run in a disposable, resource-limited container with no external network and no production secrets. Extend and review the sandbox policy as repository support grows. Decide how to populate a controlled dependency cache or proxy before permitting dependency downloads.
+The attempt report already includes diffs, validation results, patch failures, model usage, and duration. Add appropriately redacted per-tool audit records and explicit task-level time/cost budgets. Maven tests run in a disposable resource-limited Docker container, but model/tool orchestration runs in the application process; review this boundary before describing the whole agent as sandboxed. Define a controlled dependency-cache/proxy policy before permitting broader build support or network access. **Exit gate:** a reviewer can reconstruct what ran and what changed, and the execution boundary and limitations are documented.
 
-### 4. Integrate GitHub narrowly
+### 4. Add GitHub issue intake and harden PR publishing
 
-Begin with a manually submitted task against an allow-listed repository. Then add GitHub issue webhooks, short-lived narrowly scoped installation credentials, branch creation, and draft pull-request creation. Verify webhook signatures and make repeated delivery idempotent. Include validation summaries and failure limitations in the pull request. Keep merging manual.
+Opt-in draft-PR publishing now works for manually submitted tasks against allow-listed public GitHub repositories. Next add issue intake: start with one configured repository and manually supplied issue URL or an allow-listed label, then add signed webhook verification, idempotent delivery, and short-lived GitHub App credentials. Add durable publication state/retry handling for cases where a branch push succeeds but PR creation fails. Include the diff, validation evidence, and limitations in the draft PR. Keep merge approval human-controlled. **Exit gate:** duplicate events cannot create duplicate work/PRs, credentials are scoped and short-lived, partial publication can be recovered safely, and no path auto-merges.
 
-### 5. Build evaluation and observability
+### 5. Demo and polish
 
-The initial versioned three-task benchmark is in `benchmarks/v1`. Expand it toward 30–50 independently checked tasks; record model/prompt/tool versions, test outcomes, regressions, human acceptance, cost, and elapsed time. Publish sample sizes and limitations; do not infer improvements from a few hand-picked successes. Add structured logs, traces, and metrics for task/attempt lifecycle, model usage, tool calls, and validation results.
-
-### 6. Polish after the workflow works
-
-Only then add a simple status/log/diff/results view, deployment, and a demo. Keep architecture diagrams, setup steps, security assumptions, example runs, evaluation results, and known limitations current. Avoid Kubernetes, a vector database, multiple coding agents, and broad language support unless evidence shows they solve a real problem.
+Only after the workflow passes its gates, add a small status/diff/results view, deployment, and a demo. Publish measured results with sample sizes and known limitations; avoid claiming superiority to IDE coding assistants. Defer Kubernetes, a vector database, multi-agent orchestration, and broad language support unless evidence shows they solve a real problem.
 
 ## Suggested data model (to refine during implementation)
 
@@ -339,7 +353,7 @@ The source brief gives a strong direction, but leaves choices that affect implem
 - **Which repository is the first target?** Pick a small, disposable Kotlin/JVM sample repo with deterministic tests. Avoid proprietary or production repositories in the first evaluation set.
 - **Which model/provider?** The first adapter targets local Ollama by user choice, behind a provider interface. Select the local model after checking available RAM/GPU and test tool-call quality on a small benchmark. Revisit hosted providers only with an explicit usage budget.
 - **How should builds access dependencies?** A fully offline sandbox is safer, but many builds need dependency downloads. Decide on a controlled artifact cache/proxy or an explicit network allowlist before enabling execution.
-- **How should GitHub authenticate?** Prefer a GitHub App with installation-scoped permissions and short-lived credentials. Keep repository allowlisting and draft PRs as defaults.
+- **How should GitHub authenticate?** The current opt-in publisher uses a fine-grained token restricted to an allow-listed repository. Prefer a GitHub App with installation-scoped permissions and short-lived credentials before offering webhook intake or a hosted service.
 - **Which language is in scope?** Start with one Kotlin/JVM repository and its existing build/test commands. Add language support only when the first workflow is measurable.
 - **What counts as success?** Define benchmark task selection, acceptance checks, regression checks, human review outcomes, and how cost/latency are calculated before publishing scores.
 
@@ -347,7 +361,7 @@ These choices can be discussed while implementing the worker; they do not need t
 ## Status and handoff for the next coding session
 
 - Ollama is the first model backend. The provider contract and HTTP adapter have mock-HTTP coverage; run the versioned benchmark before making model-quality claims.
-- The scheduled single-process worker, fail-closed local repository-root configuration, tool allowlist, temporary repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, and benchmark runner are implemented. Continue with crash recovery, broader benchmark coverage, observability, supported build systems, and dependency-cache policy.
+- The scheduled single-process worker, fail-closed local repository-root configuration, tool allowlist, temporary repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. GitHub issue intake, private-repository clone authentication, and durable recovery from partial publication are not implemented. Next priorities are to validate publishing against a dedicated test repository, expand the benchmark, and implement issue intake/recovery.
 - Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces 100% line and branch coverage for measured application code; the HTML report is generated under `target/site/jacoco`.
 - PostgreSQL 18.6 databases `coding_agent_platform` and `coding_agent_platform_test` plus limited login `coding_agent_app` are configured locally. The app role password is in the ignored project `.env`; the administrator password is not used by the app.
 - The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. The isolated PostgreSQL test database is migrated through V4 for attempts.

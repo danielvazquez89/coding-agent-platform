@@ -20,9 +20,12 @@ class TaskExecutionWorker(
     private val model: CodingModelProvider,
     private val workspaces: RepositoryWorkspaceFactory,
     private val tools: WorkspaceToolExecutor,
+    private val pullRequestPublisher: PullRequestPublisher,
     private val objectMapper: ObjectMapper,
     @ConfigProperty(name = "agent.execution.enabled", defaultValue = "true")
     private val enabled: Boolean,
+    @ConfigProperty(name = "agent.github.pull-requests.enabled", defaultValue = "false")
+    private val pullRequestsEnabled: Boolean,
     @ConfigProperty(name = "agent.execution.max-tool-calls", defaultValue = "24")
     private val maxToolCalls: Int,
     @ConfigProperty(name = "agent.model.ollama.model", defaultValue = "qwen3:8b")
@@ -92,28 +95,13 @@ class TaskExecutionWorker(
             val blockingQuestions = modelQuestions.filter(AgentQuestion::blocking)
             val lastValidation = validation.lastOrNull()
             val acceptanceChecks = acceptanceChecks(task, parsedReport.acceptanceChecks)
-            val taskStatus = when {
+            var taskStatus = when {
                 blockingQuestions.isNotEmpty() || lastValidation?.outcome == CheckOutcome.SKIPPED -> TaskStatus.NEEDS_INPUT
                 acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } -> TaskStatus.FAILED
                 acceptanceChecks.any { it.outcome != AcceptanceOutcome.PASSED } -> TaskStatus.NEEDS_INPUT
                 changedFiles.isEmpty() -> TaskStatus.FAILED
                 lastValidation?.outcome == CheckOutcome.PASSED -> TaskStatus.COMPLETED
                 else -> TaskStatus.FAILED
-            }
-            val reason = when (taskStatus) {
-                TaskStatus.NEEDS_INPUT -> when {
-                    blockingQuestions.isNotEmpty() -> "Agent needs a user decision"
-                    lastValidation?.outcome == CheckOutcome.SKIPPED -> "No supported validation could run"
-                    acceptanceChecks.any { it.outcome == AcceptanceOutcome.UNVERIFIED } -> "Acceptance criteria could not be verified"
-                    else -> null
-                }
-                TaskStatus.COMPLETED -> null
-                TaskStatus.FAILED -> when {
-                    acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } -> "One or more acceptance criteria were reported as not met"
-                    changedFiles.isEmpty() -> "The agent did not produce a repository change"
-                    else -> lastValidation?.details?.take(500) ?: "Agent could not produce a validated result"
-                }
-                else -> null
             }
             val questions = when {
                 lastValidation?.outcome == CheckOutcome.SKIPPED && blockingQuestions.isEmpty() -> modelQuestions + AgentQuestion(
@@ -128,10 +116,6 @@ class TaskExecutionWorker(
                     )
                 else -> modelQuestions
             }
-            val report = buildReport(
-                task, finalText, workspace, changedFiles, validation, questions, taskStatus,
-                acceptanceChecks, trace, elapsedMillis(executionStartedAt)
-            )
             if (taskStatus != TaskStatus.NEEDS_INPUT) {
                 val validationReason = when {
                     changedFiles.isEmpty() -> "No repository changes were produced"
@@ -142,6 +126,43 @@ class TaskExecutionWorker(
                 }
                 taskState.transition(task.id, TaskStatus.VALIDATING, validationReason, "WORKER")
             }
+            var pullRequest: PullRequestReference? = null
+            var pullRequestError: String? = null
+            if (taskStatus == TaskStatus.COMPLETED && pullRequestsEnabled) {
+                try {
+                    val repositoryUrl = checkNotNull(task.repositoryUrl)
+                    pullRequest = pullRequestPublisher.createDraft(
+                        repositoryUrl = repositoryUrl,
+                        workspace = workspace.root,
+                        branchName = "agent/task-${task.id}",
+                        title = "[Agent] ${task.title.take(220)}",
+                        body = pullRequestBody(task, validation, acceptanceChecks),
+                        changedFiles = changedFiles
+                    )
+                } catch (failure: Exception) {
+                    log.errorf(failure, "Task %s validated but draft pull request publication failed", task.id)
+                    pullRequestError = (failure.message ?: failure.javaClass.simpleName).take(2000)
+                    taskStatus = TaskStatus.FAILED
+                }
+            }
+            val reason = when {
+                pullRequestError != null -> "Validated changes could not be published as a draft pull request: $pullRequestError"
+                taskStatus == TaskStatus.NEEDS_INPUT -> when {
+                    blockingQuestions.isNotEmpty() -> "Agent needs a user decision"
+                    lastValidation?.outcome == CheckOutcome.SKIPPED -> "No supported validation could run"
+                    acceptanceChecks.any { it.outcome == AcceptanceOutcome.UNVERIFIED } -> "Acceptance criteria could not be verified"
+                    else -> null
+                }
+                taskStatus == TaskStatus.COMPLETED -> null
+                acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } ->
+                    "One or more acceptance criteria were reported as not met"
+                changedFiles.isEmpty() -> "The agent did not produce a repository change"
+                else -> lastValidation?.details?.take(500) ?: "Agent could not produce a validated result"
+            }
+            val report = buildReport(
+                task, finalText, workspace, changedFiles, validation, questions, taskStatus,
+                acceptanceChecks, trace, elapsedMillis(executionStartedAt), pullRequest, pullRequestError
+            )
             log.infof("Task %s attempt %s finishing with taskStatus=%s, changedFiles=%d, validationChecks=%d",
                 task.id, attempt.id, taskStatus, changedFiles.size, validation.size)
             finalizer.finish(
@@ -357,7 +378,9 @@ class TaskExecutionWorker(
         status: TaskStatus,
         acceptanceChecks: List<AcceptanceCheck>,
         trace: ExecutionTrace,
-        executionDurationMillis: Long
+        executionDurationMillis: Long,
+        pullRequest: PullRequestReference?,
+        pullRequestError: String?
     ): TaskExecutionReport {
         val parsed = parseReport(finalText)
         val defaultDecision = AgentDecision(
@@ -368,8 +391,17 @@ class TaskExecutionWorker(
         )
         val finalQuestions = questions.ifEmpty { parsed.questions }
         val summary = when (status) {
-            TaskStatus.COMPLETED -> "Changes were applied, reported acceptance criteria passed, and validation passed."
+            TaskStatus.COMPLETED -> if (pullRequest != null) {
+                "Changes were applied, reported acceptance criteria passed, validation passed, and pull request #${pullRequest.number} (${pullRequest.state}${if (pullRequest.draft) ", draft" else ""}) is available."
+            } else {
+                "Changes were applied, reported acceptance criteria passed, and validation passed."
+            }
             TaskStatus.NEEDS_INPUT -> "Execution needs a user decision or additional verification before completion."
+            TaskStatus.FAILED -> if (pullRequestError != null) {
+                "Changes passed validation but draft pull request publication failed."
+            } else {
+                "Execution did not satisfy all completion requirements."
+            }
             else -> "Execution did not satisfy all completion requirements."
         }
         val modelNarrative = parsed.implementation ?: finalText.take(10_000).ifBlank {
@@ -398,9 +430,38 @@ class TaskExecutionWorker(
             acceptanceChecks = acceptanceChecks,
             patchFailures = trace.patchFailures.toList(),
             modelUsage = trace.usage(),
-            executionDurationMillis = executionDurationMillis
+            executionDurationMillis = executionDurationMillis,
+            pullRequest = pullRequest,
+            pullRequestError = pullRequestError
         )
     }
+
+    private fun pullRequestBody(
+        task: CodingTask,
+        validation: List<ValidationCheck>,
+        acceptanceChecks: List<AcceptanceCheck>
+    ): String = buildString {
+        append("## Task\n")
+        append(task.description.take(10_000)).append("\n\n")
+        append("## Validation\n")
+        validation.forEach { check ->
+            append("- ").append(check.name).append(": **").append(check.outcome).append("**")
+            check.exitCode?.let { append(" (exit code ").append(it).append(')') }
+            append('\n')
+        }
+        append("\n## Acceptance criteria\n")
+        if (acceptanceChecks.isEmpty()) {
+            append("No acceptance criteria were provided.\n")
+        } else {
+            append("These results are agent-assessed and are not independent proof.\n")
+            acceptanceChecks.forEach { check ->
+                append("- ").append(check.outcome).append(": ").append(check.criterion)
+                check.evidence?.takeIf(String::isNotBlank)?.let { append(" — ").append(it.take(500)) }
+                append('\n')
+            }
+        }
+        append("\n---\nCreated by Coding Agent Platform. Review the diff and checks before merging.\n")
+    }.take(20_000)
 
     private fun parseReport(text: String): ParsedReport {
         val json = try { objectMapper.readTree(text) } catch (_: Exception) { null }

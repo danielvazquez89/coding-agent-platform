@@ -51,4 +51,15 @@ interface ValidationRunner {
     fun validate(workspace: Path): ValidationCheck
 }
 
+interface PullRequestPublisher {
+    fun createDraft(
+        repositoryUrl: String,
+        workspace: Path,
+        branchName: String,
+        title: String,
+        body: String,
+        changedFiles: List<String>
+    ): PullRequestReference
+}
+
 data class ToolExecutionResult(val content: String, val validation: ValidationCheck? = null)
