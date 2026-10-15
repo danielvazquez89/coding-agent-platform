@@ -7,7 +7,7 @@ object TaskLifecycle {
         TaskStatus.VALIDATING to setOf(TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.NEEDS_INPUT, TaskStatus.CANCELLED),
         TaskStatus.COMPLETED to emptySet(),
         TaskStatus.FAILED to emptySet(),
-        TaskStatus.NEEDS_INPUT to emptySet(),
+        TaskStatus.NEEDS_INPUT to setOf(TaskStatus.QUEUED),
         TaskStatus.CANCELLED to emptySet()
     )
 

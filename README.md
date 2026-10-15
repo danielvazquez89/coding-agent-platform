@@ -2,7 +2,7 @@
 
 A Kotlin + Quarkus project for a controlled software engineering agent. The intended product takes a GitHub issue, inspects one repository, proposes a patch, runs validation in isolation, and opens a pull request for a person to review.
 
-The project now runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks local Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and runs Maven tests in an isolated Docker environment. When explicitly enabled and configured for an allow-listed public GitHub repository, it can push a task branch and open a draft pull request after validation. It returns a report with changed files, a diff, validation results, decisions, open questions, and (when enabled) the pull-request URL. GitHub issue ingestion and private-repository clone authentication are not implemented.
+The project now runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks local Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and runs Maven tests in an isolated Docker environment. A local review page shows reports, diffs, validation, tool-audit summaries, and draft-PR links; users can answer a `NEEDS_INPUT` question and queue a new attempt. Per-task time and estimated-cost limits are configurable. When explicitly enabled and configured for an allow-listed public GitHub repository, it can push a task branch and open a draft pull request after validation. GitHub issue ingestion and private-repository clone authentication are not implemented.
 
 ## Product goals
 
@@ -26,6 +26,7 @@ The engineering challenge is making the workflow dependable and safe, not adding
 | `GET` | `/api/tasks` | List persisted tasks, newest first. |
 | `GET` | `/api/tasks/{id}` | Return a task or `404`. |
 | `PATCH` | `/api/tasks/{id}/status` | Apply a permitted status transition; return `409` for an invalid transition and `404` for an unknown task. |
+| `POST` | `/api/tasks/{id}/answer` | Add a clarification to a `NEEDS_INPUT` task and queue another attempt; return `409` unless the task is awaiting input. |
 | `GET` | `/api/tasks/{id}/history` | Return ordered, append-only status history, including the initial `QUEUED` entry. |
 | `GET` | `/api/tasks/{id}/attempts` | Return attempts in attempt-number order, with status, report, and failure summary. |
 | `GET` | `/api/tasks/{id}/attempts/{attemptId}` | Return one attempt and its structured execution report. |
@@ -36,7 +37,11 @@ Create-task fields are `title`, `description`, `acceptanceCriteria` (optional li
 
 The current local default is `qwen3:8b`. If needed, install it with `ollama pull qwen3:8b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL.
 
-The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff, validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, and elapsed time. Attempts can finish as `COMPLETED`, `FAILED`, or `NEEDS_INPUT`; failures retain a bounded summary and the report. Patch failures receive up to three bounded correction attempts and are retained even when a later patch succeeds. A task that makes no repository change is `FAILED` unless it needs a genuine blocking decision.
+The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff, validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, elapsed time, configured budgets, and per-tool audit records. Audit records retain tool name, a redacted argument summary, outcome, duration, and a short result summary; they deliberately omit source contents, full patches, and tool outputs. Records are stored with the completed attempt report, so a crash before finalization can lose the in-memory audit trail.
+
+`AGENT_MAX_TASK_DURATION_SECONDS` defaults to `1800`; `AGENT_MAX_TASK_COST_USD` defaults to `1.0`. Budgets are cumulative across completed attempts for one task, including clarification/resume attempts; queue waiting time is excluded. Time is checked between model/tool operations and after each model response; cost is checked against cumulative reported token usage after each response. These are operation-boundary guardrails, not hard preemptive ceilings: an in-progress operation is not forcibly interrupted when a limit is reached. Cost enforcement requires non-zero input/output rates (`AGENT_MODEL_INPUT_COST_PER_MILLION_USD` and `AGENT_MODEL_OUTPUT_COST_PER_MILLION_USD`) and reported token counts; if rates are set but current or prior token usage is unavailable, the attempt fails closed. Time enforcement also fails closed when prior attempt duration is unavailable. With the default zero rates, estimated cost is zero and the cost ceiling cannot represent actual inference costs.
+
+`NEEDS_INPUT` tasks can be answered through the review page or API. The answer is prepended to the task prompt as a labeled clarification so it remains in the prompt when the original description is long; a status-history entry records the requeue, and a fresh attempt runs against a new workspace. The previous report remains available in attempt history.
 
 When acceptance criteria are supplied, the agent must return one evidence-bearing assessment per criterion. Missing or evidence-free checks prevent completion; failed criteria fail the task, and unverified criteria require input. This is a model assessment, not independent proof: Maven tests and benchmark-specific expected-diff checks provide separate machine-verifiable evidence. A task is completed only when the workspace changed, all supplied criteria are reported as passed, and supported validation passed.
 
@@ -44,9 +49,13 @@ When acceptance criteria are supplied, the agent must return one evidence-bearin
 
 Pull-request publishing is disabled by default. Set `AGENT_GITHUB_PULL_REQUESTS_ENABLED=true`, `AGENT_GITHUB_TOKEN` to a fine-grained token with **Contents: Read and write** and **Pull requests: Read and write**, and `AGENT_GITHUB_ALLOWED_REPOSITORIES=owner/repository` before starting the app. Keep the token outside source control. The task must use the matching HTTPS GitHub repository URL, and the repository must be publicly cloneable. Publishing commits only the changed paths, pushes a task-specific branch, and creates a draft PR against the repository default branch. If publication is retried after a PR was created, it records the existing PR rather than opening a duplicate; the report includes whether that PR is still open and in draft. The PR contains task context and reported checks; acceptance checks are explicitly labeled as model-assessed. The token is not sent to the model or test container. Pull requests are never merged automatically.
 
-If branch push or PR creation fails, the task is marked `FAILED` with `pullRequestError` in its persisted attempt report; a successfully pushed branch may remain and require manual cleanup. This first slice does not yet provide GitHub issue webhooks, GitHub App installation tokens, durable retry/recovery after partial publication, or a UI for reviewing the PR from the task page.
+If branch push or PR creation fails, the task is marked `FAILED` with `pullRequestError` in its persisted attempt report; a successfully pushed branch may remain and require manual cleanup. The local review page at `/` displays reports and draft-PR links but does not embed GitHub's review interface, approve changes, or merge. The UI and API are unauthenticated and must remain on localhost or a trusted network. This first slice does not yet provide GitHub issue webhooks, GitHub App installation tokens, or durable retry/recovery after partial publication.
 
-Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and the host Maven artifact cache mounted read-only. Repository tests run without external network access. If required artifacts are missing, a separate bounded dependency-fetch container may download only Maven coordinates parsed from the missing-artifact diagnostics into the host cache before the test container is retried offline. Gradle, other build systems, and network-enabled builds are not supported.
+Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and the host Maven artifact cache mounted read-only. Repository tests run without external network access. If required artifacts are missing, a separate bounded dependency-fetch container may download only Maven coordinates parsed from the missing-artifact diagnostics into the host cache before the test container is retried offline. Test and dependency-fetch commands run in containers; model/tool orchestration, workspace management, and allow-listed file/patch operations still run in the application process. Do not describe the whole agent as sandboxed. Gradle, other build systems, and network-enabled builds are not supported.
+
+### Local review page
+
+Open <http://localhost:8081/> to list tasks and inspect the latest attempt, report, diff, validation checks, tool-audit summaries, open questions, and draft-PR link. For a `NEEDS_INPUT` task, submit a clarification there; the task is requeued and the worker starts another attempt. This is a local operator view, not an embedded GitHub review client. Protect the app from untrusted network access because the API and page are unauthenticated.
 
 Allowed transitions:
 
@@ -59,9 +68,11 @@ QUEUED ──→ RUNNING ──→ VALIDATING ──→ COMPLETED
    │          ├──→ NEEDS_INPUT
    │          └──→ CANCELLED
    └──→ CANCELLED
+
+NEEDS_INPUT ──(answer)──→ QUEUED
 ```
 
-`COMPLETED`, `FAILED`, `NEEDS_INPUT`, and `CANCELLED` are terminal. Invalid and repeated transitions are rejected without changing task state or writing history.
+`COMPLETED`, `FAILED`, and `CANCELLED` are terminal. `NEEDS_INPUT` can transition to `QUEUED` only through the answer endpoint, which prepends the clarification to the task prompt and starts another attempt. Other invalid and repeated transitions are rejected without changing task state or writing history.
 
 ### Architecture and code map
 
@@ -88,6 +99,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 
 - `api/TaskResource.kt` — REST routes, input validation, HTTP status codes.
 - `api/dto/TaskDtos.kt` — API data transfer objects: `CreateTaskRequest`, `TransitionTaskRequest`, `TaskStatusTransitionResponse`, `TaskAttemptResponse`, `ApiError`.
+- `src/main/resources/META-INF/resources/index.html` — local task/PR review page and `NEEDS_INPUT` answer form.
 
 #### `dev.agentplatform.domain` — Core business logic (no framework dependencies)
 
@@ -96,7 +108,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `domain/model/TaskStatusTransition.kt` — Append-only status history entity.
 - `domain/model/TaskLifecycle.kt` — State machine policy: allowed transitions and `InvalidTaskTransitionException`.
 - `domain/model/TaskAttempt.kt` — Attempt entity and `AttemptStatus` enum.
-- `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `AgentDecision`, `AgentQuestion`, `AcceptanceCheck`, `ModelUsage`, `PullRequestReference`, `ValidationCheck`, `CheckOutcome`.
+- `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `ToolExecutionAudit`, `ToolExecutionOutcome`, `AgentDecision`, `AgentQuestion`, `AcceptanceCheck`, `ModelUsage`, `PullRequestReference`, `ValidationCheck`, `CheckOutcome`.
 - `domain/port/CodingModelProvider.kt` — Provider-neutral LLM chat/tool-calling SPI (messages, tool definitions, tool calls, turns).
 - `domain/port/ExecutionPorts.kt` — Outbound port interfaces: `TaskExecutionState`, `AttemptOperations`, `RepositoryWorkspaceFactory`, `RepositoryWorkspace`, `CommandExecutor`, `CommandResult`, `ValidationRunner`, `PullRequestPublisher`, `ToolExecutionResult`.
 
@@ -254,6 +266,14 @@ Invoke-RestMethod -Method Patch -Uri "http://localhost:8081/api/tasks/$($task.id
 Invoke-RestMethod -Uri "http://localhost:8081/api/tasks/$($task.id)/history"
 ```
 
+To answer an attempt that finished as `NEEDS_INPUT`, send a clarification. It is prepended to the task prompt, which returns to `QUEUED`; the worker creates a fresh attempt while preserving earlier reports:
+
+```powershell
+$answer = @{ answer = 'Use cursor pagination and preserve the existing default page size.' } | ConvertTo-Json
+Invoke-RestMethod -Method Post -Uri "http://localhost:8081/api/tasks/$($task.id)/answer" `
+  -ContentType 'application/json' -Body $answer
+```
+
 Create a task against a repository under the configured allowlisted local root, or against a public GitHub HTTPS URL. For local access, configure `AGENT_ALLOWED_LOCAL_ROOT` to a parent directory containing only repositories you intend the agent to access. Keep `AGENT_WORKSPACE_ROOT` separate. Do not point the agent at directories containing credentials or production data.
 
 ## Decisions and boundaries
@@ -323,7 +343,7 @@ The worker already requires a non-empty patch and successful supported validatio
 
 ### 3. Make execution reviewable and close isolation gaps
 
-The attempt report already includes diffs, validation results, patch failures, model usage, and duration. Add appropriately redacted per-tool audit records and explicit task-level time/cost budgets. Maven tests run in a disposable resource-limited Docker container, but model/tool orchestration runs in the application process; review this boundary before describing the whole agent as sandboxed. Define a controlled dependency-cache/proxy policy before permitting broader build support or network access. **Exit gate:** a reviewer can reconstruct what ran and what changed, and the execution boundary and limitations are documented.
+The attempt report now includes redacted per-tool audit summaries and configurable time/cost guardrails; they are finalized with the attempt report and do not preemptively cancel an in-flight operation. The local review page exposes this evidence. Maven tests run in a disposable, resource-limited Docker container, but model/tool orchestration runs in the application process. Isolate orchestration and repository tools behind a bounded execution runtime before describing the whole agent as sandboxed. Define a controlled dependency-cache/proxy policy before permitting broader build support or network access. **Exit gate:** a reviewer can reconstruct completed attempts, budget behavior is explicit, and the execution boundary and limitations are documented.
 
 ### 4. Add GitHub issue intake and harden PR publishing
 
@@ -331,7 +351,7 @@ Opt-in draft-PR publishing now works for manually submitted tasks against allow-
 
 ### 5. Demo and polish
 
-Only after the workflow passes its gates, add a small status/diff/results view, deployment, and a demo. Publish measured results with sample sizes and known limitations; avoid claiming superiority to IDE coding assistants. Defer Kubernetes, a vector database, multi-agent orchestration, and broad language support unless evidence shows they solve a real problem.
+Only after the workflow passes its gates, polish the local review page, then consider deployment and a demo. Add authentication before any non-local deployment. Publish measured results with sample sizes and known limitations; avoid claiming superiority to IDE coding assistants. Defer Kubernetes, a vector database, multi-agent orchestration, and broad language support unless evidence shows they solve a real problem.
 
 ## Suggested data model (to refine during implementation)
 
@@ -361,7 +381,7 @@ These choices can be discussed while implementing the worker; they do not need t
 ## Status and handoff for the next coding session
 
 - Ollama is the first model backend. The provider contract and HTTP adapter have mock-HTTP coverage; run the versioned benchmark before making model-quality claims.
-- The scheduled single-process worker, fail-closed local repository-root configuration, tool allowlist, temporary repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. GitHub issue intake, private-repository clone authentication, and durable recovery from partial publication are not implemented. Next priorities are to validate publishing against a dedicated test repository, expand the benchmark, and implement issue intake/recovery.
+- The scheduled single-process worker, fail-closed local repository-root configuration, tool allowlist, temporary repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, answer-and-requeue flow, local review page, per-tool audit summaries, task time/cost guardrails, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. Model/tool orchestration still runs in the application process; GitHub issue intake, private-repository clone authentication, and durable recovery from partial publication are not implemented. Next priorities are to validate publishing against a dedicated test repository, expand the benchmark, and isolate orchestration with durable per-tool audit persistence.
 - Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces 100% line and branch coverage for measured application code; the HTML report is generated under `target/site/jacoco`.
 - PostgreSQL 18.6 databases `coding_agent_platform` and `coding_agent_platform_test` plus limited login `coding_agent_app` are configured locally. The app role password is in the ignored project `.env`; the administrator password is not used by the app.
 - The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. The isolated PostgreSQL test database is migrated through V4 for attempts.

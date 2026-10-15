@@ -18,6 +18,8 @@ data class TransitionTaskRequest(
     val reason: String? = null
 )
 
+data class AnswerTaskRequest(val answer: String)
+
 data class TaskStatusTransitionResponse(
     val sequenceNumber: Int,
     val taskId: UUID,

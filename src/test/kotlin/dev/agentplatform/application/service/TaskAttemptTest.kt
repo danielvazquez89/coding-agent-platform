@@ -3,6 +3,7 @@ package dev.agentplatform.application.service
 import dev.agentplatform.api.dto.CreateTaskRequest
 import dev.agentplatform.api.dto.TransitionTaskRequest
 import dev.agentplatform.domain.model.*
+import dev.agentplatform.domain.port.TaskBudgetUsage
 import io.quarkus.test.junit.QuarkusTest
 import io.restassured.RestAssured.given
 import io.restassured.http.ContentType
@@ -56,11 +57,19 @@ class TaskAttemptTest {
             ),
             patchFailures = listOf("The first diff was rejected; a corrected patch applied."),
             modelUsage = ModelUsage("qwen3:8b", 1200, 350, 4, 2100, 0.0),
-            executionDurationMillis = 4500
+            executionDurationMillis = 4500,
+            toolExecutions = listOf(
+                ToolExecutionAudit(1, "read_file", "path=README.md", ToolExecutionOutcome.SUCCEEDED, 12, "Returned 42 characters")
+            ),
+            maxExecutionDurationMillis = 1_800_000,
+            maxEstimatedCostUsd = 1.0,
+            totalTaskExecutionDurationMillis = 4500,
+            totalEstimatedCostUsd = 0.0
         )
         val finishedFirst = attemptService.finish(taskId, first.id, AttemptStatus.COMPLETED, report)!!
 
         val second = attemptService.start(taskId)!!
+        assertEquals(TaskBudgetUsage(4500, 0.0), attemptService.priorBudgetUsage(taskId))
         attemptService.finish(
             taskId,
             second.id,
@@ -79,6 +88,7 @@ class TaskAttemptTest {
         assertEquals(1, first.attemptNumber)
         assertEquals(2, second.attemptNumber)
         assertNotNull(finishedFirst.finishedAt)
+        assertEquals(TaskBudgetUsage(9000, 0.0), attemptService.priorBudgetUsage(taskId))
 
         given()
             .`when`().get("/api/tasks/$taskId/attempts")
@@ -99,6 +109,10 @@ class TaskAttemptTest {
             .body("[0].report.modelUsage.promptTokens", equalTo(1200))
             .body("[0].report.modelUsage.estimatedCostUsd", notNullValue())
             .body("[0].report.executionDurationMillis", equalTo(4500))
+            .body("[0].report.toolExecutions[0].outcome", equalTo("SUCCEEDED"))
+            .body("[0].report.toolExecutions[0].argumentsSummary", equalTo("path=README.md"))
+            .body("[0].report.maxExecutionDurationMillis", equalTo(1_800_000))
+            .body("[0].report.totalTaskExecutionDurationMillis", equalTo(4500))
             .body("[1].attemptNumber", equalTo(2))
             .body("[1].status", equalTo("NEEDS_INPUT"))
 
@@ -140,7 +154,20 @@ class TaskAttemptTest {
         assertEquals(4000, failure.errorSummary?.length)
         assertNull(failure.reportJson)
         assertNull(attemptService.find(taskId, attempt.id)?.report)
+        assertEquals(TaskBudgetUsage(null, null), attemptService.priorBudgetUsage(taskId))
         assertNull(attemptService.start(UUID.randomUUID()))
+    }
+
+    @Test
+    fun `prior budget usage is unknown when a saved attempt report omits measurements`() {
+        val taskId = createTask()
+        taskService.transition(taskId, TaskStatus.RUNNING, "Worker claimed task")
+        val attempt = attemptService.start(taskId)!!
+        attemptService.finish(
+            taskId, attempt.id, AttemptStatus.NEEDS_INPUT, TaskExecutionReport("Summary", "Implementation")
+        )
+
+        assertEquals(TaskBudgetUsage(null, null), attemptService.priorBudgetUsage(taskId))
     }
 
     @Test

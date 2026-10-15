@@ -49,6 +49,17 @@ data class PullRequestReference(
     val draft: Boolean = true
 )
 
+enum class ToolExecutionOutcome { SUCCEEDED, FAILED, REJECTED }
+
+data class ToolExecutionAudit(
+    val sequenceNumber: Int,
+    val toolName: String,
+    val argumentsSummary: String,
+    val outcome: ToolExecutionOutcome,
+    val durationMillis: Long,
+    val resultSummary: String
+)
+
 data class TaskExecutionReport(
     val summary: String,
     val implementation: String,
@@ -62,5 +73,11 @@ data class TaskExecutionReport(
     val modelUsage: ModelUsage? = null,
     val executionDurationMillis: Long? = null,
     val pullRequest: PullRequestReference? = null,
-    val pullRequestError: String? = null
+    val pullRequestError: String? = null,
+    val toolExecutions: List<ToolExecutionAudit> = emptyList(),
+    val maxExecutionDurationMillis: Long? = null,
+    val maxEstimatedCostUsd: Double? = null,
+    val executionBudgetExceeded: String? = null,
+    val totalTaskExecutionDurationMillis: Long? = null,
+    val totalEstimatedCostUsd: Double? = null
 )

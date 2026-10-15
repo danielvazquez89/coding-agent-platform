@@ -55,6 +55,23 @@ class TaskResource @Inject constructor(
             ?: throw NotFoundException("Task $id was not found")
     }
 
+    @POST
+    @Path("/{id}/answer")
+    fun answer(@PathParam("id") id: UUID, request: AnswerTaskRequest): CodingTask {
+        if (request.answer.isBlank()) throw BadRequestException("answer must not be blank")
+        if (request.answer.trim().length > MAX_ANSWER_LENGTH) {
+            throw BadRequestException("answer must be $MAX_ANSWER_LENGTH characters or fewer")
+        }
+        return try {
+            taskService.answerAndRequeue(id, request.answer)
+                ?: throw NotFoundException("Task $id was not found")
+        } catch (failure: IllegalStateException) {
+            throw ClientErrorException(failure.message, Response.Status.CONFLICT)
+        } catch (failure: IllegalArgumentException) {
+            throw BadRequestException(failure.message)
+        }
+    }
+
     @GET
     @Path("/{id}/history")
     fun history(@PathParam("id") id: UUID): List<TaskStatusTransitionResponse> {
@@ -80,6 +97,7 @@ class TaskResource @Inject constructor(
     private companion object {
         const val MAX_ACCEPTANCE_CRITERIA = 30
         const val MAX_ACCEPTANCE_CRITERION_LENGTH = 1000
+        const val MAX_ANSWER_LENGTH = 5000
     }
 }
 

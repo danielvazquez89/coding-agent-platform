@@ -17,7 +17,8 @@ class TaskLifecycleTest {
             TaskStatus.VALIDATING to TaskStatus.COMPLETED,
             TaskStatus.VALIDATING to TaskStatus.FAILED,
             TaskStatus.VALIDATING to TaskStatus.NEEDS_INPUT,
-            TaskStatus.VALIDATING to TaskStatus.CANCELLED
+            TaskStatus.VALIDATING to TaskStatus.CANCELLED,
+            TaskStatus.NEEDS_INPUT to TaskStatus.QUEUED
         )
 
         for (from in TaskStatus.entries) {

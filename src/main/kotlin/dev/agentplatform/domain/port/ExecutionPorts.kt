@@ -13,6 +13,7 @@ interface TaskExecutionState {
 }
 
 interface AttemptOperations {
+    fun priorBudgetUsage(taskId: UUID): TaskBudgetUsage = TaskBudgetUsage()
     fun start(taskId: UUID): TaskAttempt?
     fun finish(
         taskId: UUID,
@@ -22,6 +23,11 @@ interface AttemptOperations {
         errorSummary: String? = null
     ): TaskAttempt?
 }
+
+data class TaskBudgetUsage(
+    val executionDurationMillis: Long? = 0,
+    val estimatedCostUsd: Double? = 0.0
+)
 
 interface RepositoryWorkspaceFactory {
     fun open(repositoryUrl: String): RepositoryWorkspace

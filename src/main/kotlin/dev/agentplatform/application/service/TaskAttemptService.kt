@@ -7,6 +7,7 @@ import dev.agentplatform.domain.model.TaskAttempt
 import dev.agentplatform.domain.model.TaskExecutionReport
 import dev.agentplatform.domain.model.TaskStatus
 import dev.agentplatform.domain.port.AttemptOperations
+import dev.agentplatform.domain.port.TaskBudgetUsage
 import dev.agentplatform.infrastructure.persistence.TaskAttemptRepository
 import dev.agentplatform.infrastructure.persistence.TaskRepository
 import jakarta.enterprise.context.ApplicationScoped
@@ -20,6 +21,31 @@ class TaskAttemptService(
     private val attemptRepository: TaskAttemptRepository,
     private val objectMapper: ObjectMapper
 ) : AttemptOperations {
+    override fun priorBudgetUsage(taskId: UUID): TaskBudgetUsage {
+        var elapsedMillis: Long? = 0
+        var estimatedCostUsd: Double? = 0.0
+        attemptRepository.forTaskInOrder(taskId)
+            .filter { it.status != AttemptStatus.RUNNING }
+            .forEach { attempt ->
+                val json = attempt.reportJson?.let(objectMapper::readTree)
+                if (json == null) {
+                    elapsedMillis = null
+                    estimatedCostUsd = null
+                } else {
+                    val duration = json.path("executionDurationMillis")
+                        .takeIf { it.isNumber }?.asLong()
+                    elapsedMillis = if (duration == null || elapsedMillis == null) null
+                    else Math.addExact(elapsedMillis!!, duration)
+
+                    val cost = json.path("modelUsage").path("estimatedCostUsd")
+                        .takeIf { it.isNumber }?.asDouble()
+                    estimatedCostUsd = if (cost == null || estimatedCostUsd == null) null
+                    else estimatedCostUsd!! + cost
+                }
+            }
+        return TaskBudgetUsage(elapsedMillis, estimatedCostUsd)
+    }
+
     /** Called by the execution worker after it has durably claimed a RUNNING task. */
     @Transactional
     override fun start(taskId: UUID): TaskAttempt? {

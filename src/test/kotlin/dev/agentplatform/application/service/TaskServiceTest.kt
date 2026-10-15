@@ -2,6 +2,7 @@ package dev.agentplatform.application.service
 
 import dev.agentplatform.api.dto.CreateTaskRequest
 import dev.agentplatform.api.dto.TaskStatusTransitionResponse
+import dev.agentplatform.domain.model.InvalidTaskTransitionException
 import dev.agentplatform.domain.model.TaskStatus
 import io.quarkus.test.junit.QuarkusTest
 import jakarta.inject.Inject
@@ -53,6 +54,49 @@ class TaskServiceTest {
         val event = taskService.history(task.id).last()
         assertNull(event.reason)
         assertEquals("WORKER", event.actor)
+    }
+
+    @Test
+    fun `answering a needs-input task records clarification and queues another attempt`() {
+        val task = taskService.create(CreateTaskRequest("Task", "Original request"))
+        taskService.transition(task.id, TaskStatus.RUNNING, null)
+        taskService.transition(task.id, TaskStatus.NEEDS_INPUT, "Agent needs a decision")
+        assertThrows(InvalidTaskTransitionException::class.java) {
+            taskService.transition(task.id, TaskStatus.QUEUED, "Bypass clarification")
+        }
+
+        val resumed = taskService.answerAndRequeue(task.id, "Use cursor pagination")
+
+        assertEquals(TaskStatus.QUEUED, resumed!!.status)
+        assertEquals("User clarification:\nUse cursor pagination\n\nOriginal request", resumed.description)
+        val history = taskService.history(task.id)
+        assertEquals(TaskStatus.NEEDS_INPUT, history[2].fromStatus)
+        assertEquals(TaskStatus.QUEUED, history[2].toStatus)
+        assertEquals("API", history[2].actor)
+        assertNull(taskService.answerAndRequeue(UUID.randomUUID(), "answer"))
+    }
+
+    @Test
+    fun `answering rejects blank answers and tasks not awaiting input`() {
+        val task = taskService.create(CreateTaskRequest("Task", "Description"))
+
+        assertThrows(IllegalArgumentException::class.java) { taskService.answerAndRequeue(task.id, "  ") }
+        assertThrows(IllegalArgumentException::class.java) {
+            taskService.answerAndRequeue(task.id, "x".repeat(5001))
+        }
+        assertThrows(IllegalStateException::class.java) { taskService.answerAndRequeue(task.id, "answer") }
+    }
+
+    @Test
+    fun `answering rejects clarifications that exceed the bounded task prompt size`() {
+        val task = taskService.create(CreateTaskRequest("Task", "x".repeat(50_000)))
+        taskService.transition(task.id, TaskStatus.RUNNING, null)
+        taskService.transition(task.id, TaskStatus.NEEDS_INPUT, null)
+
+        assertThrows(IllegalArgumentException::class.java) {
+            taskService.answerAndRequeue(task.id, "additional context")
+        }
+        assertEquals(TaskStatus.NEEDS_INPUT, taskService.findById(task.id)!!.status)
     }
 
     @Test

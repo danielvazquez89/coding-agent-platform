@@ -35,7 +35,17 @@ class TaskExecutionWorkerTest {
             "+updated project context"
         ).joinToString("\n", postfix = "\n")
         val provider = ScriptedProvider(
-            ModelTurn(null, listOf(call("read_file", """{"path":"README.md"}""")), "tool_calls", 10, 5),
+            ModelTurn(
+                null,
+                listOf(
+                    call("list_files", """{"path":"."}"""),
+                    call("search_code", """{"path":".","query":"project context"}"""),
+                    call("read_file", """{"path":"README.md"}""")
+                ),
+                "tool_calls",
+                10,
+                5
+            ),
             ModelTurn(
                 null,
                 listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
@@ -76,11 +86,22 @@ class TaskExecutionWorkerTest {
         assertEquals(false, report.openQuestions.single().blocking)
         assertTrue(provider.messages.any { it.role == "tool" && it.content.contains("project context") })
         val assistantCall = provider.messages.first { it.role == "assistant" && it.toolCalls.isNotEmpty() }
-        assertEquals("read_file", assistantCall.toolCalls.single().name)
+        assertEquals(listOf("list_files", "search_code", "read_file"), assistantCall.toolCalls.map { it.name })
         assertEquals("tool", provider.messages.last().role)
         assertEquals("apply_patch", provider.messages.last().toolName)
         assertTrue(provider.messages.last().content.contains("Patch applied"))
         assertEquals(CheckOutcome.PASSED, report.validation.single().outcome)
+        assertEquals(
+            listOf("list_files", "search_code", "read_file", "apply_patch", "run_validation"),
+            report.toolExecutions.map { it.toolName }
+        )
+        assertTrue(report.toolExecutions.all { it.outcome == ToolExecutionOutcome.SUCCEEDED })
+        assertTrue(report.toolExecutions.none { it.argumentsSummary.contains(patch) })
+        assertEquals(1, report.toolExecutions.first().sequenceNumber)
+        assertTrue(report.toolExecutions[1].argumentsSummary.contains("queryLength"))
+        assertFalse(report.toolExecutions[1].argumentsSummary.contains("project context"))
+        assertTrue(report.maxExecutionDurationMillis!! > report.executionDurationMillis!!)
+        assertEquals(1.0, report.maxEstimatedCostUsd)
         assertEquals("README.md", report.changedFiles.single())
         assertEquals("updated project context\n", Files.readString(temporary.resolve("README.md")))
         assertTrue(publisher.calls.isEmpty())
@@ -542,6 +563,7 @@ class TaskExecutionWorkerTest {
         assertEquals(TaskStatus.FAILED, rejected.status)
         assertTrue(rejectedAttempts.finishedReport!!.openQuestions.isEmpty())
         assertTrue(rejectedProvider.messages.last().content.contains("not in the allowlist"))
+        assertEquals(ToolExecutionOutcome.REJECTED, rejectedAttempts.finishedReport!!.toolExecutions.single().outcome)
 
         val overBudget = task()
         val budgetAttempts = FakeAttempts()
@@ -560,6 +582,77 @@ class TaskExecutionWorkerTest {
         budgetWorker.execute(overBudget.id)
         assertEquals(TaskStatus.FAILED, overBudget.status)
         assertTrue(budgetAttempts.finishedReport!!.implementation.contains("exceeded its limit"))
+    }
+
+    @Test
+    fun `estimated cost and elapsed time limits stop execution and are reported`() {
+        val costTask = task()
+        val costAttempts = FakeAttempts()
+        val costProvider = ScriptedProvider(ModelTurn("No changes.", emptyList(), "stop", 100, 100))
+        worker(
+            FakeState(costTask), costAttempts, costProvider, FakeWorkspace(temporary),
+            inputCostPerMillionUsd = 100.0, outputCostPerMillionUsd = 100.0, maxEstimatedCostUsd = 0.01
+        ).execute(costTask.id)
+        assertEquals(TaskStatus.FAILED, costTask.status)
+        assertTrue(costAttempts.finishedReport!!.executionBudgetExceeded!!.contains("cost budget"))
+        assertEquals(0, costAttempts.finishedReport!!.toolExecutions.size)
+
+        val unknownCostTask = task()
+        val unknownCostAttempts = FakeAttempts()
+        worker(
+            FakeState(unknownCostTask), unknownCostAttempts,
+            ScriptedProvider(ModelTurn("No changes.", emptyList(), "stop", null, null)),
+            FakeWorkspace(temporary), inputCostPerMillionUsd = 1.0
+        ).execute(unknownCostTask.id)
+        assertEquals(TaskStatus.FAILED, unknownCostTask.status)
+        assertTrue(unknownCostAttempts.finishedReport!!.executionBudgetExceeded!!.contains("usage is unavailable"))
+
+        val priorCostTask = task()
+        val priorCostAttempts = FakeAttempts(previousBudgetUsage = TaskBudgetUsage(0, 0.02))
+        val unusedProvider = ScriptedProvider()
+        worker(
+            FakeState(priorCostTask), priorCostAttempts, unusedProvider, FakeWorkspace(temporary),
+            maxEstimatedCostUsd = 0.01
+        ).execute(priorCostTask.id)
+        assertEquals(TaskStatus.FAILED, priorCostTask.status)
+        assertTrue(priorCostAttempts.finishedReport!!.executionBudgetExceeded!!.contains("cost budget"))
+        assertEquals(0, unusedProvider.calls)
+
+        val priorTimeTask = task()
+        val priorTimeAttempts = FakeAttempts(previousBudgetUsage = TaskBudgetUsage(1001, 0.0))
+        worker(
+            FakeState(priorTimeTask), priorTimeAttempts, ScriptedProvider(), FakeWorkspace(temporary),
+            maxDurationSeconds = 1
+        ).execute(priorTimeTask.id)
+        assertEquals(TaskStatus.FAILED, priorTimeTask.status)
+        assertTrue(priorTimeAttempts.finishedReport!!.executionBudgetExceeded!!.contains("time budget"))
+
+        val unknownTimeTask = task()
+        val unknownTimeAttempts = FakeAttempts(previousBudgetUsage = TaskBudgetUsage(null, null))
+        worker(
+            FakeState(unknownTimeTask), unknownTimeAttempts, ScriptedProvider(), FakeWorkspace(temporary)
+        ).execute(unknownTimeTask.id)
+        assertEquals(TaskStatus.FAILED, unknownTimeTask.status)
+        assertTrue(unknownTimeAttempts.finishedReport!!.executionBudgetExceeded!!.contains("duration is unavailable"))
+
+        val timeTask = task()
+        val timeAttempts = FakeAttempts()
+        val slowProvider = object : CodingModelProvider {
+            override fun chat(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): ModelTurn {
+                Thread.sleep(1100)
+                return ModelTurn("No changes.", emptyList(), "stop", 1, 1)
+            }
+        }
+        val timeWorker = TaskExecutionWorker(
+            FakeState(timeTask), timeAttempts, TaskExecutionFinalizer(FakeState(timeTask), timeAttempts),
+            slowProvider, object : RepositoryWorkspaceFactory {
+                override fun open(repositoryUrl: String) = FakeWorkspace(temporary)
+            }, tools(), FakePullRequestPublisher(), mapper, true, false, 5, "qwen3:8b", 0.0, 0.0,
+            maxDurationSeconds = 1
+        )
+        timeWorker.execute(timeTask.id)
+        assertEquals(TaskStatus.FAILED, timeTask.status)
+        assertTrue(timeAttempts.finishedReport!!.executionBudgetExceeded!!.contains("time budget"))
     }
 
     @Test
@@ -621,6 +714,24 @@ class TaskExecutionWorkerTest {
         assertThrows(IllegalArgumentException::class.java) {
             worker(FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary), outputCostPerMillionUsd = Double.NaN)
         }
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary), maxDurationSeconds = 0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(
+                FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary),
+                maxDurationSeconds = Long.MAX_VALUE
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary), maxEstimatedCostUsd = 0.0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(
+                FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary),
+                maxEstimatedCostUsd = Double.NaN
+            )
+        }
     }
 
     private fun worker(
@@ -635,7 +746,9 @@ class TaskExecutionWorkerTest {
         outputCostPerMillionUsd: Double = 0.0,
         validationRunner: ValidationRunner? = null,
         publisher: FakePullRequestPublisher = FakePullRequestPublisher(),
-        publishPullRequests: Boolean = false
+        publishPullRequests: Boolean = false,
+        maxDurationSeconds: Long = 1800,
+        maxEstimatedCostUsd: Double = 1.0
     ): TaskExecutionWorker {
         val defaultValidationRunner = object : ValidationRunner {
             override fun validate(workspace: Path) = validation
@@ -647,7 +760,7 @@ class TaskExecutionWorkerTest {
         return TaskExecutionWorker(
             state, attempts, TaskExecutionFinalizer(state, attempts), provider, workspaceFactory,
             toolExecutor, publisher, mapper, enabled, publishPullRequests, maxToolCalls, "qwen3:8b",
-            inputCostPerMillionUsd, outputCostPerMillionUsd
+            inputCostPerMillionUsd, outputCostPerMillionUsd, maxDurationSeconds, maxEstimatedCostUsd
         )
     }
 
@@ -701,10 +814,14 @@ class TaskExecutionWorkerTest {
         }
     }
 
-    private class FakeAttempts(private val startFails: Boolean = false) : AttemptOperations {
+    private class FakeAttempts(
+        private val startFails: Boolean = false,
+        private val previousBudgetUsage: TaskBudgetUsage = TaskBudgetUsage()
+    ) : AttemptOperations {
         var started: TaskAttempt? = null
         var finished: TaskAttempt? = null
         var finishedReport: TaskExecutionReport? = null
+        override fun priorBudgetUsage(taskId: UUID) = previousBudgetUsage
         override fun start(taskId: UUID): TaskAttempt? {
             if (startFails) return null
             return TaskAttempt(taskId = taskId).also { started = it }

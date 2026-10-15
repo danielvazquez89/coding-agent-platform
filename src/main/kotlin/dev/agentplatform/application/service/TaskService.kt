@@ -3,6 +3,7 @@ package dev.agentplatform.application.service
 import dev.agentplatform.api.dto.CreateTaskRequest
 import dev.agentplatform.api.dto.TaskStatusTransitionResponse
 import dev.agentplatform.domain.model.CodingTask
+import dev.agentplatform.domain.model.InvalidTaskTransitionException
 import dev.agentplatform.domain.model.TaskLifecycle
 import dev.agentplatform.domain.model.TaskStatus
 import dev.agentplatform.domain.model.TaskStatusTransition
@@ -64,6 +65,29 @@ class TaskService(
         return task
     }
 
+    @Transactional
+    fun answerAndRequeue(id: UUID, answer: String): CodingTask? {
+        val normalizedAnswer = answer.trim()
+        require(normalizedAnswer.isNotEmpty()) { "answer must not be blank" }
+        require(normalizedAnswer.length <= MAX_ANSWER_LENGTH) {
+            "answer must be $MAX_ANSWER_LENGTH characters or fewer"
+        }
+
+        val task = taskRepository.findForUpdate(id) ?: return null
+        check(task.status == TaskStatus.NEEDS_INPUT) {
+            "Task $id can only be answered while it needs input"
+        }
+        require(task.description.length + normalizedAnswer.length + CLARIFICATION_MARKER.length <= MAX_DESCRIPTION_LENGTH) {
+            "The task and clarification exceed the $MAX_DESCRIPTION_LENGTH character limit"
+        }
+
+        task.description = "$CLARIFICATION_MARKER$normalizedAnswer\n\n${task.description}"
+        return recordTransition(
+            task, TaskStatus.QUEUED, "User provided clarification; task requeued", "API",
+            allowNeedsInputResume = true
+        )
+    }
+
     fun findAll(): List<CodingTask> = taskRepository.listNewestFirst()
 
     override fun findById(id: UUID): CodingTask? = taskRepository.findById(id)
@@ -71,6 +95,19 @@ class TaskService(
     @Transactional
     override fun transition(id: UUID, target: TaskStatus, reason: String?, actor: String): CodingTask? {
         val task = taskRepository.findForUpdate(id) ?: return null
+        return recordTransition(task, target, reason, actor)
+    }
+
+    private fun recordTransition(
+        task: CodingTask,
+        target: TaskStatus,
+        reason: String?,
+        actor: String,
+        allowNeedsInputResume: Boolean = false
+    ): CodingTask {
+        if (!allowNeedsInputResume && task.status == TaskStatus.NEEDS_INPUT && target == TaskStatus.QUEUED) {
+            throw InvalidTaskTransitionException(task.status, target)
+        }
         TaskLifecycle.requireAllowed(task.status, target)
 
         val previousStatus = task.status
@@ -114,4 +151,10 @@ class TaskService(
                 transitionedAt = it.transitionedAt
             )
         }
+
+    private companion object {
+        const val MAX_ANSWER_LENGTH = 5000
+        const val MAX_DESCRIPTION_LENGTH = 50_000
+        const val CLARIFICATION_MARKER = "\n\nUser clarification:\n"
+    }
 }

@@ -33,7 +33,11 @@ class TaskExecutionWorker(
     @ConfigProperty(name = "agent.model.cost.input-per-million-usd", defaultValue = "0")
     private val inputCostPerMillionUsd: Double,
     @ConfigProperty(name = "agent.model.cost.output-per-million-usd", defaultValue = "0")
-    private val outputCostPerMillionUsd: Double
+    private val outputCostPerMillionUsd: Double,
+    @ConfigProperty(name = "agent.execution.max-duration-seconds", defaultValue = "1800")
+    private val maxDurationSeconds: Long = 1800,
+    @ConfigProperty(name = "agent.execution.max-estimated-cost-usd", defaultValue = "1.0")
+    private val maxEstimatedCostUsd: Double = 1.0
 ) {
     private val log = Logger.getLogger(TaskExecutionWorker::class.java)
 
@@ -41,6 +45,11 @@ class TaskExecutionWorker(
         require(maxToolCalls > 0) { "Maximum tool calls must be positive" }
         require(inputCostPerMillionUsd.isFinite() && inputCostPerMillionUsd >= 0.0) { "Input token cost must be finite and non-negative" }
         require(outputCostPerMillionUsd.isFinite() && outputCostPerMillionUsd >= 0.0) { "Output token cost must be finite and non-negative" }
+        require(maxDurationSeconds > 0) { "Maximum task duration must be positive" }
+        require(maxDurationSeconds <= Long.MAX_VALUE / 1000) { "Maximum task duration is too large" }
+        require(maxEstimatedCostUsd.isFinite() && maxEstimatedCostUsd > 0.0) {
+            "Maximum estimated task cost must be finite and positive"
+        }
     }
 
     @Scheduled(every = "2s", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)
@@ -79,16 +88,23 @@ class TaskExecutionWorker(
         log.infof("Task %s attempt %s created", task.id, attempt.id)
         var workspace: RepositoryWorkspace? = null
         val validation = mutableListOf<ValidationCheck>()
-        val trace = ExecutionTrace(modelName, inputCostPerMillionUsd, outputCostPerMillionUsd)
         val executionStartedAt = System.nanoTime()
+        val trace = ExecutionTrace(modelName, inputCostPerMillionUsd, outputCostPerMillionUsd, executionStartedAt)
         try {
+            trace.priorBudgetUsage = attempts.priorBudgetUsage(task.id)
             val repositoryUrl = task.repositoryUrl
             if (repositoryUrl.isNullOrBlank()) throw NeedsInputException("Choose a repository before asking the agent to make a change.")
             log.infof("Task %s opening workspace for repository: %s", task.id, repositoryUrl)
             workspace = workspaces.open(repositoryUrl)
             log.infof("Task %s workspace opened at: %s", task.id, workspace.root)
+            checkBudget(executionStartedAt, trace)
             val finalText = runModelLoop(task, workspace.root, validation, trace)
-            if (validation.isEmpty()) validation += tools.execute("run_validation", objectMapper.createObjectNode(), workspace.root).validation!!
+            if (validation.isEmpty()) {
+                validation += executeAuditedTool(
+                    "run_validation", objectMapper.createObjectNode(), workspace.root, trace
+                ).validation!!
+            }
+            checkBudget(executionStartedAt, trace)
             val changedFiles = workspace.changedFiles()
             val parsedReport = parseReport(finalText)
             val modelQuestions = parsedReport.questions
@@ -130,6 +146,7 @@ class TaskExecutionWorker(
             var pullRequestError: String? = null
             if (taskStatus == TaskStatus.COMPLETED && pullRequestsEnabled) {
                 try {
+                    checkBudget(executionStartedAt, trace)
                     val repositoryUrl = checkNotNull(task.repositoryUrl)
                     pullRequest = pullRequestPublisher.createDraft(
                         repositoryUrl = repositoryUrl,
@@ -199,7 +216,12 @@ class TaskExecutionWorker(
                 validation = validation.toList(),
                 acceptanceChecks = acceptanceChecks(task, emptyList()),
                 modelUsage = trace.usage(),
-                executionDurationMillis = elapsedMillis(executionStartedAt)
+                executionDurationMillis = elapsedMillis(executionStartedAt),
+                toolExecutions = trace.toolExecutions.toList(),
+                maxExecutionDurationMillis = maxDurationSeconds * 1000,
+                maxEstimatedCostUsd = maxEstimatedCostUsd,
+                totalTaskExecutionDurationMillis = trace.totalExecutionDurationMillis(elapsedMillis(executionStartedAt)),
+                totalEstimatedCostUsd = trace.totalEstimatedCostUsd()
             )
             finalizer.finish(task.id, attempt.id, TaskStatus.NEEDS_INPUT, AttemptStatus.NEEDS_INPUT, report, failure.message)
         } catch (failure: Exception) {
@@ -229,7 +251,13 @@ class TaskExecutionWorker(
                 acceptanceChecks = acceptanceChecks(task, emptyList()),
                 patchFailures = trace.patchFailures.toList(),
                 modelUsage = trace.usage(),
-                executionDurationMillis = elapsedMillis(executionStartedAt)
+                executionDurationMillis = elapsedMillis(executionStartedAt),
+                toolExecutions = trace.toolExecutions.toList(),
+                maxExecutionDurationMillis = maxDurationSeconds * 1000,
+                maxEstimatedCostUsd = maxEstimatedCostUsd,
+                executionBudgetExceeded = (failure as? ExecutionBudgetExceededException)?.message,
+                totalTaskExecutionDurationMillis = trace.totalExecutionDurationMillis(elapsedMillis(executionStartedAt)),
+                totalEstimatedCostUsd = trace.totalEstimatedCostUsd()
             )
             finalizer.finish(task.id, attempt.id, TaskStatus.FAILED, AttemptStatus.FAILED, report, details)
         } finally {
@@ -256,6 +284,7 @@ class TaskExecutionWorker(
         var validationCurrent = false
         var lastModelText: String? = null
         repeat(maxToolCalls + MAX_PATCH_FAILURE_RETRIES + 4) {
+            checkBudget(trace.startedAtNanos, trace)
             val modelCallStartedAt = System.nanoTime()
             val turn = try {
                 model.chat(messages, definitions)
@@ -264,6 +293,7 @@ class TaskExecutionWorker(
                 throw failure
             }
             trace.recordModelTurn(turn, elapsedMillis(modelCallStartedAt))
+            checkBudget(trace.startedAtNanos, trace)
             log.infof("Task %s model turn returned %d tool call(s)", task.id, turn.toolCalls.size)
             if (turn.toolCalls.isEmpty()) {
                 turn.content?.takeIf(String::isNotBlank)?.let { lastModelText = it }
@@ -303,20 +333,28 @@ class TaskExecutionWorker(
                     append(remainingPatchFailure.take(2000))
                 }
                 if (!validationCurrent) {
-                    validation += tools.execute("run_validation", objectMapper.createObjectNode(), root).validation!!
+                    checkBudget(trace.startedAtNanos, trace)
+                    validation += executeAuditedTool(
+                        "run_validation", objectMapper.createObjectNode(), root, trace
+                    ).validation!!
                 }
                 return finalText.take(MAX_FINAL_TEXT_CHARS)
             }
             val toolResults = mutableListOf<Pair<ModelToolCall, ToolExecutionResult>>()
             for (call in turn.toolCalls) {
+                checkBudget(trace.startedAtNanos, trace)
                 toolCallCount++
                 check(toolCallCount <= maxToolCalls) { "The agent exceeded its limit of $maxToolCalls tool calls" }
                 log.infof("Task %s requested allow-listed tool %s (%d/%d)", task.id, call.name, toolCallCount, maxToolCalls)
                 val result = try {
                     if (definitions.none { it.name == call.name }) {
+                        trace.recordTool(
+                            call.name, summarizeToolArguments(call.name, call.arguments),
+                            ToolExecutionOutcome.REJECTED, "Tool is not allowlisted"
+                        )
                         ToolExecutionResult("Rejected: tool '${call.name}' is not in the allowlist.")
                     } else {
-                        tools.execute(call.name, call.arguments, root)
+                        executeAuditedTool(call.name, call.arguments, root, trace)
                     }
                 } catch (failure: Exception) {
                     log.warnf(failure, "Task %s tool %s threw exception", task.id, call.name)
@@ -341,6 +379,7 @@ class TaskExecutionWorker(
                 }
                 log.infof("Task %s tool %s returned %d characters", task.id, call.name, result.content.length)
                 toolResults += call to result
+                checkBudget(trace.startedAtNanos, trace)
             }
             messages += ModelMessage("assistant", turn.content.orEmpty(), turn.toolCalls)
             toolResults.forEach { (call, result) ->
@@ -432,8 +471,65 @@ class TaskExecutionWorker(
             modelUsage = trace.usage(),
             executionDurationMillis = executionDurationMillis,
             pullRequest = pullRequest,
-            pullRequestError = pullRequestError
+            pullRequestError = pullRequestError,
+            toolExecutions = trace.toolExecutions.toList(),
+            maxExecutionDurationMillis = maxDurationSeconds * 1000,
+            maxEstimatedCostUsd = maxEstimatedCostUsd,
+            totalTaskExecutionDurationMillis = trace.totalExecutionDurationMillis(executionDurationMillis),
+            totalEstimatedCostUsd = trace.totalEstimatedCostUsd()
         )
+    }
+
+    private fun executeAuditedTool(
+        name: String,
+        arguments: JsonNode,
+        root: Path,
+        trace: ExecutionTrace
+    ): ToolExecutionResult {
+        val startedAt = System.nanoTime()
+        val argumentSummary = summarizeToolArguments(name, arguments)
+        return try {
+            tools.execute(name, arguments, root).also { result ->
+                val summary = result.validation?.let { "${it.name}: ${it.outcome}" }
+                    ?: "Returned ${result.content.length} characters"
+                trace.recordTool(
+                    name, argumentSummary, ToolExecutionOutcome.SUCCEEDED, summary, elapsedMillis(startedAt)
+                )
+            }
+        } catch (failure: Exception) {
+            trace.recordTool(
+                name, argumentSummary, ToolExecutionOutcome.FAILED,
+                "Failed with ${failure.javaClass.simpleName}", elapsedMillis(startedAt)
+            )
+            throw failure
+        }
+    }
+
+    private fun summarizeToolArguments(name: String, arguments: JsonNode): String = when (name) {
+        "list_files", "read_file" -> "path=${arguments.path("path").asText("").take(300)}"
+        "search_code" -> "path=${arguments.path("path").asText("").take(300)}, queryLength=${arguments.path("query").asText("").length}"
+        "apply_patch" -> "patchCharacters=${arguments.path("patch").asText("").length}"
+        "run_validation" -> "no arguments"
+        else -> "argumentNames=${arguments.fieldNames().asSequence().take(20).joinToString()}"
+    }
+
+    private fun checkBudget(startedAt: Long, trace: ExecutionTrace) {
+        val elapsed = elapsedMillis(startedAt)
+        val maxDurationMillis = maxDurationSeconds * 1000
+        val totalDuration = trace.totalExecutionDurationMillis(elapsed)
+            ?: throw ExecutionBudgetExceededException("Prior task duration is unavailable; cannot enforce the time budget")
+        if (totalDuration > maxDurationMillis) {
+            throw ExecutionBudgetExceededException("Task time budget of ${maxDurationSeconds}s was exceeded")
+        }
+        val estimatedCost = trace.totalEstimatedCostUsd()
+        if (estimatedCost == null && (inputCostPerMillionUsd > 0.0 || outputCostPerMillionUsd > 0.0)) {
+            throw ExecutionBudgetExceededException("Model token usage is unavailable; cannot enforce the estimated cost budget")
+        }
+        if (estimatedCost != null && estimatedCost > maxEstimatedCostUsd) {
+            throw ExecutionBudgetExceededException(
+                "Estimated model cost budget of \$${"%.4f".format(java.util.Locale.ROOT, maxEstimatedCostUsd)} was exceeded"
+            )
+        }
     }
 
     private fun pullRequestBody(
@@ -515,9 +611,12 @@ class TaskExecutionWorker(
     private class ExecutionTrace(
         private val modelName: String,
         private val inputCostPerMillionUsd: Double,
-        private val outputCostPerMillionUsd: Double
+        private val outputCostPerMillionUsd: Double,
+        val startedAtNanos: Long = System.nanoTime(),
+        var priorBudgetUsage: TaskBudgetUsage = TaskBudgetUsage()
     ) {
         val patchFailures = mutableListOf<String>()
+        val toolExecutions = mutableListOf<ToolExecutionAudit>()
         private var promptTokens = 0
         private var completionTokens = 0
         private var tokenCountsAvailable = true
@@ -541,19 +640,45 @@ class TaskExecutionWorker(
             tokenCountsAvailable = false
         }
 
+        fun recordTool(
+            name: String,
+            argumentsSummary: String,
+            outcome: ToolExecutionOutcome,
+            resultSummary: String,
+            durationMillis: Long = 0
+        ) {
+            toolExecutions += ToolExecutionAudit(
+                sequenceNumber = toolExecutions.size + 1,
+                toolName = name.take(100),
+                argumentsSummary = argumentsSummary.take(500),
+                outcome = outcome,
+                durationMillis = durationMillis,
+                resultSummary = resultSummary.take(300)
+            )
+        }
+
+        fun estimatedCostUsd(): Double? = if (tokenCountsAvailable) {
+            (promptTokens * inputCostPerMillionUsd + completionTokens * outputCostPerMillionUsd) / 1_000_000.0
+        } else null
+
+        fun totalExecutionDurationMillis(currentDurationMillis: Long): Long? =
+            priorBudgetUsage.executionDurationMillis?.let { Math.addExact(it, currentDurationMillis) }
+
+        fun totalEstimatedCostUsd(): Double? =
+            priorBudgetUsage.estimatedCostUsd?.let { prior -> estimatedCostUsd()?.let { prior + it } }
+
         fun usage(): ModelUsage = ModelUsage(
             model = modelName,
             promptTokens = promptTokens.takeIf { tokenCountsAvailable },
             completionTokens = completionTokens.takeIf { tokenCountsAvailable },
             callCount = callCount,
             durationMillis = modelDurationMillis,
-            estimatedCostUsd = if (tokenCountsAvailable) {
-                (promptTokens * inputCostPerMillionUsd + completionTokens * outputCostPerMillionUsd) / 1_000_000.0
-            } else null
+            estimatedCostUsd = estimatedCostUsd()
         )
     }
 
     private class NeedsInputException(message: String) : RuntimeException(message)
+    private class ExecutionBudgetExceededException(message: String) : RuntimeException(message)
 
     private companion object {
         const val MAX_TOOL_RESULT_CHARS = 12_000

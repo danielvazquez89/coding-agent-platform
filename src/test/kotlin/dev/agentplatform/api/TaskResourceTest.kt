@@ -8,6 +8,7 @@ import jakarta.inject.Inject
 import jakarta.ws.rs.BadRequestException
 import jakarta.ws.rs.NotFoundException
 import org.hamcrest.CoreMatchers.equalTo
+import org.hamcrest.CoreMatchers.containsString
 import org.hamcrest.CoreMatchers.nullValue
 import org.hamcrest.Matchers.hasItem
 import org.junit.jupiter.api.Assertions.assertNotNull
@@ -19,6 +20,16 @@ import java.util.*
 class TaskResourceTest {
     @Inject
     lateinit var taskResource: TaskResource
+
+    @Test
+    fun `review page is served with task and resume controls`() {
+        given()
+            .`when`().get("/")
+            .then()
+            .statusCode(200)
+            .body(containsString("Coding Agent Review"))
+            .body(containsString("Answer and resume"))
+    }
 
     @Test
     fun `resource validation and direct lookup cover both branches`() {
@@ -172,13 +183,69 @@ class TaskResourceTest {
             .body("size()", equalTo(1))
     }
 
-    private fun createTask(): String =
+    @Test
+    fun `answer endpoint resumes needs-input task and rejects invalid answers`() {
+        val id = createTask()
+        transition(id, "RUNNING")
+        transition(id, "NEEDS_INPUT", "Clarification required")
+
+        transition(id, "QUEUED").statusCode(409)
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("answer" to "Use cursor pagination"))
+            .`when`().post("/api/tasks/$id/answer")
+            .then()
+            .statusCode(200)
+            .body("status", equalTo("QUEUED"))
+            .body("description", org.hamcrest.Matchers.containsString("Use cursor pagination"))
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("answer" to "answer"))
+            .`when`().post("/api/tasks/$id/answer")
+            .then()
+            .statusCode(409)
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("answer" to " "))
+            .`when`().post("/api/tasks/$id/answer")
+            .then()
+            .statusCode(400)
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("answer" to "x".repeat(5001)))
+            .`when`().post("/api/tasks/$id/answer")
+            .then()
+            .statusCode(400)
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("answer" to "answer"))
+            .`when`().post("/api/tasks/00000000-0000-0000-0000-000000000001/answer")
+            .then()
+            .statusCode(404)
+
+        val descriptionLimitTask = createTask("x".repeat(50_000))
+        transition(descriptionLimitTask, "RUNNING")
+        transition(descriptionLimitTask, "NEEDS_INPUT")
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("answer" to "additional context"))
+            .`when`().post("/api/tasks/$descriptionLimitTask/answer")
+            .then()
+            .statusCode(400)
+    }
+
+    private fun createTask(description: String = "Exercise persisted task lifecycle behavior"): String =
         given()
             .contentType(ContentType.JSON)
             .body(
                 mapOf(
                     "title" to "Lifecycle test task",
-                    "description" to "Exercise persisted task lifecycle behavior",
+                    "description" to description,
                     "acceptanceCriteria" to listOf("First criterion", "Second criterion")
                 )
             )
