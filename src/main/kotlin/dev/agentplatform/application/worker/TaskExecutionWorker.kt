@@ -37,7 +37,9 @@ class TaskExecutionWorker(
     @ConfigProperty(name = "agent.execution.max-duration-seconds", defaultValue = "1800")
     private val maxDurationSeconds: Long = 1800,
     @ConfigProperty(name = "agent.execution.max-estimated-cost-usd", defaultValue = "1.0")
-    private val maxEstimatedCostUsd: Double = 1.0
+    private val maxEstimatedCostUsd: Double = 1.0,
+    @ConfigProperty(name = "agent.execution.worker.enabled", defaultValue = "true")
+    private val workerEnabled: Boolean = true
 ) {
     private val log = Logger.getLogger(TaskExecutionWorker::class.java)
 
@@ -54,8 +56,8 @@ class TaskExecutionWorker(
 
     @Scheduled(every = "2s", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)
     fun poll() {
-        log.infof("Task execution worker poll tick; executionEnabled=%s", enabled)
-        if (!enabled) return
+        log.infof("Task execution worker poll tick; executionEnabled=%s workerEnabled=%s", enabled, workerEnabled)
+        if (!enabled || !workerEnabled) return
         try {
             if (!processNext()) log.debug("Task execution worker found no queued tasks")
         } catch (failure: Exception) {
@@ -357,7 +359,7 @@ class TaskExecutionWorker(
                     )
                     throw IllegalStateException("The agent exceeded its limit of $maxToolCalls tool calls")
                 }
-                log.infof("Task %s requested allow-listed tool %s (%d/%d)", task.id, call.name, toolCallCount, maxToolCalls)
+                log.infof("Task %s requested tool %s (%d/%d)", task.id, call.name, toolCallCount, maxToolCalls)
                 val result = try {
                     if (definitions.none { it.name == call.name }) {
                         recordToolAudit(

@@ -5,6 +5,7 @@ import dev.agentplatform.domain.model.ValidationCheck
 import dev.agentplatform.domain.port.CommandExecutor
 import dev.agentplatform.domain.port.CommandResult
 import dev.agentplatform.domain.port.ValidationRunner
+import dev.agentplatform.infrastructure.ExecutionControlHttp
 import jakarta.enterprise.context.ApplicationScoped
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import java.nio.file.Files
@@ -26,14 +27,38 @@ class DockerValidationRunner(
     @ConfigProperty(name = "agent.execution.docker.database-ready-attempts", defaultValue = "40")
     private val databaseReadyAttempts: Int,
     @ConfigProperty(name = "agent.execution.docker.database-ready-delay-millis", defaultValue = "500")
-    private val databaseReadyDelayMillis: Long
+    private val databaseReadyDelayMillis: Long,
+    @ConfigProperty(name = "agent.execution.docker.maven-cache-volume", defaultValue = "")
+    private val mavenCacheVolume: String = "",
+    @ConfigProperty(name = "agent.execution.docker.workspace-volume", defaultValue = "")
+    private val workspaceVolume: String = "",
+    @ConfigProperty(name = "agent.execution.workspace-root", defaultValue = "")
+    private val configuredWorkspaceRoot: String = "",
+    @ConfigProperty(name = "agent.execution.control-plane-url", defaultValue = "")
+    private val controlPlaneUrl: String = "",
+    @ConfigProperty(name = "agent.execution.control-plane-token", defaultValue = "")
+    private val controlPlaneToken: String = "",
+    @ConfigProperty(name = "agent.execution.control-plane-timeout-seconds", defaultValue = "7200")
+    private val controlPlaneTimeoutSeconds: Long = 7200
 ) : ValidationRunner {
     init {
         require(validationTimeoutSeconds > 0) { "Validation timeout must be positive" }
         require(databaseReadyAttempts > 0) { "Database readiness attempts must be positive" }
         require(databaseReadyDelayMillis >= 0) { "Database readiness delay cannot be negative" }
+        require(controlPlaneTimeoutSeconds > 0) { "Control-plane timeout must be positive" }
+        require(controlPlaneUrl.isBlank() || controlPlaneToken.isNotBlank()) {
+            "Execution control-plane token is required when a control-plane URL is configured"
+        }
+        require((workspaceVolume.isBlank()) == (mavenCacheVolume.isBlank())) {
+            "Workspace and Maven cache Docker volumes must be configured together"
+        }
     }
     override fun validate(workspace: Path): ValidationCheck {
+        if (controlPlaneUrl.isNotBlank()) {
+            return ExecutionControlHttp.validate(
+                controlPlaneUrl, controlPlaneToken, workspace, controlPlaneTimeoutSeconds
+            )
+        }
         if (!Files.isRegularFile(workspace.resolve("pom.xml"))) {
             return ValidationCheck(
                 name = "Maven tests",
@@ -136,28 +161,56 @@ class DockerValidationRunner(
         maxOutputChars = MAX_VALIDATION_OUTPUT
     )
 
-    private fun offlineMavenCommand(id: String, network: String, workspacePath: String, cachePath: String) = listOf(
-        "docker", "run", "--rm", "--name", "agent-test-$id", "--network", network,
-        "--label", "coding-agent-platform.attempt=$id", "--cpus=1", "--memory=2g", "--pids-limit=1024",
-        "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
-        "--tmpfs", "/tmp:rw,exec,nosuid,size=512m", "--user", "1000:1000",
-        "--mount", "type=bind,source=$workspacePath,target=/workspace",
-        "--mount", "type=bind,source=$cachePath,target=/m2/repository,readonly",
-        "--workdir", "/workspace", "--env", "HOME=/tmp", "--env", "MAVEN_CONFIG=/tmp/maven-config",
-        "--env", "MAVEN_OPTS=-Dmaven.repo.local=/m2/repository",
-        "--env", "DB_PASSWORD=agent-temp-password", "--env", "QUARKUS_DATASOURCE_USERNAME=postgres",
-        "--env", "QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://agent-db:5432/postgres",
-        mavenImage, "mvn", "-B", "-o", "test"
-    )
+    private fun offlineMavenCommand(id: String, network: String, workspacePath: String, cachePath: String): List<String> {
+        val workspaceMount = if (workspaceVolume.isBlank()) {
+            listOf("--mount", "type=bind,source=$workspacePath,target=/workspace", "--workdir", "/workspace")
+        } else {
+            val root = Path.of(configuredWorkspaceRoot).toAbsolutePath().normalize()
+            val path = Path.of(workspacePath).toAbsolutePath().normalize()
+            require(path.startsWith(root) && path != root) { "Validation workspace is outside the configured workspace root" }
+            val relative = root.relativize(path)
+            require(relative.nameCount == 1 && relative.fileName.toString().matches(Regex("""attempt-[A-Za-z0-9-]+"""))) {
+                "Validation workspace must be one task-specific directory under the configured workspace root"
+            }
+            listOf(
+                "--mount",
+                "type=volume,source=$workspaceVolume,target=/workspace,volume-subpath=${relative.toString().replace('\\', '/')}",
+                "--workdir",
+                "/workspace"
+            )
+        }
+        val cacheMount = if (mavenCacheVolume.isBlank()) {
+            listOf("--mount", "type=bind,source=$cachePath,target=/m2/repository,readonly")
+        } else {
+            listOf("--mount", "type=volume,source=$mavenCacheVolume,target=/m2/repository,readonly")
+        }
+        return listOf(
+            "docker", "run", "--rm", "--name", "agent-test-$id", "--network", network,
+            "--label", "coding-agent-platform.attempt=$id", "--cpus=1", "--memory=2g", "--pids-limit=1024",
+            "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
+            "--tmpfs", "/tmp:rw,exec,nosuid,size=512m", "--user", "185:185",
+            *workspaceMount.toTypedArray(), *cacheMount.toTypedArray(),
+            "--env", "HOME=/tmp", "--env", "MAVEN_CONFIG=/tmp/maven-config",
+            "--env", "MAVEN_OPTS=-Dmaven.repo.local=/m2/repository",
+            "--env", "DB_PASSWORD=agent-temp-password", "--env", "QUARKUS_DATASOURCE_USERNAME=postgres",
+            "--env", "QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://agent-db:5432/postgres",
+            mavenImage, "mvn", "-B", "-o", "test"
+        )
+    }
 
     private fun dependencyGetCommand(id: String, cachePath: String, artifact: String): List<String> {
         val suffix = Integer.toHexString(artifact.hashCode())
+        val cacheMount = if (mavenCacheVolume.isBlank()) {
+            listOf("--mount", "type=bind,source=$cachePath,target=/m2/repository")
+        } else {
+            listOf("--mount", "type=volume,source=$mavenCacheVolume,target=/m2/repository")
+        }
         return listOf(
             "docker", "run", "--rm", "--name", "agent-dep-$id-$suffix",
             "--label", "coding-agent-platform.attempt=$id", "--cpus=1", "--memory=2g", "--pids-limit=128",
             "--read-only", "--cap-drop=ALL", "--security-opt=no-new-privileges",
             "--tmpfs", "/tmp:rw,exec,nosuid,size=512m",
-            "--mount", "type=bind,source=$cachePath,target=/m2/repository",
+            *cacheMount.toTypedArray(),
             "--env", "HOME=/tmp", "--env", "MAVEN_OPTS=-Dmaven.repo.local=/m2/repository",
             mavenImage, "mvn", "-B", "org.apache.maven.plugins:maven-dependency-plugin:3.8.1:get",
             "-Dartifact=$artifact"

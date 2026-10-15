@@ -32,6 +32,27 @@ class TaskResourceTest {
     }
 
     @Test
+    fun `internal validation gateway rejects requests without its bearer token`() {
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("workspacePath" to "/tmp/not-authorized"))
+            .`when`().post("/internal/execution/validate")
+            .then()
+            .statusCode(401)
+    }
+
+    @Test
+    fun `internal validation gateway rejects workspaces outside its configured root`() {
+        given()
+            .header("Authorization", "Bearer test-only-internal-token")
+            .contentType(ContentType.JSON)
+            .body(mapOf("workspacePath" to ".."))
+            .`when`().post("/internal/execution/validate")
+            .then()
+            .statusCode(403)
+    }
+
+    @Test
     fun `resource validation and direct lookup cover both branches`() {
         assertThrows(BadRequestException::class.java) {
             taskResource.create(CreateTaskRequest(" ", "Description"))

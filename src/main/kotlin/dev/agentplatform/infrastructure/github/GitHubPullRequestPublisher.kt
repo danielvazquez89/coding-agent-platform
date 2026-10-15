@@ -25,13 +25,13 @@ class GitHubPullRequestPublisher(
     @ConfigProperty(name = "agent.github.token", defaultValue = "")
     private val token: String,
     @ConfigProperty(name = "agent.github.allowed-repositories", defaultValue = "")
-    allowedRepositories: String,
+    configuredAllowedRepositories: String,
     @ConfigProperty(name = "agent.github.api-url", defaultValue = "https://api.github.com")
     private val apiUrl: String,
     @ConfigProperty(name = "agent.github.pull-requests.enabled", defaultValue = "false")
     private val enabled: Boolean
 ) : PullRequestPublisher {
-    private val allowedRepositories = allowedRepositories.split(',')
+    private val allowedRepositories = configuredAllowedRepositories.split(',')
         .map(String::trim)
         .filter(String::isNotEmpty)
         .map { it.lowercase() }
@@ -46,7 +46,7 @@ class GitHubPullRequestPublisher(
         require(api.scheme.equals("https", ignoreCase = true) || isLoopback(api.host)) {
             "GitHub API URL must use HTTPS except for loopback test servers"
         }
-        require(allowedRepositories.all(REPOSITORY_NAME::matches)) {
+        require(allowedRepositories.all { REPOSITORY_NAME.matches(it) }) {
             "agent.github.allowed-repositories must contain owner/repository names"
         }
         require(!enabled || token.isNotBlank()) {

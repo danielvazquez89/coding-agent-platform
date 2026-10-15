@@ -1,0 +1,105 @@
+services:
+  workspace-init:
+    image: busybox:1.36
+    user: "0:0"
+    command: ["sh", "-c", "chown 185:0 /workspaces && chmod 0770 /workspaces"]
+    volumes:
+      - agent-workspaces:/workspaces
+    networks: [agent]
+
+  database:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_DB: coding_agent_platform
+      POSTGRES_USER: coding_agent_app
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+    volumes:
+      - database-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coding_agent_app -d coding_agent_platform"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [agent]
+
+  control-plane:
+    image: coding-agent-platform-control-plane:local
+    build:
+      context: .
+      dockerfile: src/main/docker/Dockerfile.control-plane
+    depends_on:
+      database:
+        condition: service_healthy
+      workspace-init:
+        condition: service_completed_successfully
+    user: "0:0"
+    environment: &app-environment
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://database:5432/coding_agent_platform
+      QUARKUS_DATASOURCE_USERNAME: coding_agent_app
+      QUARKUS_DATASOURCE_PASSWORD: ${DB_PASSWORD:?Set DB_PASSWORD in .env}
+      AGENT_EXECUTION_ENABLED: "true"
+      AGENT_EXECUTION_WORKER_ENABLED: "false"
+      AGENT_WORKSPACE_ROOT: /workspaces
+      AGENT_WORKSPACE_VOLUME: agent-workspaces
+      AGENT_MAVEN_REPOSITORY: /maven-cache
+      AGENT_MAVEN_CACHE_VOLUME: agent-maven-cache
+      AGENT_CONTROL_PLANE_TOKEN: ${AGENT_CONTROL_PLANE_TOKEN:?Set a long random AGENT_CONTROL_PLANE_TOKEN in .env}
+      AGENT_GITHUB_PULL_REQUESTS_ENABLED: "false"
+      AGENT_GITHUB_TOKEN: ""
+      AGENT_GITHUB_ALLOWED_REPOSITORIES: ""
+      AGENT_ALLOWED_LOCAL_ROOT: ""
+      QUARKUS_HTTP_IDLE_TIMEOUT: PT2H
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent-workspaces:/workspaces
+      - agent-maven-cache:/maven-cache
+    ports:
+      - "127.0.0.1:8081:8081"
+    networks: [agent]
+
+  worker:
+    image: coding-agent-platform-worker:local
+    build:
+      context: .
+      dockerfile: src/main/docker/Dockerfile.jvm
+    depends_on:
+      database:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+      workspace-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *app-environment
+      AGENT_EXECUTION_WORKER_ENABLED: "true"
+      AGENT_CONTROL_PLANE_URL: http://control-plane:8081
+      AGENT_GITHUB_PULL_REQUESTS_ENABLED: ${AGENT_GITHUB_PULL_REQUESTS_ENABLED:-false}
+      AGENT_GITHUB_TOKEN: ${AGENT_GITHUB_TOKEN:-}
+      AGENT_GITHUB_ALLOWED_REPOSITORIES: ${AGENT_GITHUB_ALLOWED_REPOSITORIES:-}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    volumes:
+      - agent-workspaces:/workspaces
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [agent]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 512
+    mem_limit: 4g
+    cpus: 2
+    restart: unless-stopped
+
+volumes:
+  database-data:
+  agent-workspaces:
+    name: agent-workspaces
+  agent-maven-cache:
+    name: agent-maven-cache
+
+networks:
+  agent:
+    name: coding-agent-platform

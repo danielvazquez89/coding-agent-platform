@@ -564,7 +564,10 @@ class TaskExecutionWorkerTest {
         assertEquals(TaskStatus.FAILED, rejected.status)
         assertTrue(rejectedAttempts.finishedReport!!.openQuestions.isEmpty())
         assertTrue(rejectedProvider.messages.last().content.contains("not in the allowlist"))
-        assertEquals(ToolExecutionOutcome.REJECTED, rejectedAttempts.finishedReport!!.toolExecutions.single().outcome)
+        assertEquals(
+            ToolExecutionOutcome.REJECTED,
+            rejectedAttempts.finishedReport!!.toolExecutions.single { it.toolName == "run_shell" }.outcome
+        )
         assertEquals(rejectedAttempts.finishedReport!!.toolExecutions, rejectedAttempts.persistedToolEvents)
 
         val overBudget = task()

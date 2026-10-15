@@ -7,6 +7,8 @@ import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
+import com.sun.net.httpserver.HttpServer
+import java.net.InetSocketAddress
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
@@ -67,6 +69,77 @@ class DockerValidationRunnerTest {
         assertEquals(2, readyCalls.get())
         assertTrue(result.details!!.contains("Tests passed"))
         assertTrue(result.durationMillis!! >= 0)
+    }
+
+    @Test
+    fun `mounts only the task workspace subdirectory and shared read-only Maven cache volumes`() {
+        val workspaceRoot = Files.createDirectory(temporary.resolve("workspaces"))
+        val workspace = Files.createDirectory(workspaceRoot.resolve("attempt-test-123"))
+        Files.writeString(workspace.resolve("pom.xml"), "<project/>")
+        val cache = Files.createDirectory(temporary.resolve("maven-cache"))
+        val mavenCommand = mutableListOf<String>()
+        val commands = object : CommandExecutor {
+            override fun run(
+                command: List<String>, workingDirectory: Path?, standardInput: String?, timeout: Duration,
+                maxOutputChars: Int, environment: Map<String, String>
+            ): CommandResult {
+                if (command.contains("mvn")) mavenCommand += command
+                return when {
+                    command.take(3) == listOf("docker", "network", "create") -> CommandResult(0, "network")
+                    command.take(3) == listOf("docker", "run", "-d") -> CommandResult(0, "db")
+                    command.take(2) == listOf("docker", "exec") -> CommandResult(0, "ready")
+                    else -> CommandResult(0, "ok")
+                }
+            }
+        }
+
+        val result = DockerValidationRunner(
+            commands, "maven:test", "postgres:test", cache.toString(), 10, 2, 0,
+            mavenCacheVolume = "agent-maven-cache",
+            workspaceVolume = "agent-workspaces",
+            configuredWorkspaceRoot = workspaceRoot.toString()
+        ).validate(workspace)
+
+        assertEquals(CheckOutcome.PASSED, result.outcome)
+        assertTrue(mavenCommand.any { it.contains("volume-subpath=attempt-test-123") })
+        assertTrue(mavenCommand.any { it.contains("source=agent-maven-cache,target=/m2/repository,readonly") })
+        assertTrue(mavenCommand.none { it.startsWith("type=bind,source=") })
+    }
+
+    @Test
+    fun `delegates validation to the authenticated control plane when configured`() {
+        val authorization = java.util.concurrent.atomic.AtomicReference<String>()
+        val payload = java.util.concurrent.atomic.AtomicReference<String>()
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/internal/execution/validate") { exchange ->
+            authorization.set(exchange.requestHeaders.getFirst("Authorization"))
+            payload.set(exchange.requestBody.bufferedReader().readText())
+            val response = """{"name":"Maven tests","command":"mvn in isolated Docker","outcome":"PASSED","exitCode":0,"details":"Tests passed","durationMillis":120}"""
+            exchange.sendResponseHeaders(200, response.toByteArray().size.toLong())
+            exchange.responseBody.use { it.write(response.toByteArray()) }
+        }
+        server.start()
+        try {
+            val runner = DockerValidationRunner(
+                fakeCommands(),
+                "maven:test",
+                "postgres:test",
+                temporary.toString(),
+                10,
+                2,
+                0,
+                controlPlaneUrl = "http://127.0.0.1:${server.address.port}",
+                controlPlaneToken = "gateway-test-token"
+            )
+
+            val result = runner.validate(temporary)
+
+            assertEquals(CheckOutcome.PASSED, result.outcome)
+            assertEquals("Bearer gateway-test-token", authorization.get())
+            assertTrue(payload.get().contains(temporary.fileName.toString()))
+        } finally {
+            server.stop(0)
+        }
     }
 
     @Test

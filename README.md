@@ -2,7 +2,7 @@
 
 A Kotlin + Quarkus project for a controlled software engineering agent. The intended product takes a GitHub issue, inspects one repository, proposes a patch, runs validation in isolation, and opens a pull request for a person to review.
 
-The project now runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks local Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and runs Maven tests in an isolated Docker environment. A local review page shows reports, diffs, validation, tool-audit summaries, and draft-PR links; users can answer a `NEEDS_INPUT` question and queue a new attempt. Per-task time and estimated-cost limits are configurable. When explicitly enabled and configured for an allow-listed public GitHub repository, it can push a task branch and open a draft pull request after validation. GitHub issue ingestion and private-repository clone authentication are not implemented.
+The project runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and validates Maven projects in a separate Docker container. The included Compose deployment separates the API/control plane from a resource-limited worker container; the worker has no Docker socket, and validation requests go through an authenticated, workspace-scoped control-plane endpoint. A local review page shows reports, diffs, validation, tool-audit events, and draft-PR links; users can answer a `NEEDS_INPUT` question and queue a new attempt. Per-task time and estimated-cost limits are configurable. When explicitly enabled and configured for an allow-listed public GitHub repository, the worker can push a task branch and open a draft pull request after validation. GitHub issue ingestion and private-repository clone authentication are not implemented.
 
 ## Product goals
 
@@ -32,7 +32,7 @@ The engineering challenge is making the workflow dependable and safe, not adding
 | `GET` | `/api/tasks/{id}/attempts/{attemptId}` | Return one attempt and its structured execution report. |
 | `GET` | `/api/tasks/{id}/attempts/{attemptId}/tool-executions` | Return redacted, ordered tool audit events, including events recorded before an attempt finishes. |
 
-Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list of up to 30 items, each at most 1000 characters), and `repositoryUrl` (required for execution). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. The Quarkus scheduler invokes a single-process worker every two seconds; startup, poll ticks, and successful claims are logged, including whether agent execution is enabled. The worker claims queued tasks and creates a durable attempt. Task creation currently returns `201` with `QUEUED`; the worker executes asynchronously after persistence. `AGENT_EXECUTION_ENABLED=false` leaves polling active but skips task execution; Quarkus scheduler configuration can independently disable all scheduled jobs.
+Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list of up to 30 items, each at most 1000 characters), and `repositoryUrl` (required for execution). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. The Quarkus scheduler polls every two seconds. In local development, the API process also runs the worker. In Compose, `control-plane` sets `AGENT_EXECUTION_WORKER_ENABLED=false` and the separate `worker` service enables it; database row locks prevent both processes from claiming the same task. Task creation returns `201` with `QUEUED`; the worker executes asynchronously after persistence. `AGENT_EXECUTION_ENABLED=false` disables execution, and Quarkus scheduler configuration can independently disable scheduled jobs.
 
 `CodingModelProvider` defines a provider-independent chat/tool-call contract. `OllamaCodingModelProvider` implements Ollama's `/api/chat` protocol, including structured assistant tool-call history and named tool-result messages, tool schemas, usage counts, timeouts, and bounded error messages. For models that return a JSON tool request in message content instead of Ollama's native `tool_calls`, it normalizes that response only when the requested tool was offered to the model. The adapter is configured with `OLLAMA_BASE_URL` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen3:8b`), and `OLLAMA_TIMEOUT_SECONDS` (default `1200`). It does not download models.
 
@@ -52,7 +52,24 @@ Pull-request publishing is disabled by default. Set `AGENT_GITHUB_PULL_REQUESTS_
 
 If branch push or PR creation fails, the task is marked `FAILED` with `pullRequestError` in its persisted attempt report; a successfully pushed branch may remain and require manual cleanup. The local review page at `/` displays reports and draft-PR links but does not embed GitHub's review interface, approve changes, or merge. The UI and API are unauthenticated and must remain on localhost or a trusted network. This first slice does not yet provide GitHub issue webhooks, GitHub App installation tokens, or durable retry/recovery after partial publication.
 
-Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and the host Maven artifact cache mounted read-only. Repository tests run without external network access. If required artifacts are missing, a separate bounded dependency-fetch container may download only Maven coordinates parsed from the missing-artifact diagnostics into the host cache before the test container is retried offline. Test and dependency-fetch commands run in containers; model/tool orchestration, workspace management, and allow-listed file/patch operations still run in the application process. Do not describe the whole agent as sandboxed. Gradle, other build systems, and network-enabled builds are not supported.
+Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and a read-only Maven cache volume. In Compose, the trusted control-plane container alone receives the Docker socket. The worker calls its authenticated validation endpoint; the control plane rejects workspace paths outside the shared workspace root, and the validator mounts only that attempt's named-volume subdirectory. Test and bounded dependency-fetch commands execute without external network access. Gradle, other build systems, and network-enabled builds are not supported.
+
+The worker container runs non-root with a read-only root filesystem, dropped Linux capabilities, no-new-privileges, a process limit, and CPU/memory limits. It has no Docker socket. The shared workspace and database are reachable by both services; the worker still has the application's database credentials, GitHub credentials when publishing is enabled, and outbound network access needed for GitHub/Ollama. Compose networking does not enforce a strict egress allowlist, and this deployment is not a hostile multi-tenant boundary. Keep it on a trusted host/network, use a narrowly scoped GitHub token, and do not grant production database access. The control-plane container runs as root to access the Docker socket, has Docker-daemon-equivalent privileges, and is bound to localhost by default; treat it as host-root.
+
+### Containerized worker deployment
+
+The local `quarkus:dev` flow remains available. To run the separated worker/control-plane topology, use Docker Compose with a Linux Docker Engine (API 1.45+ for per-attempt volume subdirectory mounts) and an Ollama endpoint reachable from the worker:
+
+```powershell
+Copy-Item .env.example .env
+# Edit .env and replace both placeholder secrets with long random values.
+.\mvnw.cmd package -DskipTests
+docker compose up --build
+```
+
+The Compose file creates PostgreSQL, the control plane, and a separate worker. The control plane is available at <http://localhost:8081>; only it mounts `/var/run/docker.sock`. Both services share named workspace and Maven-cache volumes. `AGENT_CONTROL_PLANE_TOKEN` authenticates worker-to-control-plane validation requests; `AGENT_GITHUB_TOKEN` is configured only in the worker environment (never the API or validation containers) and is used only when publishing is enabled. The worker uses `OLLAMA_BASE_URL` (default `http://host.docker.internal:11434`). If Ollama is on the host, configure it to listen on an address reachable from Docker and use host firewall rules to limit access. Set `AGENT_GITHUB_PULL_REQUESTS_ENABLED=true` and configure an allowlisted repository/token in `.env` only when draft-PR publishing is intended. Do not commit `.env`.
+
+For this deployment, use public GitHub HTTPS repository URLs; local host paths are intentionally unavailable because no host source tree is mounted into the worker. `docker compose down` stops services but retains database and workspace volumes; `docker compose down -v` deletes that persisted data.
 
 ### Local review page
 
@@ -99,6 +116,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 #### `dev.agentplatform.api` — Inbound adapters (REST)
 
 - `api/TaskResource.kt` — REST routes, input validation, HTTP status codes.
+- `api/InternalExecutionResource.kt` — bearer-authenticated validation gateway restricted to the shared workspace root.
 - `api/dto/TaskDtos.kt` — API data transfer objects: `CreateTaskRequest`, `TransitionTaskRequest`, `TaskStatusTransitionResponse`, `TaskAttemptResponse`, `ApiError`.
 - `src/main/resources/META-INF/resources/index.html` — local task/PR review page and `NEEDS_INPUT` answer form.
 
@@ -132,6 +150,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `infrastructure/workspace/GitRepositoryWorkspaceFactory.kt` — Authorized local/GitHub repository cloning into isolated workspaces; implements `RepositoryWorkspaceFactory`.
 - `infrastructure/tool/WorkspaceToolExecutor.kt` — Path-checked, allowlisted tool execution for the model loop.
 - `infrastructure/docker/DockerValidationRunner.kt` — Disposable Docker Maven/PostgreSQL validation runtime; implements `ValidationRunner`.
+- `infrastructure/ExecutionControlHttp.kt` — Worker HTTP client for the authenticated validation gateway.
 - `infrastructure/process/LocalCommandExecutor.kt` — Argument-vector process runner with bounded output and timeouts; implements `CommandExecutor`.
 - `benchmarks/v1/cases.json` and `benchmarks/v1/Invoke-Benchmark.ps1` — Versioned coding benchmark cases and API-driven evaluator.
 - `scripts/Apply-TaskPatch.ps1` — Export a completed attempt's patch and optionally apply it to a clean local Git worktree.
@@ -139,6 +158,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 #### Resources and build
 
 - `src/main/resources/application.properties` — App name, HTTP port (`8081`), database configuration.
+- `compose.yaml` and `.env.example` — Separate worker/control-plane deployment with named workspace/cache volumes and no Docker socket in the worker.
 - `src/main/resources/db/migration/` — Flyway-managed PostgreSQL schema migrations (V1 tasks, V2 status history, V3 attempts, V4 one-running-attempt constraint, V5 tool execution events).
 - `pom.xml` — Maven build, Kotlin compiler, Quarkus platform and extensions. The Quarkus Maven plugin is configured to disable its default dev-mode debugger; the project has had a conflict on debugger port `5005`.
 
@@ -222,7 +242,7 @@ $env:DB_PASSWORD = (Get-Content .env | ConvertFrom-StringData).DB_PASSWORD
 Remove-Item Env:DB_PASSWORD
 ```
 
-The suite includes transition-policy and REST/database tests, provider protocol tests, worker/report lifecycle tests, path and patch safety tests, repository workspace tests, command execution tests, and Docker-runner tests. `mvnw verify` enforces 100% line and branch coverage for measured application code.
+The suite includes transition-policy and REST/database tests, provider protocol tests, worker/report lifecycle tests, path and patch safety tests, repository workspace tests, command execution tests, and Docker-runner tests. `application/AgentWorkflowIntegrationTest.kt` additionally exercises REST submission through real workspace creation, scripted Ollama tool calls, durable audit retrieval, validation, draft-PR reporting, `NEEDS_INPUT` answer/resume, failed validation, unapproved-tool rejection, and the authenticated control-plane path restriction. It uses a local Git fixture and a scripted model server; PostgreSQL remains the test database. Run just this workflow suite with `.\mvnw.cmd "-Dtest=AgentWorkflowIntegrationTest" test`. `mvnw verify` enforces 100% line and branch coverage for measured application code.
 
 ### Repeatable coding benchmark
 
@@ -290,7 +310,7 @@ Create a task against a repository under the configured allowlisted local root, 
 
 ## Architecture evolution: synchronous MVP to async workers
 
-The current implementation is a **Quarkus** REST API and one in-process scheduled worker backed by PostgreSQL. The API stores a task as `QUEUED`; the worker claims it, creates an attempt, opens an isolated workspace, runs a bounded model/tool loop, validates changes in Docker, and persists the report and terminal state. This is still an early single-worker slice: there are no leases, heartbeats, retries, crash recovery, cancellation during execution, broker, GitHub write integration, or independent worker process.
+The current implementation is a **Quarkus** REST API with an in-process worker for local development and a container-separated worker option backed by PostgreSQL. The API stores a task as `QUEUED`; the worker claims it, creates an attempt, opens a workspace, runs a bounded model/tool loop, requests isolated validation from the control plane, and persists the report and terminal state. This remains an early single-worker slice: there are no leases, heartbeats, automatic retries, execution cancellation, or durable recovery of in-flight work after a crash.
 
 When execution becomes asynchronous and needs to survive API restarts or scale independently, evolve toward this flow:
 
@@ -318,10 +338,10 @@ For long-running agent work, avoid holding a RabbitMQ delivery unacknowledged fo
 
 ### Incremental path
 
-1. **Current MVP:** Quarkus API, PostgreSQL task persistence, and audited status transitions.
-2. **Execution model:** add attempt records and a single database-backed worker; define claims, leases, bounded retries, timeouts, cancellation, and idempotency.
-3. **Asynchronous API:** return `202 Accepted` for submitted work and expose task/attempt progress while a worker executes independently.
-4. **Broker-backed dispatch:** add RabbitMQ when independent worker processes, scaling, or isolation make it useful. Introduce an outbox with broker publication and idempotent consumption as part of reliable dispatch.
+1. **Initial MVP (implemented):** Quarkus API, PostgreSQL task persistence, and audited status transitions.
+2. **Execution model (implemented first slice):** attempt records, database-backed claims, and local or container-separated worker. Next add leases, bounded retries, crash recovery, cancellation, and stronger idempotency.
+3. **Asynchronous API (implemented first slice):** task creation persists and returns `201 Created` with `QUEUED`; expose task/attempt progress while a worker executes asynchronously. Consider `202 Accepted` if the API contract is revised.
+4. **Broker-backed dispatch:** add RabbitMQ only when independent worker scaling or durable dispatch requirements justify it. Introduce an outbox with broker publication and idempotent consumption as part of reliable dispatch.
 5. **Operational hardening:** add recovery for expired leases, retry/backoff limits, dead-letter handling, concurrency and provider-rate limits, and observability before increasing worker count.
 
 Treat these as architecture guidance, not commitments to add every component now. Prefer the simplest stage that meets the current reliability and scaling needs.
@@ -346,7 +366,7 @@ The worker already requires a non-empty patch and successful supported validatio
 
 ### 3. Make execution reviewable and close isolation gaps
 
-The attempt report now includes redacted per-tool audit summaries and configurable time/cost guardrails; they are finalized with the attempt report and do not preemptively cancel an in-flight operation. The local review page exposes this evidence. Maven tests run in a disposable, resource-limited Docker container, but model/tool orchestration runs in the application process. Isolate orchestration and repository tools behind a bounded execution runtime before describing the whole agent as sandboxed. Define a controlled dependency-cache/proxy policy before permitting broader build support or network access. **Exit gate:** a reviewer can reconstruct completed attempts, budget behavior is explicit, and the execution boundary and limitations are documented.
+Tool calls are durably audited before execution and finalized afterward; task time/cost guardrails are checked at operation boundaries and do not preemptively cancel an in-flight operation. The Compose worker/control-plane split removes Docker-daemon access from orchestration, while Maven tests run in a separate resource-limited container. It is a process/container isolation layer, not a complete hostile-code security boundary: the worker has database credentials and outbound network access, and the control plane retains Docker-daemon privileges. A stricter deployment still needs least-privilege database roles, network egress controls, and operational tests on the target Docker host. **Exit gate:** a reviewer can reconstruct attempts, budget behavior is explicit, and the execution boundary and limitations are documented.
 
 ### 4. Add GitHub issue intake and harden PR publishing
 
@@ -384,10 +404,10 @@ These choices can be discussed while implementing the worker; they do not need t
 ## Status and handoff for the next coding session
 
 - Ollama is the first model backend. The provider contract and HTTP adapter have mock-HTTP coverage; run the versioned benchmark before making model-quality claims.
-- The scheduled single-process worker, fail-closed local repository-root configuration, tool allowlist, temporary repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, answer-and-requeue flow, local review page, durable per-tool audit events, cumulative task time/cost guardrails, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. Model/tool orchestration still runs in the application process; GitHub issue intake, private-repository clone authentication, and durable recovery from partial publication are not implemented. Next priorities are to validate publishing against a dedicated test repository, expand the benchmark, and design an isolated orchestration runtime that does not expose the host Docker socket or publishing credentials.
+- The scheduled worker, fail-closed local repository-root configuration, tool allowlist, disposable repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, answer-and-requeue flow, local review page, durable per-tool audit events, cumulative task time/cost guardrails, container-separated worker/control-plane deployment, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. GitHub issue intake, private-repository clone authentication, strict egress controls, least-privilege worker database roles, and durable recovery from partial publication are not implemented. The Compose topology still needs execution and containment testing on the deployment host.
 - Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces 100% line and branch coverage for measured application code; the HTML report is generated under `target/site/jacoco`.
 - PostgreSQL 18.6 databases `coding_agent_platform` and `coding_agent_platform_test` plus limited login `coding_agent_app` are configured locally. The app role password is in the ignored project `.env`; the administrator password is not used by the app.
-- The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. The isolated PostgreSQL test database is migrated through V4 for attempts.
+- The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. Flyway migrations through V5 add durable tool-execution events.
 - A prior shell lookup resolved `java` to Oracle's `java8path` shim. The IntelliJ JBR at `C:\\Program Files\JetBrains\IntelliJ IDEA 2026.1\jbr` ran Maven as Java 25, compiling for the project's Java 21 target. Configure IntelliJ's Maven Runner JRE explicitly.
 - A previous debug-port collision was reported on `5005`. The Maven plugin now has `<debug>false</debug>` configured; reload the Maven project after pulling this change. If JDWP still appears, inspect IntelliJ's run configuration for an explicit `-agentlib:jdwp` VM option.
 
