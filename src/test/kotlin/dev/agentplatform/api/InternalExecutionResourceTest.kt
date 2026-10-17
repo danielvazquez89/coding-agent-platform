@@ -59,10 +59,12 @@ class InternalExecutionResourceTest {
 
     @Test
     fun `returns service unavailable when gateway credentials are not configured`() {
-        val unconfigured = InternalExecutionResource(runner, "", root.toString())
+        for (token in listOf("", "   ", "disabled", "DISABLED")) {
+            val unconfigured = InternalExecutionResource(runner, token, root.toString())
 
-        assertStatus(503) {
-            unconfigured.validate(TOKEN, InternalExecutionResource.ValidationRequest(workspace.toString()))
+            assertStatus(503) {
+                unconfigured.validate(TOKEN, InternalExecutionResource.ValidationRequest(workspace.toString()))
+            }
         }
         assertEquals(0, runner.calls)
     }

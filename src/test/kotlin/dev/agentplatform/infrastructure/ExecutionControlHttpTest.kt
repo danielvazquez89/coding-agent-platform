@@ -79,6 +79,31 @@ class ExecutionControlHttpTest {
     }
 
     @Test
+    fun `parses optional validation fields as absent`() {
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val workspace = Files.createTempDirectory("execution-control-http-")
+        server.createContext("/internal/execution/validate") { exchange ->
+            respond(exchange, 200, """{"name":"Maven tests","outcome":"SKIPPED"}""")
+        }
+        server.start()
+        try {
+            val result = ExecutionControlHttp.validate(
+                "http://127.0.0.1:${server.address.port}",
+                "test-token",
+                workspace,
+                5
+            )
+            assertEquals(null, result.exitCode)
+            assertEquals(null, result.durationMillis)
+            assertEquals(null, result.command)
+            assertEquals(null, result.details)
+        } finally {
+            server.stop(0)
+            Files.deleteIfExists(workspace)
+        }
+    }
+
+    @Test
     fun `rejects missing credentials and invalid timeouts before sending requests`() {
         val workspace = Files.createTempDirectory("execution-control-http-")
 
@@ -89,6 +114,30 @@ class ExecutionControlHttpTest {
             assertThrows(IllegalArgumentException::class.java) {
                 ExecutionControlHttp.validate("http://localhost", "test-token", workspace, 0)
             }
+            assertThrows(IllegalArgumentException::class.java) {
+                ExecutionControlHttp.validate("ftp://localhost", "test-token", workspace, 5)
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                ExecutionControlHttp.validate("http://user@localhost", "test-token", workspace, 5)
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                ExecutionControlHttp.validate("http:/missing-host", "test-token", workspace, 5)
+            }
+        } finally {
+            Files.deleteIfExists(workspace)
+        }
+    }
+
+    @Test
+    fun `reports transport failures when the control plane is unreachable`() {
+        val workspace = Files.createTempDirectory("execution-control-http-")
+        val unreachablePort = java.net.ServerSocket(0).use { it.localPort }
+        try {
+            val failure = assertThrows(IllegalStateException::class.java) {
+                ExecutionControlHttp.validate("http://127.0.0.1:$unreachablePort", "test-token", workspace, 5)
+            }
+
+            assertTrue(failure.message.orEmpty().contains("Execution control-plane request failed"))
         } finally {
             Files.deleteIfExists(workspace)
         }

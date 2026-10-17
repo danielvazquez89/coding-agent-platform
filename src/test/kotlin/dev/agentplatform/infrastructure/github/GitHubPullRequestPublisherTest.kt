@@ -7,6 +7,7 @@ import dev.agentplatform.domain.port.CommandResult
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import java.net.InetSocketAddress
+import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
 import java.util.concurrent.atomic.AtomicReference
@@ -87,6 +88,226 @@ class GitHubPullRequestPublisherTest {
     }
 
     @Test
+    fun `validates GitHub publisher configuration and pull request inputs`() {
+        val server = server { exchange -> respond(exchange, 200, """{"default_branch":"main"}""") }
+        try {
+            val commands = RecordingGitCommands()
+            assertThrows(IllegalArgumentException::class.java) {
+                GitHubPullRequestPublisher(commands, mapper, "token", "bad/name/extra", "https://api.github.com", false)
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                GitHubPullRequestPublisher(commands, mapper, "token", "example/repo", "http://example.com", false)
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                GitHubPullRequestPublisher(commands, mapper, "not-configured", "example/repo", "https://api.github.com", true)
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                GitHubPullRequestPublisher(commands, mapper, "token", "not-configured", "https://api.github.com", true)
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                GitHubPullRequestPublisher(commands, mapper, "token", "example/repo", "ftp://api.github.com", false)
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                publisher(commands, server, "example/repo", token = "not-configured")
+                    .createDraft("https://github.com/example/repo", Path.of("workspace"), branch, "title", "body", files)
+            }
+
+            val client = publisher(commands, server, "example/repo")
+            assertThrows(IllegalArgumentException::class.java) {
+                client.createDraft("https://github.com/example/repo", Path.of("workspace"), "invalid-branch", "title", "body", files)
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                client.createDraft("https://github.com/example/repo", Path.of("workspace"), branch, " ", "body", files)
+            }
+            assertThrows(IllegalArgumentException::class.java) {
+                client.createDraft("https://github.com/example/repo", Path.of("workspace"), branch, "x".repeat(300), "body", files)
+            }
+            assertTrue(commands.commands.isEmpty())
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `rejects unsafe changed file lists before invoking git`() {
+        val server = server { exchange ->
+            when (exchange.requestURI.path) {
+                "/repos/example/repo" -> respond(exchange, 200, """{"default_branch":"main"}""")
+                "/repos/example/repo/pulls" -> respond(exchange, 200, "[]")
+                else -> respond(exchange, 404, "{}")
+            }
+        }
+        try {
+            val commands = RecordingGitCommands()
+            val client = publisher(commands, server, "example/repo")
+            fun publish(changed: List<String>) = client.createDraft(
+                "https://github.com/example/repo", Path.of("workspace"), branch, "title", "body", changed
+            )
+
+            assertThrows(IllegalArgumentException::class.java) { publish(emptyList()) }
+            assertThrows(IllegalArgumentException::class.java) { publish(listOf("../outside")) }
+            assertThrows(IllegalArgumentException::class.java) {
+                publish(listOf(Path.of(System.getProperty("java.io.tmpdir"), "outside").toString()))
+            }
+            assertThrows(IllegalArgumentException::class.java) { publish(listOf("unsafe\npath")) }
+            assertThrows(IllegalArgumentException::class.java) { publish(listOf("unsafe\u0000path")) }
+            assertThrows(IllegalArgumentException::class.java) { publish((0..250).map { "src/File$it.kt" }) }
+            assertThrows(IllegalArgumentException::class.java) {
+                publish((0..249).map { "d$it/" + "x".repeat(100) })
+            }
+            assertTrue(commands.commands.isEmpty())
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `rejects changed paths that traverse symbolic links when supported`() {
+        val workspace = Files.createTempDirectory("github-publish-workspace-")
+        val target = Files.createTempFile("github-publish-target-", ".txt")
+        val server = server { exchange ->
+            when {
+                exchange.requestURI.path == "/repos/example/repo" ->
+                    respond(exchange, 200, """{"default_branch":"main"}""")
+                exchange.requestURI.path == "/repos/example/repo/pulls" ->
+                    respond(exchange, 200, "[]")
+                else -> respond(exchange, 404, "{}")
+            }
+        }
+        try {
+            try {
+                Files.createSymbolicLink(workspace.resolve("linked.txt"), target)
+            } catch (_: Exception) {
+                return
+            }
+            val commands = RecordingGitCommands()
+            val failure = assertThrows(IllegalArgumentException::class.java) {
+                publisher(commands, server, "example/repo").createDraft(
+                    "https://github.com/example/repo",
+                    workspace,
+                    branch,
+                    "title",
+                    "body",
+                    listOf("linked.txt")
+                )
+            }
+            assertTrue(failure.message.orEmpty().contains("escapes"))
+            assertTrue(commands.commands.isEmpty())
+        } finally {
+            server.stop(0)
+            Files.deleteIfExists(workspace.resolve("linked.txt"))
+            Files.deleteIfExists(workspace)
+            Files.deleteIfExists(target)
+        }
+    }
+
+    @Test
+    fun `rejects incomplete GitHub repository and pull request responses`() {
+        val body = AtomicReference("""{"number":17,"html_url":"https://github.com/example/repo/pull/17","title":"Agent change","state":"open","draft":true}""")
+        val repository = AtomicReference("""{"default_branch":"main"}""")
+        val server = server { exchange ->
+            when {
+                exchange.requestURI.path == "/repos/example/repo" -> respond(exchange, 200, repository.get())
+                exchange.requestURI.path == "/repos/example/repo/pulls" && exchange.requestMethod == "GET" ->
+                    respond(exchange, 200, "[]")
+                exchange.requestURI.path == "/repos/example/repo/pulls" && exchange.requestMethod == "POST" ->
+                    respond(exchange, 201, body.get())
+                else -> respond(exchange, 404, "{}")
+            }
+        }
+        try {
+            val publisher = publisher(RecordingGitCommands(), server, "example/repo")
+            repository.set("""{"default_branch":" "}""")
+            assertThrows(IllegalStateException::class.java) {
+                publisher.createDraft(
+                    "https://github.com/example/repo", Path.of("workspace"), branch, "title", "body", files
+                )
+            }
+            repository.set("""{"default_branch":"main"}""")
+            listOf(
+                "{}",
+                """{"number":"not-a-number","html_url":"url","state":"open","draft":true}""",
+                """{"number":1,"state":"open","draft":true}""",
+                """{"number":1,"html_url":"url","state":"unknown","draft":true}""",
+                """{"number":1,"html_url":"url","state":"closed"}"""
+            ).forEach { response ->
+                body.set(response)
+                assertThrows(IllegalStateException::class.java) {
+                    publisher.createDraft(
+                        "https://github.com/example/repo", Path.of("workspace"), branch, "title", "body", files
+                    )
+                }
+            }
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `reports GitHub API errors and invalid JSON`() {
+        val status = AtomicReference(403)
+        val responseBody = AtomicReference("token denied")
+        val server = server { exchange ->
+            respond(exchange, status.get(), responseBody.get())
+        }
+        try {
+            val publisher = publisher(RecordingGitCommands(), server, "example/repo")
+            val denied = assertThrows(IllegalStateException::class.java) {
+                publisher.createDraft(
+                    "https://github.com/example/repo", Path.of("workspace"), branch, "title", "body", files
+                )
+            }
+            assertTrue(denied.message.orEmpty().contains("HTTP 403"))
+
+            status.set(200)
+            responseBody.set("{")
+            val malformed = assertThrows(IllegalStateException::class.java) {
+                publisher.createDraft(
+                    "https://github.com/example/repo", Path.of("workspace"), branch, "title", "body", files
+                )
+            }
+            assertTrue(malformed.message.orEmpty().contains("invalid JSON"))
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `rejects unsafe Git workspace configuration and staged states`() {
+        val server = server { exchange ->
+            when {
+                exchange.requestURI.path == "/repos/example/repo" ->
+                    respond(exchange, 200, """{"default_branch":"main"}""")
+                exchange.requestURI.path == "/repos/example/repo/pulls" && exchange.requestMethod == "GET" ->
+                    respond(exchange, 200, "[]")
+                else -> respond(exchange, 201, """{"number":17,"html_url":"url","title":"title","state":"open","draft":true}""")
+            }
+        }
+        try {
+            val scenarios: List<Pair<String, (List<String>) -> CommandResult?>> = listOf(
+                "origin" to { command -> if (command.contains("remote.origin.url")) CommandResult(0, "https://github.com/other/repo.git") else null },
+                "pushurl" to { command -> if (command.contains("remote.origin.pushurl")) CommandResult(0, "https://attacker.invalid/repo.git") else null },
+                "rewrite" to { command -> if (command.contains("--get-regexp")) CommandResult(0, "url.other.insteadOf https://github.com") else null },
+                "pre-staged" to { command -> if (command.contains("--cached") && command.contains("--quiet")) CommandResult(1, "staged") else null },
+                "no-staged-diff" to { command -> if (command.contains("--cached") && command.contains("--quiet")) CommandResult(0, "") else null },
+                "push" to { command -> if (command.contains("push")) CommandResult(1, "push rejected") else null }
+            )
+
+            scenarios.forEach { (name, override) ->
+                val commands = RecordingGitCommands().apply { resultOverride = override }
+                val failure = assertThrows(Exception::class.java) {
+                    publisher(commands, server, "example/repo").createDraft(
+                        "https://github.com/example/repo", Path.of("workspace"), branch, "title", "body", files
+                    )
+                }
+                assertTrue(failure.message.orEmpty().isNotBlank(), name)
+            }
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
     fun `returns an existing pull request instead of creating a duplicate`() {
         val server = server { exchange ->
             when {
@@ -108,18 +329,85 @@ class GitHubPullRequestPublisherTest {
         }
     }
 
+    @Test
+    fun `cleans up a non-empty temporary hooks directory without masking success`() {
+        val server = server { exchange ->
+            when {
+                exchange.requestURI.path == "/repos/example/repo" ->
+                    respond(exchange, 200, """{"default_branch":"main"}""")
+                exchange.requestURI.path == "/repos/example/repo/pulls" && exchange.requestMethod == "GET" ->
+                    respond(exchange, 200, "[]")
+                exchange.requestURI.path == "/repos/example/repo/pulls" && exchange.requestMethod == "POST" ->
+                    respond(exchange, 201, """{"number":5,"html_url":"url","title":"title","state":"open","draft":true}""")
+                else -> respond(exchange, 404, "{}")
+            }
+        }
+        var hooksDirectory: Path? = null
+        try {
+            val commands = RecordingGitCommands().apply {
+                resultOverride = { command ->
+                    command.firstOrNull { it.startsWith("core.hooksPath=") }?.let { flag ->
+                        val directory = Path.of(flag.substringAfter('='))
+                        hooksDirectory = directory
+                        Files.writeString(directory.resolve("pre-commit"), "#!/bin/sh\n")
+                    }
+                    null
+                }
+            }
+            val result = publisher(commands, server, "example/repo").createDraft(
+                "https://github.com/example/repo", Path.of("workspace"), branch, "title", "body", files
+            )
+            assertEquals(5, result.number)
+        } finally {
+            server.stop(0)
+        }
+        assertNotNull(hooksDirectory)
+        assertFalse(Files.exists(hooksDirectory!!), "temp hooks directory should be removed even when non-empty")
+    }
+
+    @Test
+    fun `redacts the configured token from git failure messages`() {
+        val server = server { exchange ->
+            when {
+                exchange.requestURI.path == "/repos/example/repo" ->
+                    respond(exchange, 200, """{"default_branch":"main"}""")
+                exchange.requestURI.path == "/repos/example/repo/pulls" && exchange.requestMethod == "GET" ->
+                    respond(exchange, 200, "[]")
+                else -> respond(exchange, 404, "{}")
+            }
+        }
+        try {
+            val commands = RecordingGitCommands().apply {
+                resultOverride = { command ->
+                    if (command.contains("push")) CommandResult(1, "fatal: authentication failed for test-token")
+                    else null
+                }
+            }
+            val failure = assertThrows(IllegalStateException::class.java) {
+                publisher(commands, server, "example/repo").createDraft(
+                    "https://github.com/example/repo", Path.of("workspace"), branch, "title", "body", files
+                )
+            }
+            assertFalse(failure.message.orEmpty().contains("test-token"))
+            assertTrue(failure.message.orEmpty().contains("[redacted]"))
+        } finally {
+            server.stop(0)
+        }
+    }
+
     private fun publisher(
         commands: RecordingGitCommands,
         server: HttpServer,
         allowlist: String,
         token: String = "test-token",
-        enabled: Boolean = true
+        enabled: Boolean = true,
+        apiUrl: String = "http://127.0.0.1:${server.address.port}"
     ) = GitHubPullRequestPublisher(
         commands,
         mapper,
         token,
         allowlist,
-        "http://127.0.0.1:${server.address.port}",
+        apiUrl,
         enabled
     )
 
@@ -138,6 +426,7 @@ class GitHubPullRequestPublisherTest {
 
     private class RecordingGitCommands : CommandExecutor {
         val commands = mutableListOf<List<String>>()
+        var resultOverride: ((List<String>) -> CommandResult?)? = null
         var cachedDiffCalls = 0
         var pushCommand: List<String>? = null
         var pushEnvironment: Map<String, String>? = null
@@ -151,6 +440,7 @@ class GitHubPullRequestPublisherTest {
             environment: Map<String, String>
         ): CommandResult {
             commands += command
+            resultOverride?.invoke(command)?.let { return it }
             if (command.contains("push")) {
                 pushCommand = command
                 pushEnvironment = environment

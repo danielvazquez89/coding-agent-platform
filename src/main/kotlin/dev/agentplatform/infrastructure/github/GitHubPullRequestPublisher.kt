@@ -18,6 +18,7 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
 import java.util.Base64
+import java.util.Comparator
 
 @ApplicationScoped
 open class GitHubPullRequestPublisher @Inject constructor(
@@ -209,8 +210,11 @@ open class GitHubPullRequestPublisher @Inject constructor(
                 "Could not push the pull-request branch: ${sanitize(push.output)}"
             }
         } finally {
-            Files.deleteIfExists(globalConfig)
-            Files.deleteIfExists(hooksPath)
+            // Temp cleanup must never mask the original failure: a hook file left behind or a
+            // still-open handle can make deletion throw (DirectoryNotEmptyException, IOException),
+            // so each removal is best-effort.
+            runCatching { Files.deleteIfExists(globalConfig) }
+            runCatching { deleteTree(hooksPath) }
         }
     }
 
@@ -315,10 +319,20 @@ open class GitHubPullRequestPublisher @Inject constructor(
 
     private fun encode(value: String) = URLEncoder.encode(value, StandardCharsets.UTF_8)
 
+    private fun deleteTree(root: Path) {
+        if (!Files.exists(root)) return
+        Files.walk(root).use { paths ->
+            paths.sorted(Comparator.reverseOrder()).forEach { Files.deleteIfExists(it) }
+        }
+    }
+
     private fun sanitize(text: String): String {
         val encoded = Base64.getEncoder()
             .encodeToString("x-access-token:$token".toByteArray(StandardCharsets.UTF_8))
-        return text.replace(token, "[redacted]").replace(encoded, "[redacted]").take(MAX_ERROR_LENGTH)
+        // Guard against a blank token: String.replace("", ...) would insert the marker between
+        // every character instead of redacting a secret.
+        val withoutToken = if (token.isBlank()) text else text.replace(token, "[redacted]")
+        return withoutToken.replace(encoded, "[redacted]").take(MAX_ERROR_LENGTH)
     }
 
     private companion object {

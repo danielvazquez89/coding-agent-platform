@@ -20,7 +20,7 @@ import java.security.MessageDigest
 @Produces(MediaType.APPLICATION_JSON)
 class InternalExecutionResource(
     private val validationRunner: ValidationRunner,
-    @ConfigProperty(name = "agent.execution.control-plane-token", defaultValue = "")
+    @ConfigProperty(name = "agent.execution.control-plane-token", defaultValue = "disabled")
     private val controlPlaneToken: String,
     @ConfigProperty(name = "agent.execution.workspace-root", defaultValue = "")
     private val workspaceRoot: String
@@ -62,7 +62,7 @@ class InternalExecutionResource(
     }
 
     private fun authorize(authorization: String?) {
-        if (controlPlaneToken.isBlank()) {
+        if (!isConfigured(controlPlaneToken)) {
             throw WebApplicationException("Internal execution gateway is not configured", Response.Status.SERVICE_UNAVAILABLE)
         }
         val expected = "Bearer $controlPlaneToken".toByteArray(Charsets.UTF_8)
@@ -70,5 +70,12 @@ class InternalExecutionResource(
         if (!MessageDigest.isEqual(expected, provided)) {
             throw WebApplicationException(Response.Status.UNAUTHORIZED)
         }
+    }
+
+    private fun isConfigured(value: String): Boolean =
+        value.isNotBlank() && !value.equals(DISABLED_CONFIGURATION_VALUE, ignoreCase = true)
+
+    private companion object {
+        const val DISABLED_CONFIGURATION_VALUE = "disabled"
     }
 }

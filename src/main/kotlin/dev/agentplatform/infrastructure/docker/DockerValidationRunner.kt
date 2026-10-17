@@ -37,8 +37,8 @@ open class DockerValidationRunner @Inject constructor(
     private val configuredWorkspaceRoot: String = "",
     @ConfigProperty(name = "agent.execution.control-plane-url", defaultValue = "disabled")
     private val controlPlaneUrl: String = "disabled",
-    @ConfigProperty(name = "agent.execution.control-plane-token", defaultValue = "")
-    private val controlPlaneToken: String = "",
+    @ConfigProperty(name = "agent.execution.control-plane-token", defaultValue = "disabled")
+    private val controlPlaneToken: String = "disabled",
     @ConfigProperty(name = "agent.execution.control-plane-timeout-seconds", defaultValue = "7200")
     private val controlPlaneTimeoutSeconds: Long = 7200
 ) : ValidationRunner {
@@ -47,7 +47,7 @@ open class DockerValidationRunner @Inject constructor(
         require(databaseReadyAttempts > 0) { "Database readiness attempts must be positive" }
         require(databaseReadyDelayMillis >= 0) { "Database readiness delay cannot be negative" }
         require(controlPlaneTimeoutSeconds > 0) { "Control-plane timeout must be positive" }
-        require(!isConfigured(controlPlaneUrl) || controlPlaneToken.isNotBlank()) {
+        require(!isConfigured(controlPlaneUrl) || isConfigured(controlPlaneToken)) {
             "Execution control-plane token is required when a control-plane URL is configured"
         }
         require(isConfigured(workspaceVolume) == isConfigured(mavenCacheVolume)) {

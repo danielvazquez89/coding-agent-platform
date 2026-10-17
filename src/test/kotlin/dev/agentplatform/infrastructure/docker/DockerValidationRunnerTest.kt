@@ -48,6 +48,13 @@ class DockerValidationRunnerTest {
         assertThrows(IllegalArgumentException::class.java) {
             DockerValidationRunner(
                 commands, "maven:test", "postgres:test", "cache", 1, 1, 0,
+                controlPlaneUrl = "http://localhost:8080",
+                controlPlaneToken = "disabled"
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            DockerValidationRunner(
+                commands, "maven:test", "postgres:test", "cache", 1, 1, 0,
                 mavenCacheVolume = "maven-cache"
             )
         }
@@ -62,6 +69,7 @@ class DockerValidationRunnerTest {
             artifact descriptor for org.example:plugin:maven-plugin:runner:6.7
             dependency: org.example:library:jar:1.2.3
             dependency: org.example:bad:invalid:1.2
+            artifact descriptor for org.example:thing:zip:runner:9.9
             dependency: org.example:too:few
         """.trimIndent()
 
@@ -89,7 +97,7 @@ class DockerValidationRunnerTest {
                 command.take(3) == listOf("docker", "network", "create") -> CommandResult(0, "network")
                 command.take(3) == listOf("docker", "run", "-d") -> CommandResult(0, "db")
                 command.take(2) == listOf("docker", "exec") -> CommandResult(0, "ready")
-                "maven-dependency-plugin:3.8.1:get" in command -> {
+                command.any { it.endsWith("maven-dependency-plugin:3.8.1:get") } -> {
                     dependencyCalls.incrementAndGet()
                     CommandResult(0, "downloaded")
                 }
@@ -108,6 +116,56 @@ class DockerValidationRunnerTest {
         assertEquals(2, validationCalls.get())
         assertEquals(1, dependencyCalls.get())
         assertTrue(result.details!!.contains("Retrying offline Maven tests"))
+    }
+
+    @Test
+    fun `stops dependency recovery when no artifacts match or download fails`() {
+        val repo = mavenRepository()
+        val dependencyCalls = AtomicInteger()
+        val validationCalls = AtomicInteger()
+        val commands = object : CommandExecutor {
+            override fun run(
+                command: List<String>, workingDirectory: Path?, standardInput: String?, timeout: Duration,
+                maxOutputChars: Int, environment: Map<String, String>
+            ): CommandResult = when {
+                command.take(3) == listOf("docker", "network", "create") -> CommandResult(0, "network")
+                command.take(3) == listOf("docker", "run", "-d") -> CommandResult(0, "db")
+                command.take(2) == listOf("docker", "exec") -> CommandResult(0, "ready")
+                command.any { it.endsWith("maven-dependency-plugin:3.8.1:get") } -> {
+                    dependencyCalls.incrementAndGet()
+                    CommandResult(1, "download denied")
+                }
+                command.contains("mvn") -> {
+                    validationCalls.incrementAndGet()
+                    CommandResult(1, "Could not find artifact org.example:library:jar:1.2.3")
+                }
+                else -> CommandResult(0, "removed")
+            }
+        }
+
+        val result = runner(commands, temporary.resolve("m2").toString()).validate(repo)
+        assertEquals(CheckOutcome.FAILED, result.outcome)
+        assertEquals(1, validationCalls.get())
+        assertEquals(1, dependencyCalls.get())
+        assertTrue(result.details!!.contains("Could not download missing artifact"))
+
+        val noCoordinates = runner(
+            object : CommandExecutor {
+                override fun run(
+                    command: List<String>, workingDirectory: Path?, standardInput: String?, timeout: Duration,
+                    maxOutputChars: Int, environment: Map<String, String>
+                ) = when {
+                    command.take(3) == listOf("docker", "network", "create") -> CommandResult(0, "network")
+                    command.take(3) == listOf("docker", "run", "-d") -> CommandResult(0, "db")
+                    command.take(2) == listOf("docker", "exec") -> CommandResult(0, "ready")
+                    command.contains("mvn") -> CommandResult(1, "Could not resolve dependencies for project")
+                    else -> CommandResult(0, "removed")
+                }
+            },
+            temporary.resolve("m2").toString()
+        ).validate(repo)
+        assertEquals(CheckOutcome.FAILED, noCoordinates.outcome)
+        assertTrue(noCoordinates.details!!.contains("Could not resolve dependencies"))
     }
 
     @Test
@@ -196,6 +254,109 @@ class DockerValidationRunnerTest {
         assertTrue(mavenCommand.any { it.contains("volume-subpath=attempt-test-123") })
         assertTrue(mavenCommand.any { it.contains("source=agent-maven-cache,target=/m2/repository,readonly") })
         assertTrue(mavenCommand.none { it.startsWith("type=bind,source=") })
+    }
+
+    @Test
+    fun `fetches missing artifacts through the shared Maven cache volume`() {
+        val workspaceRoot = Files.createDirectory(temporary.resolve("recovery-workspaces"))
+        val workspace = Files.createDirectory(workspaceRoot.resolve("attempt-recovery-1"))
+        Files.writeString(workspace.resolve("pom.xml"), "<project/>")
+        val cache = Files.createDirectory(temporary.resolve("recovery-cache"))
+        val dependencyCommands = mutableListOf<List<String>>()
+        val validationCalls = AtomicInteger()
+        val commands = object : CommandExecutor {
+            override fun run(
+                command: List<String>, workingDirectory: Path?, standardInput: String?, timeout: Duration,
+                maxOutputChars: Int, environment: Map<String, String>
+            ): CommandResult = when {
+                command.take(3) == listOf("docker", "network", "create") -> CommandResult(0, "network")
+                command.take(3) == listOf("docker", "run", "-d") -> CommandResult(0, "db")
+                command.take(2) == listOf("docker", "exec") -> CommandResult(0, "ready")
+                command.any { it.endsWith("maven-dependency-plugin:3.8.1:get") } -> {
+                    dependencyCommands += command
+                    CommandResult(0, "downloaded")
+                }
+                command.contains("mvn") -> if (validationCalls.incrementAndGet() == 1) {
+                    CommandResult(1, "Could not find artifact org.example:library:jar:1.2.3")
+                } else {
+                    CommandResult(0, "Tests passed")
+                }
+                else -> CommandResult(0, "cleanup")
+            }
+        }
+
+        val result = DockerValidationRunner(
+            commands, "maven:test", "postgres:test", cache.toString(), 10, 2, 0,
+            mavenCacheVolume = "agent-maven-cache",
+            workspaceVolume = "agent-workspaces",
+            configuredWorkspaceRoot = workspaceRoot.toString()
+        ).validate(workspace)
+
+        assertEquals(CheckOutcome.PASSED, result.outcome)
+        assertEquals(1, dependencyCommands.size)
+        assertTrue(dependencyCommands.first().contains("type=volume,source=agent-maven-cache,target=/m2/repository"))
+        assertTrue(dependencyCommands.first().none { it.startsWith("type=bind") })
+    }
+
+    @Test
+    fun `rejects workspace volume mounts outside the task attempt directory`() {
+        val workspaceRoot = Files.createDirectory(temporary.resolve("volume-workspaces"))
+        val outside = Files.createDirectory(temporary.resolve("outside-attempt"))
+        Files.writeString(outside.resolve("pom.xml"), "<project/>")
+        val attemptRoot = Files.createDirectory(workspaceRoot.resolve("attempt-invalid_name"))
+        Files.writeString(attemptRoot.resolve("pom.xml"), "<project/>")
+        val cache = Files.createDirectory(temporary.resolve("volume-cache"))
+        val validationRunner = DockerValidationRunner(
+            fakeCommands(), "maven:test", "postgres:test", cache.toString(), 10, 1, 0,
+            mavenCacheVolume = "maven-cache",
+            workspaceVolume = "workspace-volume",
+            configuredWorkspaceRoot = workspaceRoot.toString()
+        )
+
+        val outsideResult = validationRunner.validate(outside)
+        assertEquals(CheckOutcome.FAILED, outsideResult.outcome)
+        assertTrue(outsideResult.details!!.contains("outside the configured workspace root"))
+
+        val invalidNameResult = validationRunner.validate(attemptRoot)
+        assertEquals(CheckOutcome.FAILED, invalidNameResult.outcome)
+        assertTrue(invalidNameResult.details!!.contains("task-specific directory"))
+    }
+
+    @Test
+    fun `does not retry an artifact download already completed and bounds validation output`() {
+        val repo = mavenRepository()
+        val dependencyCalls = AtomicInteger()
+        val validationCalls = AtomicInteger()
+        val commands = object : CommandExecutor {
+            override fun run(
+                command: List<String>, workingDirectory: Path?, standardInput: String?, timeout: Duration,
+                maxOutputChars: Int, environment: Map<String, String>
+            ): CommandResult = when {
+                command.take(3) == listOf("docker", "network", "create") -> CommandResult(0, "network")
+                command.take(3) == listOf("docker", "run", "-d") -> CommandResult(0, "db")
+                command.take(2) == listOf("docker", "exec") -> CommandResult(0, "ready")
+                command.any { it.endsWith("maven-dependency-plugin:3.8.1:get") } -> {
+                    dependencyCalls.incrementAndGet()
+                    CommandResult(0, "downloaded")
+                }
+                command.contains("mvn") -> {
+                    validationCalls.incrementAndGet()
+                    CommandResult(1, "Could not find artifact org.example:library:jar:1.2.3")
+                }
+                else -> CommandResult(0, "removed")
+            }
+        }
+
+        val result = runner(commands, temporary.resolve("m2").toString()).validate(repo)
+        assertEquals(CheckOutcome.FAILED, result.outcome)
+        assertEquals(2, validationCalls.get())
+        assertEquals(1, dependencyCalls.get())
+
+        val oversizedOutput = "x".repeat(20_000)
+        val bounded = runner(fakeCommands(mavenResult = CommandResult(1, oversizedOutput)), temporary.resolve("m2").toString())
+            .validate(repo)
+        assertEquals(CheckOutcome.FAILED, bounded.outcome)
+        assertTrue(bounded.details!!.length <= DockerValidationRunner.MAX_VALIDATION_OUTPUT)
     }
 
     @Test
