@@ -11,6 +11,8 @@ import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.jboss.logging.Logger
 import java.nio.file.Path
+import java.time.Duration
+import java.time.Instant
 import java.util.*
 
 @ApplicationScoped
@@ -40,9 +42,19 @@ class TaskExecutionWorker @Inject constructor(
     @ConfigProperty(name = "agent.execution.max-estimated-cost-usd", defaultValue = "1.0")
     private val maxEstimatedCostUsd: Double = 1.0,
     @ConfigProperty(name = "agent.execution.worker.enabled", defaultValue = "true")
-    private val workerEnabled: Boolean = true
+    private val workerEnabled: Boolean = true,
+    @ConfigProperty(name = "agent.execution.stale-attempt-timeout-seconds", defaultValue = "disabled")
+    private val staleAttemptTimeoutSeconds: String = "disabled"
 ) {
     private val log = Logger.getLogger(TaskExecutionWorker::class.java)
+
+    /**
+     * How long an attempt may stay RUNNING without completing before it is treated as orphaned by a
+     * worker that stopped reporting progress. Defaults to twice the maximum task duration so a task
+     * that is still legitimately executing (its budget is checked after each operation) is never
+     * reaped early.
+     */
+    private val staleAfter: Duration = resolveStaleAfter(staleAttemptTimeoutSeconds, maxDurationSeconds)
 
     init {
         require(maxToolCalls > 0) { "Maximum tool calls must be positive" }
@@ -60,10 +72,50 @@ class TaskExecutionWorker @Inject constructor(
         log.infof("Task execution worker poll tick; executionEnabled=%s workerEnabled=%s", enabled, workerEnabled)
         if (!enabled || !workerEnabled) return
         try {
+            reapOrphanedAttempts()
             if (!processNext()) log.debug("Task execution worker found no queued tasks")
         } catch (failure: Exception) {
             log.error("Task execution worker poll failed", failure)
         }
+    }
+
+    /**
+     * Fails attempts that a crashed or restarted worker left RUNNING. Runs on each poll tick while
+     * this worker is idle; it cannot reap its own in-flight attempt because [poll] never runs
+     * concurrently with execution. In a multi-worker deployment another idle worker performs the
+     * reconciliation, and [staleAfter] guards against failing a task that is merely slow.
+     */
+    fun reapOrphanedAttempts(now: Instant = Instant.now()): Int {
+        val cutoff = now.minus(staleAfter)
+        val orphaned = try {
+            attempts.runningAttemptsStartedBefore(cutoff)
+        } catch (e: Exception) {
+            log.warnf(e, "Could not scan for orphaned execution attempts")
+            return 0
+        }
+        var reaped = 0
+        for (attempt in orphaned) {
+            val task = try {
+                taskState.findById(attempt.taskId)
+            } catch (e: Exception) {
+                log.warnf(e, "Could not load task %s for orphaned attempt %s", attempt.taskId, attempt.id)
+                null
+            }
+            if (task == null || (task.status != TaskStatus.RUNNING && task.status != TaskStatus.VALIDATING)) {
+                continue
+            }
+            val reason = "The execution worker stopped while attempt ${attempt.attemptNumber} was running " +
+                "(started ${attempt.startedAt}); its outcome is unknown. The attempt was failed so the task " +
+                "stays consistent, and a new task is required to retry the work."
+            try {
+                finalizer.failOrphaned(task.id, attempt.id, reason)
+                reaped++
+                log.warnf("Reaped orphaned attempt %s of task %s", attempt.id, task.id)
+            } catch (e: Exception) {
+                log.warnf(e, "Could not reap orphaned attempt %s", attempt.id)
+            }
+        }
+        return reaped
     }
 
     fun processNext(): Boolean {
@@ -239,7 +291,7 @@ class TaskExecutionWorker @Inject constructor(
                 log.warnf(e, "Task %s could not list changed files after failure", task.id)
                 emptyList()
             }
-            val diff = try { workspace?.patchDiff(MAX_DIFF_CHARS) } catch (e: Exception) {
+            val patch = try { workspace?.patchDiff(MAX_DIFF_CHARS) } catch (e: Exception) {
                 log.warnf(e, "Task %s could not collect diff after failure", task.id)
                 null
             }
@@ -255,7 +307,8 @@ class TaskExecutionWorker @Inject constructor(
                 ),
                 changedFiles = files,
                 validation = validation.toList(),
-                patchDiff = diff,
+                patchDiff = patch?.diff,
+                patchDiffTruncated = patch?.truncated == true,
                 acceptanceChecks = acceptanceChecks(task, emptyList()),
                 patchFailures = trace.patchFailures.toList(),
                 modelUsage = trace.usage(),
@@ -390,7 +443,7 @@ class TaskExecutionWorker @Inject constructor(
                 lastToolResult = result.content.take(MAX_TOOL_RESULT_CHARS)
                 if (call.name == "apply_patch") {
                     lastPatchFailure = if (result.content.startsWith("Patch applied to ")) null else result.content
-                    if (lastPatchFailure != null) trace.patchFailures += lastPatchFailure!!.take(2000)
+                    if (lastPatchFailure != null) trace.patchFailures += lastPatchFailure.take(2000)
                     patchApplied = lastPatchFailure == null
                     if (patchApplied) validationCurrent = false
                 }
@@ -475,6 +528,7 @@ class TaskExecutionWorker @Inject constructor(
             append("\n\nModel-provided narrative (not independently verified):\n")
             append(modelNarrative)
         }.take(10_000)
+        val patch = workspace.patchDiff(MAX_DIFF_CHARS)
         return TaskExecutionReport(
             summary = summary,
             implementation = implementation,
@@ -482,7 +536,8 @@ class TaskExecutionWorker @Inject constructor(
             openQuestions = finalQuestions,
             changedFiles = changedFiles.take(250),
             validation = validation.toList(),
-            patchDiff = workspace.patchDiff(MAX_DIFF_CHARS).takeIf(String::isNotBlank),
+            patchDiff = patch.diff.takeIf(String::isNotBlank),
+            patchDiffTruncated = patch.truncated,
             acceptanceChecks = acceptanceChecks,
             patchFailures = trace.patchFailures.toList(),
             modelUsage = trace.usage(),
@@ -757,5 +812,21 @@ class TaskExecutionWorker @Inject constructor(
         const val MAX_FINAL_TEXT_CHARS = 15_000
         const val MAX_DIFF_CHARS = 30_000
         const val MAX_PATCH_FAILURE_RETRIES = 3
+        const val DISABLED_SENTINEL = "disabled"
+
+        fun resolveStaleAfter(configuredSeconds: String, maxDurationSeconds: Long): Duration {
+            val trimmed = configuredSeconds.trim()
+            if (trimmed.isEmpty() || trimmed.equals(DISABLED_SENTINEL, ignoreCase = true)) {
+                return Duration.ofSeconds(maxDurationSeconds * 2)
+            }
+            val seconds = trimmed.toLongOrNull()
+                ?: throw IllegalArgumentException(
+                    "agent.execution.stale-attempt-timeout-seconds must be a whole number of seconds or 'disabled'"
+                )
+            require(seconds > maxDurationSeconds) {
+                "Stale attempt timeout ($seconds s) must exceed the maximum task duration ($maxDurationSeconds s)"
+            }
+            return Duration.ofSeconds(seconds)
+        }
     }
 }

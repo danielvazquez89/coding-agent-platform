@@ -104,6 +104,7 @@ class TaskExecutionWorkerTest {
         assertTrue(report.maxExecutionDurationMillis!! > report.executionDurationMillis!!)
         assertEquals(1.0, report.maxEstimatedCostUsd)
         assertEquals("README.md", report.changedFiles.single())
+        assertFalse(report.patchDiffTruncated)
         assertEquals("updated project context\n", Files.readString(temporary.resolve("README.md")))
         assertTrue(publisher.calls.isEmpty())
         assertTrue(workspace.closed)
@@ -743,6 +744,165 @@ class TaskExecutionWorkerTest {
         }
     }
 
+    @Test
+    fun `poll handles empty queues disabled workers and claim failures`() {
+        worker(FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary)).poll()
+        worker(
+            FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary),
+            workerEnabled = false
+        ).poll()
+
+        val failedState = object : TaskExecutionState {
+            override fun claimNextQueued(): CodingTask? = throw IllegalStateException("database unavailable")
+            override fun claim(id: UUID): CodingTask? = null
+            override fun findById(id: UUID): CodingTask? = null
+            override fun transition(id: UUID, target: TaskStatus, reason: String?, actor: String): CodingTask? = null
+        }
+        val attempts = FakeAttempts()
+        TaskExecutionWorker(
+            failedState,
+            attempts,
+            TaskExecutionFinalizer(failedState, attempts),
+            ScriptedProvider(),
+            object : RepositoryWorkspaceFactory {
+                override fun open(repositoryUrl: String) = FakeWorkspace(temporary)
+            },
+            tools(),
+            FakePullRequestPublisher(),
+            mapper,
+            true,
+            false,
+            5,
+            "qwen3:8b",
+            0.0,
+            0.0
+        ).poll()
+    }
+
+    @Test
+    fun `reports model failures even when workspace diagnostics and cleanup also fail`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        val workspace = FakeWorkspace(
+            temporary,
+            changedFilesFailure = IllegalStateException("git status failed"),
+            patchDiffFailure = IllegalStateException("git diff failed"),
+            closeFailure = IllegalStateException("workspace cleanup failed")
+        )
+
+        worker(FakeState(task), attempts, ScriptedProvider(failure = IllegalStateException()), workspace)
+            .execute(task.id)
+
+        assertEquals(TaskStatus.FAILED, task.status)
+        assertTrue(attempts.finishedReport!!.implementation.contains("IllegalStateException"))
+        assertTrue(attempts.finishedReport!!.changedFiles.isEmpty())
+        assertNull(attempts.finishedReport!!.patchDiff)
+        assertTrue(workspace.closed)
+    }
+
+    @Test
+    fun `records when the stored patch was truncated`() {
+        val criterion = "README is updated"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        val workspace = FakeWorkspace(temporary, listOf("README.md"), truncated = true)
+        Files.writeString(temporary.resolve("README.md"), "project context\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-project context",
+            "+updated project context"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls",
+                10,
+                5
+            ),
+            ModelTurn(
+                """{"summary":"Changed the README","implementation":"The README was updated.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"README now says updated project context."}]}""",
+                emptyList(),
+                "stop",
+                10,
+                5
+            )
+        )
+        val worker = worker(FakeState(task), attempts, provider, workspace)
+
+        assertTrue(worker.processNext())
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        val report = attempts.finishedReport!!
+        assertEquals("README.md", report.changedFiles.single())
+        assertNotNull(report.patchDiff)
+        assertTrue(report.patchDiffTruncated)
+    }
+
+    @Test
+    fun `reaps an attempt orphaned by a stopped worker and fails the task`() {
+        val task = task().also { it.status = TaskStatus.RUNNING }
+        val state = FakeState(task)
+        val orphan = TaskAttempt(
+            taskId = task.id,
+            attemptNumber = 1,
+            status = AttemptStatus.RUNNING,
+            startedAt = Instant.now().minusSeconds(600)
+        )
+        val attempts = FakeAttempts(runningAttempts = listOf(orphan))
+        val worker = worker(
+            state, attempts, ScriptedProvider(), FakeWorkspace(temporary),
+            maxDurationSeconds = 30, staleAttemptTimeoutSeconds = "60"
+        )
+
+        assertEquals(1, worker.reapOrphanedAttempts())
+
+        assertEquals(TaskStatus.FAILED, task.status)
+        assertEquals(AttemptStatus.FAILED, attempts.finished?.status)
+        assertTrue(attempts.finishedReport!!.summary.contains("worker stopped"))
+        assertTrue(attempts.finishedReport!!.implementation.contains("outcome is unknown"))
+    }
+
+    @Test
+    fun `leaves a running attempt alone until it exceeds the stale timeout`() {
+        val task = task().also { it.status = TaskStatus.RUNNING }
+        val state = FakeState(task)
+        val running = TaskAttempt(
+            taskId = task.id,
+            attemptNumber = 1,
+            status = AttemptStatus.RUNNING,
+            startedAt = Instant.now()
+        )
+        val attempts = FakeAttempts(runningAttempts = listOf(running))
+        val worker = worker(
+            state, attempts, ScriptedProvider(), FakeWorkspace(temporary),
+            maxDurationSeconds = 30, staleAttemptTimeoutSeconds = "60"
+        )
+
+        assertEquals(0, worker.reapOrphanedAttempts())
+
+        assertEquals(TaskStatus.RUNNING, task.status)
+        assertNull(attempts.finished)
+    }
+
+    @Test
+    fun `rejects a stale attempt timeout that does not exceed the task duration`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(
+                FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary),
+                maxDurationSeconds = 1800, staleAttemptTimeoutSeconds = "900"
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(
+                FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary),
+                staleAttemptTimeoutSeconds = "not-a-number"
+            )
+        }
+    }
+
     private fun worker(
         state: FakeState,
         attempts: FakeAttempts,
@@ -757,7 +917,9 @@ class TaskExecutionWorkerTest {
         publisher: FakePullRequestPublisher = FakePullRequestPublisher(),
         publishPullRequests: Boolean = false,
         maxDurationSeconds: Long = 1800,
-        maxEstimatedCostUsd: Double = 1.0
+        maxEstimatedCostUsd: Double = 1.0,
+        workerEnabled: Boolean = true,
+        staleAttemptTimeoutSeconds: String = "disabled"
     ): TaskExecutionWorker {
         val defaultValidationRunner = object : ValidationRunner {
             override fun validate(workspace: Path) = validation
@@ -769,7 +931,8 @@ class TaskExecutionWorkerTest {
         return TaskExecutionWorker(
             state, attempts, TaskExecutionFinalizer(state, attempts), provider, workspaceFactory,
             toolExecutor, publisher, mapper, enabled, publishPullRequests, maxToolCalls, "qwen3:8b",
-            inputCostPerMillionUsd, outputCostPerMillionUsd, maxDurationSeconds, maxEstimatedCostUsd
+            inputCostPerMillionUsd, outputCostPerMillionUsd, maxDurationSeconds, maxEstimatedCostUsd, workerEnabled,
+            staleAttemptTimeoutSeconds
         )
     }
 
@@ -825,13 +988,16 @@ class TaskExecutionWorkerTest {
 
     private class FakeAttempts(
         private val startFails: Boolean = false,
-        private val previousBudgetUsage: TaskBudgetUsage = TaskBudgetUsage()
+        private val previousBudgetUsage: TaskBudgetUsage = TaskBudgetUsage(),
+        private val runningAttempts: List<TaskAttempt> = emptyList()
     ) : AttemptOperations {
         var started: TaskAttempt? = null
         var finished: TaskAttempt? = null
         var finishedReport: TaskExecutionReport? = null
         val persistedToolEvents = mutableListOf<ToolExecutionAudit>()
         override fun priorBudgetUsage(taskId: UUID) = previousBudgetUsage
+        override fun runningAttemptsStartedBefore(startedBefore: Instant): List<TaskAttempt> =
+            runningAttempts.filter { it.status == AttemptStatus.RUNNING && it.startedAt.isBefore(startedBefore) }
         override fun recordToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit) {
             persistedToolEvents += audit
         }
@@ -848,7 +1014,9 @@ class TaskExecutionWorkerTest {
         override fun finish(
             taskId: UUID, attemptId: UUID, status: AttemptStatus, report: TaskExecutionReport?, errorSummary: String?
         ): TaskAttempt? {
-            val attempt = started?.takeIf { it.id == attemptId && it.taskId == taskId } ?: return null
+            val attempt = started?.takeIf { it.id == attemptId && it.taskId == taskId }
+                ?: runningAttempts.firstOrNull { it.id == attemptId && it.taskId == taskId }
+                ?: return null
             attempt.status = status
             attempt.errorSummary = errorSummary
             finished = attempt
@@ -882,10 +1050,26 @@ class TaskExecutionWorkerTest {
         }
     }
 
-    private class FakeWorkspace(override val root: Path, private val files: List<String> = listOf("src/main/Example.kt")) : RepositoryWorkspace {
+    private class FakeWorkspace(
+        override val root: Path,
+        private val files: List<String> = listOf("src/main/Example.kt"),
+        private val changedFilesFailure: Exception? = null,
+        private val patchDiffFailure: Exception? = null,
+        private val closeFailure: Exception? = null,
+        private val truncated: Boolean = false
+    ) : RepositoryWorkspace {
         var closed = false
-        override fun changedFiles() = files
-        override fun patchDiff(maxChars: Int) = "diff --git a/src/main/Example.kt b/src/main/Example.kt".take(maxChars)
-        override fun close() { closed = true }
+        override fun changedFiles(): List<String> {
+            changedFilesFailure?.let { throw it }
+            return files
+        }
+        override fun patchDiff(maxChars: Int): PatchDiff {
+            patchDiffFailure?.let { throw it }
+            return PatchDiff("diff --git a/src/main/Example.kt b/src/main/Example.kt".take(maxChars), truncated)
+        }
+        override fun close() {
+            closed = true
+            closeFailure?.let { throw it }
+        }
     }
 }

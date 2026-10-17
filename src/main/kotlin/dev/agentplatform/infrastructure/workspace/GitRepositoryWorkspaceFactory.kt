@@ -1,6 +1,7 @@
 package dev.agentplatform.infrastructure.workspace
 
 import dev.agentplatform.domain.port.CommandExecutor
+import dev.agentplatform.domain.port.PatchDiff
 import dev.agentplatform.domain.port.RepositoryWorkspace
 import dev.agentplatform.domain.port.RepositoryWorkspaceFactory
 import jakarta.enterprise.context.ApplicationScoped
@@ -15,7 +16,7 @@ import java.time.Duration
 @ApplicationScoped
 class GitRepositoryWorkspaceFactory(
     private val commands: CommandExecutor,
-    @ConfigProperty(name = "agent.execution.allowed-local-root", defaultValue = "")
+    @ConfigProperty(name = "agent.execution.allowed-local-root", defaultValue = "disabled")
     private val allowedLocalRoot: String,
     @ConfigProperty(name = "agent.execution.workspace-root", defaultValue = "\${java.io.tmpdir}/coding-agent-platform/workspaces")
     private val configuredWorkspaceRoot: String
@@ -83,12 +84,19 @@ class GitRepositoryWorkspaceFactory(
         }
 
         // Local repository path validation with diagnostic logging
-        val root = allowedLocalRoot.takeIf(String::isNotBlank)?.let { Path.of(it).toAbsolutePath().normalize() }
+        val configuredRoot = allowedLocalRoot
+            .takeIf { it.isNotBlank() && !it.equals(DISABLED_LOCAL_ACCESS, ignoreCase = true) }
             ?: throw IllegalArgumentException(
                 "Local repositories are disabled; configure agent.execution.allowed-local-root " +
                 "(current value is empty; set AGENT_ALLOWED_LOCAL_ROOT environment variable or " +
                 "agent.execution.allowed-local-root in application.properties)"
             )
+        val root = try {
+            Path.of(configuredRoot).toAbsolutePath().normalize()
+        } catch (failure: RuntimeException) {
+            log.errorf("Allowed local root '%s' could not be parsed: %s", configuredRoot, failure.message)
+            throw IllegalArgumentException("agent.execution.allowed-local-root is not a valid path: ${failure.message}")
+        }
         log.debugf("Allowed local root resolved to: %s", root)
 
         val path = try { Path.of(input).toAbsolutePath().normalize() } catch (e: RuntimeException) {
@@ -240,27 +248,47 @@ class GitRepositoryWorkspaceFactory(
             val untracked = commands.run(listOf("git", "ls-files", "--others", "--exclude-standard"), root)
             check(tracked.exitCode == 0 && untracked.exitCode == 0) { "Could not list changed repository files" }
             return (tracked.output.lineSequence() + untracked.output.lineSequence())
-                .map(String::trim).filter(String::isNotEmpty).distinct().sorted().toList()
+                .map(String::trim).filter(String::isNotEmpty).filterNot(::isBuildOutput)
+                .distinct().sorted().toList()
         }
 
-        override fun patchDiff(maxChars: Int): String {
+        override fun patchDiff(maxChars: Int): PatchDiff {
             require(maxChars > 0) { "Diff output limit must be positive" }
-            val tracked = commands.run(listOf("git", "diff", "--no-ext-diff", "--unified=3", "--"), root, maxOutputChars = maxChars)
+            // Ask for one character more than we keep: if the command output reaches that, the diff
+            // was cut and the stored text is not a valid, appliable patch.
+            val probeLimit = maxChars + 1
+            val tracked = commands.run(listOf("git", "diff", "--no-ext-diff", "--unified=3", "--"), root, maxOutputChars = probeLimit)
             check(tracked.exitCode == 0) { "Could not create repository diff" }
-            val diff = tracked.output.toMutableStringBuilder(maxChars)
-            val untracked = commands.run(listOf("git", "ls-files", "--others", "--exclude-standard"), root)
-            check(untracked.exitCode == 0) { "Could not list untracked repository files" }
-            for (file in untracked.output.lineSequence().map(String::trim).filter(String::isNotEmpty)) {
-                val newFile = commands.run(listOf("git", "diff", "--no-index", "--no-ext-diff", "--unified=3", "--", "/dev/null", file), root, maxOutputChars = maxChars)
-                if (newFile.exitCode in 0..1 && diff.length < maxChars) diff.append(newFile.output.take(maxChars - diff.length))
+            val diff = tracked.output.toMutableStringBuilder(probeLimit)
+            if (diff.length <= maxChars) {
+                val untracked = commands.run(listOf("git", "ls-files", "--others", "--exclude-standard"), root)
+                check(untracked.exitCode == 0) { "Could not list untracked repository files" }
+                val untrackedFiles = untracked.output.lineSequence()
+                    .map(String::trim).filter(String::isNotEmpty).filterNot(::isBuildOutput)
+                for (file in untrackedFiles) {
+                    if (diff.length > maxChars) break
+                    val newFile = commands.run(listOf("git", "diff", "--no-index", "--no-ext-diff", "--unified=3", "--", "/dev/null", file), root, maxOutputChars = probeLimit)
+                    if (newFile.exitCode in 0..1) diff.append(newFile.output)
+                }
             }
-            return diff.toString().take(maxChars)
+            return PatchDiff(diff.toString().take(maxChars), truncated = diff.length > maxChars)
         }
+
+        // The offline Maven validator runs inside this workspace and writes build output into target/.
+        // Those files are validation side effects, not agent changes, so they must never be reported
+        // as changed files or included in the pull-request diff.
+        private fun isBuildOutput(path: String): Boolean =
+            path.split('/', '\\').any { it == BUILD_OUTPUT_DIRECTORY }
 
         override fun close() = deleteTree(root)
+
+        private companion object {
+            const val BUILD_OUTPUT_DIRECTORY = "target"
+        }
     }
 
     companion object {
+        private const val DISABLED_LOCAL_ACCESS = "disabled"
         private const val MAX_LOCAL_FILES = 100_000
         private const val MAX_LOCAL_BYTES = 1_073_741_824L
         private const val MAX_LOCAL_INDEX_CHARS = 20_000_000

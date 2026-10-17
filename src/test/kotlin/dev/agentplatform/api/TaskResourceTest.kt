@@ -1,6 +1,9 @@
 package dev.agentplatform.api
 
 import dev.agentplatform.api.dto.CreateTaskRequest
+import dev.agentplatform.application.service.TaskAttemptService
+import dev.agentplatform.application.service.TaskService
+import dev.agentplatform.domain.model.*
 import io.quarkus.test.junit.QuarkusTest
 import io.restassured.RestAssured.given
 import io.restassured.http.ContentType
@@ -20,6 +23,12 @@ import java.util.*
 class TaskResourceTest {
     @Inject
     lateinit var taskResource: TaskResource
+
+    @Inject
+    lateinit var taskService: TaskService
+
+    @Inject
+    lateinit var attemptService: TaskAttemptService
 
     @Test
     fun `review page is served with task and resume controls`() {
@@ -100,6 +109,24 @@ class TaskResourceTest {
             .body("[0].sequenceNumber", equalTo(1))
             .body("[0].fromStatus", nullValue())
             .body("[0].toStatus", equalTo("QUEUED"))
+    }
+
+    @Test
+    fun `tool execution endpoint returns not found for missing task or attempt`() {
+        val missingTaskId = UUID.randomUUID()
+        assertThrows(NotFoundException::class.java) {
+            taskResource.toolExecutions(missingTaskId, UUID.randomUUID())
+        }
+
+        val taskId = UUID.fromString(createTask())
+        taskService.transition(taskId, TaskStatus.RUNNING, "start")
+        val attempt = attemptService.start(taskId)!!
+        assertThrows(NotFoundException::class.java) {
+            taskResource.toolExecutions(taskId, UUID.randomUUID())
+        }
+        assertThrows(NotFoundException::class.java) {
+            taskResource.toolExecutions(UUID.randomUUID(), attempt.id)
+        }
     }
 
     @Test
@@ -258,6 +285,90 @@ class TaskResourceTest {
             .`when`().post("/api/tasks/$descriptionLimitTask/answer")
             .then()
             .statusCode(400)
+    }
+
+    @Test
+    fun `patch endpoint exports an applicable diff and explains refusals`() {
+        val id = createTask()
+        val taskId = UUID.fromString(id)
+        taskService.transition(taskId, TaskStatus.RUNNING, "Worker claimed task")
+        val attempt = attemptService.start(taskId)!!
+        attemptService.finish(
+            taskId,
+            attempt.id,
+            AttemptStatus.COMPLETED,
+            TaskExecutionReport(
+                summary = "Implemented the change",
+                implementation = "Both criteria were satisfied.",
+                validation = listOf(ValidationCheck("Maven tests", "mvn test", CheckOutcome.PASSED, 0, "ok")),
+                acceptanceChecks = listOf(
+                    AcceptanceCheck("First criterion", AcceptanceOutcome.PASSED, "evidence one"),
+                    AcceptanceCheck("Second criterion", AcceptanceOutcome.PASSED, "evidence two")
+                ),
+                patchDiff = "diff --git a/a.txt b/a.txt"
+            ),
+            null
+        )
+        taskService.transition(taskId, TaskStatus.VALIDATING, "Validation started")
+        taskService.transition(taskId, TaskStatus.COMPLETED, "All checks passed")
+
+        given()
+            .`when`().get("/api/tasks/$id/attempts/${attempt.id}/patch")
+            .then()
+            .statusCode(200)
+            .contentType(containsString("text/x-patch"))
+            .body(equalTo("diff --git a/a.txt b/a.txt"))
+
+        val runningId = createTask()
+        val runningTaskId = UUID.fromString(runningId)
+        taskService.transition(runningTaskId, TaskStatus.RUNNING, "Worker claimed task")
+        val runningAttempt = attemptService.start(runningTaskId)!!
+        given()
+            .`when`().get("/api/tasks/$runningId/attempts/${runningAttempt.id}/patch")
+            .then()
+            .statusCode(409)
+            .contentType(containsString("application/json"))
+            .body("message", containsString("only a COMPLETED task"))
+
+        val truncatedId = createTask()
+        val truncatedTaskId = UUID.fromString(truncatedId)
+        taskService.transition(truncatedTaskId, TaskStatus.RUNNING, "Worker claimed task")
+        val truncatedAttempt = attemptService.start(truncatedTaskId)!!
+        attemptService.finish(
+            truncatedTaskId,
+            truncatedAttempt.id,
+            AttemptStatus.COMPLETED,
+            TaskExecutionReport(
+                summary = "Implemented a change with a very large diff",
+                implementation = "The diff exceeded the storage limit.",
+                validation = listOf(ValidationCheck("Maven tests", "mvn test", CheckOutcome.PASSED, 0, "ok")),
+                acceptanceChecks = listOf(
+                    AcceptanceCheck("First criterion", AcceptanceOutcome.PASSED, "evidence one"),
+                    AcceptanceCheck("Second criterion", AcceptanceOutcome.PASSED, "evidence two")
+                ),
+                patchDiff = "diff --git a/a.txt b/a.txt",
+                patchDiffTruncated = true
+            ),
+            null
+        )
+        taskService.transition(truncatedTaskId, TaskStatus.VALIDATING, "Validation started")
+        taskService.transition(truncatedTaskId, TaskStatus.COMPLETED, "All checks passed")
+
+        given()
+            .`when`().get("/api/tasks/$truncatedId/attempts/${truncatedAttempt.id}/patch")
+            .then()
+            .statusCode(409)
+            .body("message", containsString("larger than the report diff limit"))
+
+        given()
+            .`when`().get("/api/tasks/$id/attempts/${UUID.randomUUID()}/patch")
+            .then()
+            .statusCode(404)
+
+        given()
+            .`when`().get("/api/tasks/${UUID.randomUUID()}/attempts/${attempt.id}/patch")
+            .then()
+            .statusCode(404)
     }
 
     private fun createTask(description: String = "Exercise persisted task lifecycle behavior"): String =

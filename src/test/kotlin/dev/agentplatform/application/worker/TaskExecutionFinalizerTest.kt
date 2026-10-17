@@ -12,6 +12,22 @@ import java.util.*
 
 class TaskExecutionFinalizerTest {
     @Test
+    fun `attempt operations default prior budget is empty`() {
+        val operations = object : AttemptOperations {
+            override fun recordToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit) = Unit
+            override fun finishToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit) = Unit
+            override fun toolExecutions(taskId: UUID, attemptId: UUID) = emptyList<ToolExecutionAudit>()
+            override fun start(taskId: UUID) = null
+            override fun finish(
+                taskId: UUID, attemptId: UUID, status: AttemptStatus,
+                report: TaskExecutionReport?, errorSummary: String?
+            ) = null
+        }
+
+        assertEquals(TaskBudgetUsage(), operations.priorBudgetUsage(UUID.randomUUID()))
+    }
+
+    @Test
     fun `rejects invalid final states and attempts or a cancelled task`() {
         val task = CodingTask(
             id = UUID.randomUUID(),
@@ -50,16 +66,43 @@ class TaskExecutionFinalizerTest {
         assertEquals(null, attempts.finished)
     }
 
+    @Test
+    fun `fails finalization when the attempt disappears after the task transition`() {
+        val task = CodingTask(
+            id = UUID.randomUUID(),
+            title = "Task",
+            description = "Description",
+            status = TaskStatus.RUNNING
+        )
+        val finalizer = TaskExecutionFinalizer(State(task), Attempts(returnMissing = true))
+
+        assertThrows(IllegalStateException::class.java) {
+            finalizer.finish(
+                task.id,
+                UUID.randomUUID(),
+                TaskStatus.FAILED,
+                AttemptStatus.FAILED,
+                report(),
+                "execution failed"
+            )
+        }
+        assertEquals(TaskStatus.FAILED, task.status)
+    }
+
     private fun report() = TaskExecutionReport("summary", "implementation")
 
     private class State(private val task: CodingTask?) : TaskExecutionState {
         override fun claimNextQueued() = null
         override fun claim(id: UUID) = null
         override fun findById(id: UUID) = task?.takeIf { it.id == id }
-        override fun transition(id: UUID, target: TaskStatus, reason: String?, actor: String): CodingTask? = null
+        override fun transition(id: UUID, target: TaskStatus, reason: String?, actor: String): CodingTask? {
+            val current = task?.takeIf { it.id == id } ?: return null
+            current.status = target
+            return current
+        }
     }
 
-    private class Attempts : AttemptOperations {
+    private class Attempts(private val returnMissing: Boolean = false) : AttemptOperations {
         var finished: TaskAttempt? = null
         override fun priorBudgetUsage(taskId: UUID) = TaskBudgetUsage()
         override fun recordToolExecution(taskId: UUID, attemptId: UUID, audit: ToolExecutionAudit) {}
@@ -69,6 +112,7 @@ class TaskExecutionFinalizerTest {
         override fun finish(
             taskId: UUID, attemptId: UUID, status: AttemptStatus, report: TaskExecutionReport?, errorSummary: String?
         ): TaskAttempt? {
+            if (returnMissing) return null
             val attempt = TaskAttempt(
                 id = attemptId,
                 taskId = taskId,

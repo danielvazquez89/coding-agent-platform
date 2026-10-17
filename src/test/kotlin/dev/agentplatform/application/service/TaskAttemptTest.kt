@@ -12,6 +12,7 @@ import org.hamcrest.CoreMatchers.equalTo
 import org.hamcrest.CoreMatchers.notNullValue
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
+import java.time.Instant
 import java.util.*
 
 @QuarkusTest
@@ -163,6 +164,40 @@ class TaskAttemptTest {
     }
 
     @Test
+    fun `prior budget becomes unknown when finished reports omit usage fields`() {
+        val taskId = createTask()
+        taskService.transition(taskId, TaskStatus.RUNNING, "Worker claimed task")
+
+        val durationMissing = attemptService.start(taskId)!!
+        attemptService.finish(
+            taskId,
+            durationMissing.id,
+            AttemptStatus.FAILED,
+            TaskExecutionReport(
+                summary = "No duration",
+                implementation = "The provider omitted duration.",
+                executionDurationMillis = null,
+                modelUsage = ModelUsage("qwen3:8b", null, null, 0, 0, 0.01)
+            )
+        )
+        assertEquals(TaskBudgetUsage(null, 0.01), attemptService.priorBudgetUsage(taskId))
+
+        val costMissing = attemptService.start(taskId)!!
+        attemptService.finish(
+            taskId,
+            costMissing.id,
+            AttemptStatus.FAILED,
+            TaskExecutionReport(
+                summary = "No cost",
+                implementation = "The provider omitted cost.",
+                executionDurationMillis = 10,
+                modelUsage = ModelUsage("qwen3:8b", null, null, 0, 0, null)
+            )
+        )
+        assertEquals(TaskBudgetUsage(null, null), attemptService.priorBudgetUsage(taskId))
+    }
+
+    @Test
     fun `tool events persist independently of the final attempt report`() {
         val taskId = createTask()
         taskService.transition(taskId, TaskStatus.RUNNING, "Worker claimed task")
@@ -306,6 +341,137 @@ class TaskAttemptTest {
             .then()
             .statusCode(404)
     }
+
+    @Test
+    fun `lists running attempts started before a cutoff`() {
+        val taskId = createTask()
+        taskService.transition(taskId, TaskStatus.RUNNING, "Worker claimed task")
+        val attempt = attemptService.start(taskId)!!
+
+        assertTrue(
+            attemptService.runningAttemptsStartedBefore(Instant.now().plusSeconds(60)).any { it.id == attempt.id }
+        )
+        assertTrue(
+            attemptService.runningAttemptsStartedBefore(Instant.now().minusSeconds(60)).none { it.id == attempt.id }
+        )
+
+        attemptService.finish(taskId, attempt.id, AttemptStatus.FAILED, null, "worker stopped")
+        assertTrue(
+            attemptService.runningAttemptsStartedBefore(Instant.now().plusSeconds(60)).none { it.id == attempt.id }
+        )
+    }
+
+    @Test
+    fun `patch export enforces completed status passed checks and evidenced acceptance`() {
+        val criterion = "Add a greeting endpoint"
+        val validReport = TaskExecutionReport(
+            summary = "Added the greeting endpoint",
+            implementation = "A greeting resource was added.",
+            changedFiles = listOf("Greeting.kt"),
+            validation = listOf(ValidationCheck("Maven tests", "mvn test", CheckOutcome.PASSED, 0, "ok")),
+            acceptanceChecks = listOf(AcceptanceCheck(criterion, AcceptanceOutcome.PASSED, "GreetingTest passed")),
+            patchDiff = "diff --git a/Greeting.kt b/Greeting.kt"
+        )
+
+        val (taskId, attemptId) = completedAttempt(listOf(criterion), validReport)
+        assertEquals("diff --git a/Greeting.kt b/Greeting.kt", attemptService.exportablePatch(taskId, attemptId))
+
+        assertNull(attemptService.exportablePatch(UUID.randomUUID(), attemptId))
+        assertNull(attemptService.exportablePatch(taskId, UUID.randomUUID()))
+        assertNull(attemptService.exportablePatch(createTask(), attemptId))
+
+        val (runningTask, runningAttempt) =
+            completedAttempt(listOf(criterion), validReport, taskStatus = TaskStatus.RUNNING)
+        assertExportRejected(runningTask, runningAttempt, "only a COMPLETED task")
+
+        val (failedAttemptTask, failedAttempt) =
+            completedAttempt(listOf(criterion), validReport, attemptStatus = AttemptStatus.FAILED)
+        assertExportRejected(failedAttemptTask, failedAttempt, "only a COMPLETED attempt")
+
+        assertExportRejected(listOf(criterion), null, "has no execution report")
+        assertExportRejected(listOf(criterion), validReport.copy(validation = emptyList()), "no validation checks")
+        assertExportRejected(
+            listOf(criterion),
+            validReport.copy(
+                validation = listOf(ValidationCheck("Maven tests", outcome = CheckOutcome.FAILED, exitCode = 1))
+            ),
+            "must have passed"
+        )
+        assertExportRejected(listOf(criterion), validReport.copy(patchDiff = "  "), "no patch diff")
+        assertExportRejected(
+            listOf(criterion),
+            validReport.copy(patchDiffTruncated = true),
+            "larger than the report diff limit"
+        )
+
+        assertExportRejected(listOf(criterion, "Second criterion"), validReport, "exactly one acceptance check")
+        assertExportRejected(
+            listOf("First criterion", "Second criterion"),
+            validReport.copy(
+                acceptanceChecks = listOf(
+                    AcceptanceCheck("Second criterion", AcceptanceOutcome.PASSED, "evidence"),
+                    AcceptanceCheck("First criterion", AcceptanceOutcome.PASSED, "evidence")
+                )
+            ),
+            "match the task criteria in order"
+        )
+        assertExportRejected(
+            listOf(criterion),
+            validReport.copy(acceptanceChecks = listOf(AcceptanceCheck(criterion, AcceptanceOutcome.FAILED, "evidence"))),
+            "did not pass"
+        )
+        assertExportRejected(
+            listOf(criterion),
+            validReport.copy(acceptanceChecks = listOf(AcceptanceCheck(criterion, AcceptanceOutcome.PASSED, " "))),
+            "has no evidence"
+        )
+    }
+
+    private fun completedAttempt(
+        criteria: List<String>,
+        report: TaskExecutionReport?,
+        taskStatus: TaskStatus = TaskStatus.COMPLETED,
+        attemptStatus: AttemptStatus = AttemptStatus.COMPLETED
+    ): Pair<UUID, UUID> {
+        val taskId = createTask(criteria)
+        taskService.transition(taskId, TaskStatus.RUNNING, "Worker claimed task")
+        val attempt = attemptService.start(taskId)!!
+        attemptService.finish(taskId, attempt.id, attemptStatus, report, null)
+        if (taskStatus == TaskStatus.COMPLETED) {
+            taskService.transition(taskId, TaskStatus.VALIDATING, "Validation started")
+            taskService.transition(taskId, TaskStatus.COMPLETED, "All checks passed")
+        }
+        return taskId to attempt.id
+    }
+
+    private fun assertExportRejected(criteria: List<String>, report: TaskExecutionReport?, messagePart: String) {
+        val (taskId, attemptId) = completedAttempt(criteria, report)
+        assertExportRejected(taskId, attemptId, messagePart)
+    }
+
+    private fun assertExportRejected(taskId: UUID, attemptId: UUID, messagePart: String) {
+        val failure = assertThrows(IllegalStateException::class.java) {
+            attemptService.exportablePatch(taskId, attemptId)
+        }
+        assertTrue(failure.message!!.contains(messagePart)) {
+            "Expected '${failure.message}' to contain '$messagePart'"
+        }
+    }
+
+    private fun createTask(criteria: List<String>): UUID =
+        given()
+            .contentType(ContentType.JSON)
+            .body(
+                mapOf(
+                    "title" to "Patch export test",
+                    "description" to "Export and apply an attempt patch",
+                    "acceptanceCriteria" to criteria
+                )
+            )
+            .`when`().post("/api/tasks")
+            .then()
+            .statusCode(201)
+            .extract().path<String>("id").let(UUID::fromString)
 
     private fun createTask(): UUID =
         given()

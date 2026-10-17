@@ -2,7 +2,9 @@ package dev.agentplatform.application.service
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.agentplatform.api.dto.TaskAttemptResponse
+import dev.agentplatform.domain.model.AcceptanceOutcome
 import dev.agentplatform.domain.model.AttemptStatus
+import dev.agentplatform.domain.model.CheckOutcome
 import dev.agentplatform.domain.model.TaskAttempt
 import dev.agentplatform.domain.model.TaskExecutionReport
 import dev.agentplatform.domain.model.TaskStatus
@@ -40,12 +42,12 @@ class TaskAttemptService(
                     val duration = json.path("executionDurationMillis")
                         .takeIf { it.isNumber }?.asLong()
                     elapsedMillis = if (duration == null || elapsedMillis == null) null
-                    else Math.addExact(elapsedMillis!!, duration)
+                    else Math.addExact(elapsedMillis, duration)
 
                     val cost = json.path("modelUsage").path("estimatedCostUsd")
                         .takeIf { it.isNumber }?.asDouble()
                     estimatedCostUsd = if (cost == null || estimatedCostUsd == null) null
-                    else estimatedCostUsd!! + cost
+                    else estimatedCostUsd + cost
                 }
             }
         return TaskBudgetUsage(elapsedMillis, estimatedCostUsd)
@@ -128,6 +130,10 @@ class TaskAttemptService(
     }
 
     @Transactional
+    override fun runningAttemptsStartedBefore(startedBefore: Instant): List<TaskAttempt> =
+        attemptRepository.runningStartedBefore(startedBefore)
+
+    @Transactional
     override fun finish(
         taskId: UUID,
         attemptId: UUID,
@@ -149,6 +155,62 @@ class TaskAttemptService(
         attempt.reportJson = reportJson
         attemptRepository.flush()
         return attempt
+    }
+
+    /**
+     * Returns the patch diff an attempt produced when it is safe to apply locally, or null when the
+     * task or attempt does not exist. The "safe to export" rules live here (not in a client) so every
+     * consumer is guarded identically: the task and attempt must be COMPLETED, every validation check
+     * must have passed, and the report must contain exactly one passing, evidenced acceptance check
+     * for every task criterion. When the attempt exists but is not exportable this throws
+     * [IllegalStateException] with the reason, which the API surfaces as HTTP 409.
+     */
+    @Transactional
+    fun exportablePatch(taskId: UUID, attemptId: UUID): String? {
+        val task = taskRepository.findById(taskId) ?: return null
+        val attempt = attemptRepository.findById(attemptId)?.takeIf { it.taskId == taskId } ?: return null
+        check(task.status == TaskStatus.COMPLETED) {
+            "Task $taskId is ${task.status}; only a COMPLETED task has a patch that can be applied locally"
+        }
+        check(attempt.status == AttemptStatus.COMPLETED) {
+            "Attempt $attemptId is ${attempt.status}; only a COMPLETED attempt has a patch that can be applied locally"
+        }
+        val report = attempt.reportJson?.let(objectMapper::readTree)
+            ?: throw IllegalStateException("Attempt $attemptId has no execution report to export")
+
+        val validation = report.path("validation")
+        check(validation.isArray && validation.size() > 0) {
+            "Attempt $attemptId has no validation checks, so its patch cannot be trusted"
+        }
+        check(validation.all { it.path("outcome").asText() == CheckOutcome.PASSED.name }) {
+            "Every validation check must have passed before a patch can be applied locally"
+        }
+
+        val criteria = task.acceptanceCriteria
+        val acceptance = report.path("acceptanceChecks")
+        check(acceptance.isArray && acceptance.size() == criteria.size) {
+            "The attempt must contain exactly one acceptance check for every task criterion"
+        }
+        criteria.forEachIndexed { index, criterion ->
+            val entry = acceptance.get(index)
+            check(entry.path("criterion").asText() == criterion) {
+                "The attempt acceptance checks must match the task criteria in order"
+            }
+            check(entry.path("outcome").asText() == AcceptanceOutcome.PASSED.name) {
+                "Acceptance criterion '${criterion.take(120)}' did not pass"
+            }
+            check(entry.path("evidence").asText().isNotBlank()) {
+                "Acceptance criterion '${criterion.take(120)}' has no evidence"
+            }
+        }
+
+        val diff = report.path("patchDiff").takeIf { it.isTextual }?.asText()
+        check(!diff.isNullOrBlank()) { "Attempt $attemptId has no patch diff to export" }
+        check(!report.path("patchDiffTruncated").asBoolean(false)) {
+            "Attempt $attemptId produced a patch larger than the report diff limit; it was stored truncated, " +
+                "so it cannot be applied locally. Use the draft pull request instead"
+        }
+        return diff
     }
 
     @Transactional

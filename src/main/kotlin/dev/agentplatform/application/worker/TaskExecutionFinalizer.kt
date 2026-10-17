@@ -1,5 +1,6 @@
 package dev.agentplatform.application.worker
 
+import dev.agentplatform.domain.model.AgentDecision
 import dev.agentplatform.domain.model.AttemptStatus
 import dev.agentplatform.domain.model.TaskExecutionReport
 import dev.agentplatform.domain.model.TaskStatus
@@ -33,5 +34,26 @@ class TaskExecutionFinalizer(
         checkNotNull(attempts.finish(taskId, attemptId, attemptStatus, report, errorSummary)) {
             "Attempt $attemptId disappeared during execution"
         }
+    }
+
+    /**
+     * Reconciles an attempt whose execution worker disappeared (for example after a crash or restart).
+     * The attempt is failed with an explicit "outcome unknown" report so the task and attempt states
+     * stay consistent; it is never reported as a pass.
+     */
+    @Transactional
+    fun failOrphaned(taskId: UUID, attemptId: UUID, reason: String) {
+        val report = TaskExecutionReport(
+            summary = "The execution worker stopped while this attempt was still running, so no result was recorded.",
+            implementation = reason,
+            decisions = listOf(
+                AgentDecision(
+                    "Crash recovery",
+                    "Fail the abandoned attempt",
+                    "An attempt whose worker disappeared cannot be treated as a pass, so its outcome stays unknown."
+                )
+            )
+        )
+        finish(taskId, attemptId, TaskStatus.FAILED, AttemptStatus.FAILED, report, reason)
     }
 }

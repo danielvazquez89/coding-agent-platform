@@ -68,6 +68,11 @@ data class TaskExecutionReport(
     val changedFiles: List<String> = emptyList(),
     val validation: List<ValidationCheck> = emptyList(),
     val patchDiff: String? = null,
+    /**
+     * True when [patchDiff] was cut to the report diff limit and is therefore not a valid patch.
+     * The stored text is still useful for review, but it must not be exported for local application.
+     */
+    val patchDiffTruncated: Boolean = false,
     val acceptanceChecks: List<AcceptanceCheck> = emptyList(),
     val patchFailures: List<String> = emptyList(),
     val modelUsage: ModelUsage? = null,

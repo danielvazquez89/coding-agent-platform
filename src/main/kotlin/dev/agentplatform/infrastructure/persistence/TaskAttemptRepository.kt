@@ -6,6 +6,7 @@ import io.quarkus.hibernate.orm.panache.kotlin.PanacheRepositoryBase
 import io.quarkus.panache.common.Sort
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.persistence.LockModeType
+import java.time.Instant
 import java.util.*
 
 @ApplicationScoped
@@ -16,6 +17,14 @@ class TaskAttemptRepository : PanacheRepositoryBase<TaskAttempt, UUID> {
     fun nextAttemptNumber(taskId: UUID): Int = count("taskId", taskId).toInt() + 1
 
     fun hasRunningAttempt(taskId: UUID): Boolean = count("taskId = ?1 and status = ?2", taskId, AttemptStatus.RUNNING) > 0
+
+    fun runningStartedBefore(startedBefore: Instant): List<TaskAttempt> =
+        find(
+            "status = ?1 and startedAt < ?2",
+            Sort.ascending("startedAt"),
+            AttemptStatus.RUNNING,
+            startedBefore
+        ).list()
 
     fun findForUpdate(id: UUID): TaskAttempt? = findById(id, LockModeType.PESSIMISTIC_WRITE)
 }

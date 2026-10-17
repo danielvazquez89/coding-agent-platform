@@ -49,10 +49,98 @@ class GitRepositoryWorkspaceFactoryTest {
         Files.writeString(clonePath.resolve("new.txt"), "new content\n")
 
         assertEquals(listOf("README.md", "new.txt"), workspace.changedFiles())
-        assertTrue(workspace.patchDiff(5000).contains("updated text"))
-        assertTrue(workspace.patchDiff(5000).contains("new content"))
+        val patch = workspace.patchDiff(5000)
+        assertFalse(patch.truncated)
+        assertTrue(patch.diff.contains("updated text"))
+        assertTrue(patch.diff.contains("new content"))
         workspace.close()
         assertFalse(Files.exists(clonePath))
+    }
+
+    @Test
+    fun `excludes offline validation build output from changed files and diff`() {
+        val allowed = Files.createDirectory(temporary.resolve("allowed-build-output"))
+        val source = Files.createDirectory(allowed.resolve("sample"))
+        initializeRepository(source)
+        val factory = GitRepositoryWorkspaceFactory(
+            LocalCommandExecutor(), allowed.toString(), temporary.resolve("workspaces-build-output").toString()
+        )
+
+        val workspace = factory.open(source.toString())
+        try {
+            val clonePath = workspace.root
+            Files.writeString(clonePath.resolve("README.md"), "updated text\n")
+            Files.createDirectories(clonePath.resolve("target/classes"))
+            Files.createDirectories(clonePath.resolve("module/target"))
+            Files.writeString(clonePath.resolve("target/classes/Build.class"), "bytecode")
+            Files.writeString(clonePath.resolve("module/target/report.txt"), "maven build output")
+
+            assertEquals(listOf("README.md"), workspace.changedFiles())
+            val patch = workspace.patchDiff(20_000)
+            assertFalse(patch.truncated)
+            assertTrue(patch.diff.contains("updated text"))
+            assertFalse(patch.diff.contains("Build.class"))
+            assertFalse(patch.diff.contains("maven build output"))
+        } finally {
+            workspace.close()
+        }
+    }
+
+    @Test
+    fun `reports truncation instead of returning an unappliable patch`() {
+        val allowed = Files.createDirectory(temporary.resolve("allowed-truncated"))
+        val source = Files.createDirectory(allowed.resolve("sample"))
+        initializeRepository(source)
+        val factory = GitRepositoryWorkspaceFactory(
+            LocalCommandExecutor(), allowed.toString(), temporary.resolve("workspaces-truncated").toString()
+        )
+
+        val workspace = factory.open(source.toString())
+        try {
+            val clonePath = workspace.root
+            Files.writeString(clonePath.resolve("README.md"), (1..500).joinToString("\n") { "line $it" } + "\n")
+
+            val full = workspace.patchDiff(1_000_000)
+            assertFalse(full.truncated)
+            assertTrue(full.diff.contains("line 500"))
+            assertTrue(full.diff.length > 200)
+
+            val capped = workspace.patchDiff(200)
+            assertTrue(capped.truncated)
+            assertEquals(200, capped.diff.length)
+        } finally {
+            workspace.close()
+        }
+    }
+
+    @Test
+    fun `excludes sensitive local files while preserving example environment files`() {
+        val allowed = Files.createDirectory(temporary.resolve("allowed-sensitive"))
+        val source = Files.createDirectory(allowed.resolve("sample"))
+        initializeRepository(source)
+        listOf(".env.production", "certificate.pem", "signing.key", "id_ed25519", "credentials.json").forEach {
+            Files.writeString(source.resolve(it), "sensitive")
+        }
+        Files.createDirectories(source.resolve(".aws"))
+        Files.writeString(source.resolve(".aws/credentials"), "sensitive")
+        Files.createDirectories(source.resolve(".ssh"))
+        Files.writeString(source.resolve(".ssh/config"), "sensitive")
+        listOf(".env.example", ".env.sample", ".env.template").forEach {
+            Files.writeString(source.resolve(it), "safe")
+        }
+        val workspace = GitRepositoryWorkspaceFactory(
+            LocalCommandExecutor(), allowed.toString(), temporary.resolve("workspaces-sensitive").toString()
+        ).open(source.toString())
+
+        try {
+            listOf(".env.production", "certificate.pem", "signing.key", "id_ed25519", "credentials.json",
+                ".aws/credentials", ".ssh/config").forEach { assertFalse(Files.exists(workspace.root.resolve(it)), it) }
+            listOf(".env.example", ".env.sample", ".env.template").forEach {
+                assertTrue(Files.exists(workspace.root.resolve(it)), it)
+            }
+        } finally {
+            workspace.close()
+        }
     }
 
     @Test
@@ -78,15 +166,41 @@ class GitRepositoryWorkspaceFactoryTest {
     }
 
     @Test
+    fun `leaves binary and oversized files unchanged during line ending normalization`() {
+        val allowed = Files.createDirectory(temporary.resolve("allowed-normalization-edges"))
+        val source = Files.createDirectory(allowed.resolve("repo"))
+        initializeRepository(source)
+        val binary = byteArrayOf('a'.code.toByte(), '\r'.code.toByte(), 0, '\n'.code.toByte())
+        Files.write(source.resolve("binary.dat"), binary)
+        val large = "x\r\n".repeat(700_000)
+        Files.writeString(source.resolve("large.txt"), large)
+        val commands = LocalCommandExecutor()
+        check(commands.run(listOf("git", "add", "binary.dat", "large.txt"), source).exitCode == 0)
+        check(commands.run(listOf("git", "commit", "-m", "binary and large"), source).exitCode == 0)
+
+        val workspace = GitRepositoryWorkspaceFactory(
+            LocalCommandExecutor(), allowed.toString(), temporary.resolve("workspaces-normalization-edges").toString()
+        ).open(source.toString())
+        try {
+            assertArrayEquals(binary, Files.readAllBytes(workspace.root.resolve("binary.dat")))
+            assertEquals(large, Files.readString(workspace.root.resolve("large.txt")))
+        } finally {
+            workspace.close()
+        }
+    }
+
+    @Test
     fun `rejects unsafe or out of scope repository sources`() {
         val allowed = Files.createDirectory(temporary.resolve("allowed"))
         val validRepo = Files.createDirectory(allowed.resolve("repo"))
         Files.createDirectory(validRepo.resolve(".git"))
         val factory = GitRepositoryWorkspaceFactory(LocalCommandExecutor(), allowed.toString(), temporary.resolve("workspaces").toString())
+        val nonRepository = Files.createDirectory(allowed.resolve("not-a-repository"))
 
         assertThrows(IllegalArgumentException::class.java) { factory.open(" ") }
         assertThrows(IllegalArgumentException::class.java) { factory.open(temporary.toString()) }
         assertThrows(IllegalArgumentException::class.java) { factory.open(temporary.resolve("outside").toString()) }
+        assertThrows(IllegalArgumentException::class.java) { factory.open(nonRepository.toString()) }
         assertThrows(IllegalArgumentException::class.java) { factory.open("http://github.com/owner/repo") }
         assertThrows(IllegalArgumentException::class.java) { factory.open("https://example.com/owner/repo") }
         assertThrows(IllegalArgumentException::class.java) { factory.open("https://user:secret@github.com/owner/repo") }
@@ -95,6 +209,38 @@ class GitRepositoryWorkspaceFactoryTest {
         assertThrows(IllegalArgumentException::class.java) { factory.open("https://github.com/owner/repo%ZZ") }
         assertThrows(IllegalArgumentException::class.java) {
             GitRepositoryWorkspaceFactory(LocalCommandExecutor(), "", temporary.resolve("workspaces").toString()).open(validRepo.toString())
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            GitRepositoryWorkspaceFactory(LocalCommandExecutor(), "bad\u0000root", temporary.resolve("workspaces").toString())
+                .open(validRepo.toString())
+        }
+    }
+
+    @Test
+    fun `rejects local repository symlinks and symlink traversal when supported`() {
+        val allowed = Files.createDirectory(temporary.resolve("allowed-symlink"))
+        val external = Files.createDirectory(temporary.resolve("external-symlink"))
+        val externalRepository = Files.createDirectory(external.resolve("repo"))
+        initializeRepository(externalRepository)
+        val factory = GitRepositoryWorkspaceFactory(
+            LocalCommandExecutor(), allowed.toString(), temporary.resolve("workspaces-symlink").toString()
+        )
+        try {
+            val directLink = allowed.resolve("direct-link")
+            Files.createSymbolicLink(directLink, externalRepository)
+            assertThrows(IllegalArgumentException::class.java) { factory.open(directLink.toString()) }
+
+            val parentLink = allowed.resolve("external")
+            Files.createSymbolicLink(parentLink, external)
+            assertThrows(IllegalArgumentException::class.java) {
+                factory.open(parentLink.resolve("repo").toString())
+            }
+        } catch (_: UnsupportedOperationException) {
+            return
+        } catch (_: java.io.IOException) {
+            return
+        } catch (_: SecurityException) {
+            return
         }
     }
 
@@ -124,6 +270,46 @@ class GitRepositoryWorkspaceFactoryTest {
         }
         assertThrows(IllegalStateException::class.java) {
             GitRepositoryWorkspaceFactory(failing, "", workspaceRoot.toString()).open("https://github.com/example/project")
+        }
+        Files.list(workspaceRoot).use { assertEquals(0L, it.count()) }
+    }
+
+    @Test
+    fun `cleans up when a remote clone is not a working tree`() {
+        val workspaceRoot = temporary.resolve("workspaces-invalid-clone")
+        val fake = object : CommandExecutor {
+            override fun run(
+                command: List<String>, workingDirectory: Path?, standardInput: String?, timeout: Duration,
+                maxOutputChars: Int, environment: Map<String, String>
+            ) = when {
+                command.contains("clone") -> CommandResult(0, "cloned")
+                command.contains("rev-parse") -> CommandResult(1, "not a repository")
+                else -> CommandResult(0, "")
+            }
+        }
+
+        assertThrows(IllegalStateException::class.java) {
+            GitRepositoryWorkspaceFactory(fake, "", workspaceRoot.toString())
+                .open("https://github.com/example/project")
+        }
+        Files.list(workspaceRoot).use { assertEquals(0L, it.count()) }
+    }
+
+    @Test
+    fun `cleans up when a local repository file listing fails`() {
+        val allowed = Files.createDirectory(temporary.resolve("allowed-list-failure"))
+        val source = Files.createDirectory(allowed.resolve("repo"))
+        initializeRepository(source)
+        val failing = object : CommandExecutor {
+            override fun run(
+                command: List<String>, workingDirectory: Path?, standardInput: String?, timeout: Duration,
+                maxOutputChars: Int, environment: Map<String, String>
+            ) = CommandResult(1, "git ls-files failed")
+        }
+        val workspaceRoot = temporary.resolve("workspaces-list-failure")
+
+        assertThrows(IllegalStateException::class.java) {
+            GitRepositoryWorkspaceFactory(failing, allowed.toString(), workspaceRoot.toString()).open(source.toString())
         }
         Files.list(workspaceRoot).use { assertEquals(0L, it.count()) }
     }

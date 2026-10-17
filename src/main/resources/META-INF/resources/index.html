@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Coding Agent Review</title>
+  <style>
+    :root { color-scheme: light dark; font: 15px/1.5 system-ui, sans-serif; }
+    body { margin: 0 auto; max-width: 1200px; padding: 24px; }
+    header, .layout, .task-heading { display: flex; gap: 24px; }
+    header, .task-heading { align-items: center; justify-content: space-between; }
+    .layout { align-items: flex-start; }
+    aside { flex: 0 0 280px; }
+    main { flex: 1; min-width: 0; }
+    button, textarea { font: inherit; }
+    button { cursor: pointer; }
+    .task-list { display: grid; gap: 8px; }
+    .task-list button { padding: 10px; text-align: left; }
+    .task-list button span { display: block; opacity: .75; }
+    .panel { border: 1px solid #8886; border-radius: 8px; margin: 16px 0; padding: 16px; }
+    .status { font-weight: 700; }
+    .needs-input { border-color: #d99b23; }
+    textarea { box-sizing: border-box; min-height: 110px; width: 100%; }
+    pre { background: #8881; overflow: auto; padding: 12px; white-space: pre-wrap; }
+    .muted { opacity: .7; }
+    @media (max-width: 720px) {
+      .layout { display: block; }
+      aside { margin-bottom: 24px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Coding Agent Review</h1>
+    <button id="refresh" type="button">Refresh tasks</button>
+  </header>
+  <p class="muted">Review task reports, validation evidence, diffs, and draft pull requests. This page does not approve or merge PRs.</p>
+  <div id="message" role="status" aria-live="polite"></div>
+  <div class="layout">
+    <aside>
+      <h2>Tasks</h2>
+      <div id="tasks" class="task-list"></div>
+    </aside>
+    <main id="details"><p>Select a task to inspect its latest attempt.</p></main>
+  </div>
+  <script>
+    const tasksElement = document.querySelector("#tasks");
+    const detailsElement = document.querySelector("#details");
+    const messageElement = document.querySelector("#message");
+
+    async function api(path, options = {}) {
+      const response = await fetch(path, {
+        ...options,
+        headers: { "Content-Type": "application/json", ...(options.headers || {}) }
+      });
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        throw new Error(body.message || `Request failed with HTTP ${response.status}`);
+      }
+      return response.status === 204 ? null : response.json();
+    }
+
+    function section(title, value, tag = "pre") {
+      const panel = document.createElement("section");
+      panel.className = "panel";
+      const heading = document.createElement("h3");
+      heading.textContent = title;
+      const content = document.createElement(tag);
+      content.textContent = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+      panel.append(heading, content);
+      return panel;
+    }
+
+    async function loadTasks(selectedId) {
+      messageElement.textContent = "";
+      const tasks = await api("/api/tasks");
+      tasksElement.replaceChildren();
+      tasks.forEach(task => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.addEventListener("click", () => showTask(task.id));
+        const title = document.createElement("strong");
+        title.textContent = task.title;
+        const status = document.createElement("span");
+        status.textContent = `${task.status} · ${new Date(task.createdAt).toLocaleString()}`;
+        button.append(title, status);
+        tasksElement.append(button);
+      });
+      if (selectedId) await showTask(selectedId);
+      else if (tasks.length) await showTask(tasks[0].id);
+    }
+
+    async function showTask(id) {
+      try {
+        const [task, attempts, history] = await Promise.all([
+          api(`/api/tasks/${id}`),
+          api(`/api/tasks/${id}/attempts`),
+          api(`/api/tasks/${id}/history`)
+        ]);
+        detailsElement.replaceChildren();
+        const heading = document.createElement("div");
+        heading.className = "task-heading";
+        const title = document.createElement("h2");
+        title.textContent = task.title;
+        const status = document.createElement("span");
+        status.className = "status";
+        status.textContent = task.status;
+        heading.append(title, status);
+        detailsElement.append(heading);
+        detailsElement.append(section("Repository", task.repositoryUrl || "Not selected", "p"));
+        detailsElement.append(section("Task", task.description));
+        if (task.acceptanceCriteria?.length) detailsElement.append(section("Acceptance criteria", task.acceptanceCriteria));
+        detailsElement.append(section("Status history", history));
+
+        const latest = attempts[attempts.length - 1];
+        if (latest) {
+          detailsElement.append(section(`Attempt ${latest.attemptNumber} · ${latest.status}`, latest.report || latest.errorSummary || "No report"));
+          const report = latest.report;
+          const toolEvents = await api(`/api/tasks/${id}/attempts/${latest.id}/tool-executions`);
+          if (report?.openQuestions?.length) detailsElement.append(section("Open questions", report.openQuestions));
+          if (report?.pullRequest?.url) {
+            try {
+              const url = new URL(report.pullRequest.url);
+              if (url.protocol === "https:" && url.hostname === "github.com") {
+                const link = document.createElement("a");
+                link.href = url.href;
+                link.target = "_blank";
+                link.rel = "noopener noreferrer";
+                link.textContent = `Open draft pull request #${report.pullRequest.number}`;
+                detailsElement.append(link);
+              }
+            } catch (_) { /* Ignore malformed report URLs. */ }
+          }
+          if (report?.patchDiff) {
+            const truncated = report.patchDiffTruncated === true;
+            detailsElement.append(section(
+              truncated
+                ? "Patch diff (truncated — larger than the stored limit, not appliable; use the draft pull request)"
+                : "Patch diff",
+              report.patchDiff
+            ));
+          }
+          if (report?.validation) detailsElement.append(section("Validation", report.validation));
+          if (toolEvents.length) detailsElement.append(section("Tool execution audit", toolEvents));
+          if (report?.pullRequestError) detailsElement.append(section("Pull-request publication error", report.pullRequestError));
+        }
+        if (attempts.length > 1) {
+          const earlier = document.createElement("details");
+          const summary = document.createElement("summary");
+          summary.textContent = `Earlier attempts (${attempts.length - 1})`;
+          earlier.append(summary);
+          attempts.slice(0, -1).reverse().forEach(attempt => {
+            earlier.append(section(
+              `Attempt ${attempt.attemptNumber} · ${attempt.status}`,
+              attempt.report || attempt.errorSummary || "No report"
+            ));
+          });
+          detailsElement.append(earlier);
+        }
+
+        if (task.status === "NEEDS_INPUT") {
+          const form = document.createElement("form");
+          form.className = "panel needs-input";
+          const label = document.createElement("label");
+          label.textContent = "Answer the agent's open question to queue a new attempt";
+          label.htmlFor = "clarification";
+          const answer = document.createElement("textarea");
+          answer.id = "clarification";
+          answer.required = true;
+          answer.maxLength = 5000;
+          answer.placeholder = "Provide the missing decision or clarification";
+          const submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Answer and resume";
+          form.append(label, answer, submit);
+          form.addEventListener("submit", async event => {
+            event.preventDefault();
+            submit.disabled = true;
+            try {
+              await api(`/api/tasks/${id}/answer`, {
+                method: "POST",
+                body: JSON.stringify({ answer: answer.value })
+              });
+              messageElement.textContent = "Clarification saved; task queued for another attempt.";
+              await loadTasks(id);
+            } catch (error) {
+              messageElement.textContent = error.message;
+              submit.disabled = false;
+            }
+          });
+          detailsElement.append(form);
+        }
+      } catch (error) {
+        messageElement.textContent = error.message;
+      }
+    }
+
+    document.querySelector("#refresh").addEventListener("click", () => loadTasks());
+    loadTasks().catch(error => { messageElement.textContent = error.message; });
+  </script>
+</body>
+</html>

@@ -3,6 +3,7 @@ package dev.agentplatform.domain.port
 import dev.agentplatform.domain.model.*
 import java.nio.file.Path
 import java.time.Duration
+import java.time.Instant
 import java.util.*
 
 interface TaskExecutionState {
@@ -25,6 +26,12 @@ interface AttemptOperations {
         report: TaskExecutionReport?,
         errorSummary: String? = null
     ): TaskAttempt?
+
+    /**
+     * Attempts that have been RUNNING since before [startedBefore] and therefore belong to a worker
+     * that is no longer reporting progress. Used to reconcile attempts orphaned by a crashed worker.
+     */
+    fun runningAttemptsStartedBefore(startedBefore: Instant): List<TaskAttempt> = emptyList()
 }
 
 data class TaskBudgetUsage(
@@ -39,9 +46,16 @@ interface RepositoryWorkspaceFactory {
 interface RepositoryWorkspace : AutoCloseable {
     val root: Path
     fun changedFiles(): List<String>
-    fun patchDiff(maxChars: Int): String
+    fun patchDiff(maxChars: Int): PatchDiff
     override fun close()
 }
+
+/**
+ * A repository diff bounded to the requested size. [truncated] is true when the real diff was larger
+ * than the limit, in which case [diff] ends mid-hunk and is **not** a valid patch: it must never be
+ * presented as something that can be applied with `git apply`.
+ */
+data class PatchDiff(val diff: String, val truncated: Boolean)
 
 interface CommandExecutor {
     fun run(

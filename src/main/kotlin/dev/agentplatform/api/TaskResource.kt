@@ -95,6 +95,26 @@ class TaskResource @Inject constructor(
         ?: throw NotFoundException("Attempt $attemptId was not found for task $id")
 
     @GET
+    @Path("/{id}/attempts/{attemptId}/patch")
+    @Produces(PATCH_MEDIA_TYPE)
+    fun patch(
+        @PathParam("id") id: UUID,
+        @PathParam("attemptId") attemptId: UUID
+    ): Response {
+        if (taskService.findById(id) == null) throw NotFoundException("Task $id was not found")
+        val diff = try {
+            attemptService.exportablePatch(id, attemptId)
+        } catch (failure: IllegalStateException) {
+            return Response.status(Response.Status.CONFLICT)
+                .type(MediaType.APPLICATION_JSON)
+                .entity(ApiError(failure.message ?: "The patch for attempt $attemptId cannot be exported"))
+                .build()
+        }
+        if (diff == null) throw NotFoundException("Attempt $attemptId was not found for task $id")
+        return Response.ok(diff).type(PATCH_MEDIA_TYPE).build()
+    }
+
+    @GET
     @Path("/{id}/attempts/{attemptId}/tool-executions")
     fun toolExecutions(
         @PathParam("id") id: UUID,
@@ -111,6 +131,7 @@ class TaskResource @Inject constructor(
         const val MAX_ACCEPTANCE_CRITERIA = 30
         const val MAX_ACCEPTANCE_CRITERION_LENGTH = 1000
         const val MAX_ANSWER_LENGTH = 5000
+        const val PATCH_MEDIA_TYPE = "text/x-patch"
     }
 }
 
