@@ -157,8 +157,9 @@ control-plane URL without a real token throws in the adapter's `init`.
 
 **Consequences:** The app starts with no optional feature configured. Do not "simplify" a sentinel back
 to an empty default; it reintroduces a startup failure. This pattern is applied to
-`AGENT_ALLOWED_LOCAL_ROOT`, the control-plane URL/token, the Docker workspace/cache volumes, and the
-GitHub token/repository allow-list.
+`AGENT_ALLOWED_LOCAL_ROOT`, the control-plane URL/token, the Docker workspace/cache volumes, the
+GitHub token/repository allow-list, and the stale-attempt timeout (there `disabled` means "derive twice
+the maximum task duration", not "feature off").
 
 ---
 
@@ -219,4 +220,6 @@ would reject.
 a truncated diff can never be mistaken for an appliable one. A change too large to store is only
 reproducible through the draft pull request. Automatically committing, pushing, or applying to a user's
 working tree is deliberately **not** provided; `COMPLETED` still means "patch produced with an honest
-report", not "applied anywhere".
+report", not "applied anywhere". The three handoff routes — draft PR (primary), patch export (fallback),
+stored report (audit) — plus the execution flow and a verified Route B walkthrough are documented in
+[README](../README.md) under "From task to change" and "Handoff".

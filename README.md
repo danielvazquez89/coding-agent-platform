@@ -2,7 +2,7 @@
 
 A Kotlin + Quarkus project for a controlled software engineering agent. The intended product takes a GitHub issue, inspects one repository, proposes a patch, runs validation in isolation, and opens a pull request for a person to review.
 
-The project runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and validates Maven projects in a separate Docker container. The included Compose deployment separates the API/control plane from a resource-limited worker container; the worker has no Docker socket, and validation requests go through an authenticated, workspace-scoped control-plane endpoint. A local review page shows reports, diffs, validation, tool-audit events, and draft-PR links; users can answer a `NEEDS_INPUT` question and queue a new attempt. Per-task time and estimated-cost limits are configurable. When explicitly enabled and configured for an allow-listed public GitHub repository, the worker can push a task branch and open a draft pull request after validation. GitHub issue ingestion and private-repository clone authentication are not implemented.
+The project runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and validates Maven projects in a separate Docker container. The included Compose deployment separates the API/control plane from a resource-limited worker container; the worker has no Docker socket, and validation requests go through an authenticated, workspace-scoped control-plane endpoint. A local review page shows reports, diffs, validation, tool-audit events, and draft-PR links; a completed attempt's diff can also be exported as an applicable patch, and users can answer a `NEEDS_INPUT` question and queue a new attempt. Per-task time and estimated-cost limits are configurable. When explicitly enabled and configured for an allow-listed public GitHub repository, the worker can push a task branch and open a draft pull request after validation. GitHub issue ingestion and private-repository clone authentication are not implemented.
 
 > **Repository guides.** For an agent-oriented operating guide — build/test commands, the layer and
 > port/adapter map, conventions, invariants, and known pitfalls — see [`AGENTS.md`](AGENTS.md). The
@@ -37,13 +37,13 @@ The engineering challenge is making the workflow dependable and safe, not adding
 | `GET` | `/api/tasks/{id}/attempts/{attemptId}/patch` | Return the attempt's patch as `text/x-patch` when it is safe to apply locally; return `409` with the reason when it is not, and `404` for an unknown task or attempt. |
 | `GET` | `/api/tasks/{id}/attempts/{attemptId}/tool-executions` | Return redacted, ordered tool audit events, including events recorded before an attempt finishes. |
 
-Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list of up to 30 items, each at most 1000 characters), and `repositoryUrl` (required for execution). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. The Quarkus scheduler polls every two seconds. In local development, the API process also runs the worker. In Compose, `control-plane` sets `AGENT_EXECUTION_WORKER_ENABLED=false` and the separate `worker` service enables it; database row locks prevent both processes from claiming the same task. Task creation returns `201` with `QUEUED`; the worker executes asynchronously after persistence. `AGENT_EXECUTION_ENABLED=false` disables execution, and Quarkus scheduler configuration can independently disable scheduled jobs.
+Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list of up to 30 items, each at most 1000 characters), and `repositoryUrl` (required for execution). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. The Quarkus scheduler polls every two seconds; each tick reconciles attempts orphaned by a stopped worker and then claims one queued task. In local development, the API process also runs the worker. In Compose, `control-plane` sets `AGENT_EXECUTION_WORKER_ENABLED=false` and the separate `worker` service enables it; database row locks prevent both processes from claiming the same task. Task creation returns `201` with `QUEUED`; the worker executes asynchronously after persistence. `AGENT_EXECUTION_ENABLED=false` disables execution, and Quarkus scheduler configuration can independently disable scheduled jobs. Every external setting is an environment variable with a default in `src/main/resources/application.properties`; optional values use the `disabled` sentinel.
 
 `CodingModelProvider` defines a provider-independent chat/tool-call contract. `OllamaCodingModelProvider` implements Ollama's `/api/chat` protocol, including structured assistant tool-call history and named tool-result messages, tool schemas, usage counts, timeouts, and bounded error messages. For models that return a JSON tool request in message content instead of Ollama's native `tool_calls`, it normalizes that response only when the requested tool was offered to the model. The adapter is configured with `OLLAMA_BASE_URL` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen3:8b`), and `OLLAMA_TIMEOUT_SECONDS` (default `1200`). It does not download models.
 
 The current local default is `qwen3:8b`. If needed, install it with `ollama pull qwen3:8b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL.
 
-The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff, validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, elapsed time, configured budgets, and per-tool audit summaries. Before an allowed tool runs, its invocation is committed to a separate audit-event table; after it returns, the event is updated with its outcome and duration. Events remain readable if the process stops before finalizing the attempt report. A `STARTED` event left after a crash means the operation's final outcome is unknown, not proof that it did or did not take effect. Audit records retain tool name, a redacted argument summary, outcome, duration, and a short result summary; they deliberately omit source contents, full patches, and tool outputs.
+The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff (with a truncation flag), validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, elapsed time, configured budgets, draft-PR reference/error, and per-tool audit summaries. Before an allowed tool runs, its invocation is committed to a separate audit-event table; after it returns, the event is updated with its outcome and duration. Events remain readable if the process stops before finalizing the attempt report. A `STARTED` event left after a crash means the operation's final outcome is unknown, not proof that it did or did not take effect. Audit records retain tool name, a redacted argument summary, outcome, duration, and a short result summary; they deliberately omit source contents, full patches, and tool outputs.
 
 `AGENT_MAX_TASK_DURATION_SECONDS` defaults to `1800`; `AGENT_MAX_TASK_COST_USD` defaults to `1.0`. Budgets are cumulative across completed attempts for one task, including clarification/resume attempts; queue waiting time is excluded. Time is checked between model/tool operations and after each model response; cost is checked against cumulative reported token usage after each response. These are operation-boundary guardrails, not hard preemptive ceilings: an in-progress operation is not forcibly interrupted when a limit is reached. Cost enforcement requires non-zero input/output rates (`AGENT_MODEL_INPUT_COST_PER_MILLION_USD` and `AGENT_MODEL_OUTPUT_COST_PER_MILLION_USD`) and reported token counts; if rates are set but current or prior token usage is unavailable, the attempt fails closed. Time enforcement also fails closed when prior attempt duration is unavailable. With the default zero rates, estimated cost is zero and the cost ceiling cannot represent actual inference costs. A worker that stops mid-attempt is reconciled rather than resumed: an attempt left `RUNNING` by a crashed or restarted worker is failed once it is older than `AGENT_STALE_ATTEMPT_TIMEOUT_SECONDS` (default: twice `AGENT_MAX_TASK_DURATION_SECONDS`), recording an explicit "outcome unknown" report so a task is never stuck in `RUNNING` and is never reported as a pass; retrying means creating a new task.
 
@@ -72,7 +72,7 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-The Compose file creates PostgreSQL, the control plane, and a separate worker. The control plane is available at <http://localhost:8081>; only it mounts `/var/run/docker.sock`. Both services share named workspace and Maven-cache volumes. `AGENT_CONTROL_PLANE_TOKEN` authenticates worker-to-control-plane validation requests; it defaults to a `disabled` sentinel so a local run needs no token, and configuring a control-plane URL without a real token fails closed at startup; `AGENT_GITHUB_TOKEN` is configured only in the worker environment (never the API or validation containers) and is used only when publishing is enabled. The worker uses `OLLAMA_BASE_URL` (default `http://host.docker.internal:11434`). If Ollama is on the host, configure it to listen on an address reachable from Docker and use host firewall rules to limit access. Set `AGENT_GITHUB_PULL_REQUESTS_ENABLED=true` and configure an allowlisted repository/token in `.env` only when draft-PR publishing is intended. Do not commit `.env`.
+The Compose file creates PostgreSQL, the control plane, and a separate worker. The control plane is available at <http://localhost:8081>; only it mounts `/var/run/docker.sock`. Both services share named workspace and Maven-cache volumes. `AGENT_CONTROL_PLANE_TOKEN` authenticates worker-to-control-plane validation requests. The app defaults it to a `disabled` sentinel so a local run needs no token, and configuring a control-plane URL without a real token fails closed at startup; Compose requires a real value; `AGENT_GITHUB_TOKEN` is configured only in the worker environment (never the API or validation containers) and is used only when publishing is enabled. The worker uses `OLLAMA_BASE_URL` (default `http://host.docker.internal:11434`). If Ollama is on the host, configure it to listen on an address reachable from Docker and use host firewall rules to limit access. Set `AGENT_GITHUB_PULL_REQUESTS_ENABLED=true` and configure an allowlisted repository/token in `.env` only when draft-PR publishing is intended. Do not commit `.env`.
 
 For this deployment, use public GitHub HTTPS repository URLs; local host paths are intentionally unavailable because no host source tree is mounted into the worker. `docker compose down` stops services but retains database and workspace volumes; `docker compose down -v` deletes that persisted data.
 
@@ -96,6 +96,198 @@ NEEDS_INPUT ──(answer)──→ QUEUED
 ```
 
 `COMPLETED`, `FAILED`, and `CANCELLED` are terminal. `NEEDS_INPUT` can transition to `QUEUED` only through the answer endpoint, which prepends the clarification to the task prompt and starts another attempt. Other invalid and repeated transitions are rejected without changing task state or writing history.
+
+### From task to change: the execution flow
+
+Every task follows the same bounded pipeline. The workspace is disposable — it is deleted when the attempt ends — so the change survives only in the durable attempt report and, when publishing is enabled, the draft pull request.
+
+```text
+POST /api/tasks ──► QUEUED (persisted in PostgreSQL)
+                        │
+                        ▼
+      worker poll (every 2s): reap orphaned attempts, then claim one task
+                        │  database row lock · one RUNNING attempt per task
+                        ▼
+      attempt RUNNING ──► disposable workspace
+                        │  (allow-listed local root, or a public GitHub HTTPS URL)
+                        ▼
+      bounded model/tool loop ─────────────────────────────────────────────────┐
+        model proposes ─► application authorizes ─► audit ─► execute           │
+        tools: list_files · search_code · read_file · apply_patch ·            │
+               run_validation (Docker, offline `mvn -B -o test`)               │
+        limits: tool calls · elapsed time · estimated cost                     │
+        ▲──────────────────────────────────────────────────────────────────────┘
+                        ▼
+      evaluate completion ──► VALIDATING ──► COMPLETED | FAILED | NEEDS_INPUT
+                        ▼
+      durable attempt report (PostgreSQL): changed files, diff + truncation flag,
+      validation checks, acceptance checks, tool audit, token usage, cost, duration
+                        ▼
+      COMPLETED and publishing enabled ──► draft pull request (never merged)
+```
+
+`COMPLETED` means "a patch was produced with an honest report", not "applied" or "approved".
+
+### Handoff: what to do with a completed change
+
+```text
+attempt COMPLETED (workspace changed AND supported validation passed)?
+│
+├─ no ─► FAILED       ─► open a new task (the report explains why)
+│         NEEDS_INPUT ─► POST /api/tasks/{id}/answer ─► QUEUED ─► new attempt
+│
+└─ yes ─► choose a route
+          │
+          ├─ A · draft pull request  (primary handoff)
+          │     branch agent/task-<id> ─► DRAFT PR against the default branch
+          │     a person reviews and merges · never auto-merged
+          │
+          ├─ B · patch export, applied locally  (fallback)
+          │     GET /api/tasks/{id}/attempts/{attemptId}/patch ─► text/x-patch
+          │     git apply on YOUR clean worktree (opt-in) · no commit, push, or PR
+          │
+          └─ C · read the report  (audit / manual port)
+                GET /api/tasks/{id}/attempts/{attemptId} ─► report.patchDiff,
+                changedFiles, validation, acceptance checks, tool audit
+```
+
+| Route | Source | Requires | Who acts |
+| --- | --- | --- | --- |
+| A · draft PR | `GitHubPullRequestPublisher` | publishing enabled, allow-listed public repo, task `COMPLETED` | a person, on GitHub |
+| B · patch | `GET …/patch` | task **and** attempt `COMPLETED`, all validation passed, one matching evidenced passing check per criterion, not truncated | a person, `git apply` locally |
+| C · report | `GET …/attempts/{attemptId}` | none | a person, reading or porting |
+
+The export policy lives in `TaskAttemptService.exportablePatch`, so no client re-implements it. When the stored diff is too large it is flagged `patchDiffTruncated`, and Route B refuses it (`409`) rather than return text `git apply` would reject; for such a change, Route A is the reproducible path.
+
+#### Applying a completed attempt's patch (Route B)
+
+The patch is a normal unified diff against the revision the attempt started from, so the target worktree must be at that revision and clean. The API must be running (`.\mvnw.cmd quarkus:dev`).
+
+1. Find a completed task and its attempt:
+
+   ```powershell
+   $base = 'http://localhost:8081'
+   $task = Invoke-RestMethod "$base/api/tasks" | Where-Object status -eq 'COMPLETED' | Select-Object -First 1
+   $attempt = Invoke-RestMethod "$base/api/tasks/$($task.id)/attempts" |
+              Sort-Object attemptNumber -Descending | Select-Object -First 1
+   $task.id; $attempt.id; $attempt.status
+   ```
+
+   A recorded example from this project's database:
+
+   ```text
+   e30b7410-1ffb-461a-9292-694f6e496d5b
+   e95bcc2b-959a-465d-afb0-b1b4bcbd378f
+   COMPLETED
+   ```
+
+2. Preview the patch (served as `text/x-patch`):
+
+   ```powershell
+   Invoke-RestMethod "$base/api/tasks/$($task.id)/attempts/$($attempt.id)/patch" |
+     Out-String -Width 200
+   ```
+
+   For the attempt above the result is 886 characters:
+
+   ```diff
+   diff --git a/src/main/java/example/Greeting.java b/src/main/java/example/Greeting.java
+   index 2b58eb3..264559b 100644
+   --- a/src/main/java/example/Greeting.java
+   +++ b/src/main/java/example/Greeting.java
+   @@ -6,4 +6,8 @@ public final class Greeting {
+        public static String message() {
+            return "Hello";
+        }
+   +
+   +    public static String greeting(String name) {
+   +        return "Hello, " + name + "!";
+   +    }
+    }
+   diff --git a/src/test/java/example/GreetingTest.java b/src/test/java/example/GreetingTest.java
+   index 6543aad..36b7c99 100644
+   --- a/src/test/java/example/GreetingTest.java
+   +++ b/src/test/java/example/GreetingTest.java
+   @@ -9,4 +9,9 @@ class GreetingTest {
+        void returnsTheDefaultGreeting() {
+            assertEquals("Hello", Greeting.message());
+        }
+   +
+   +    @Test
+   +    void greetsByName() {
+   +        assertEquals("Hello, Ada!", Greeting.greeting("Ada"));
+   +    }
+    }
+   ```
+
+   A non-exportable attempt answers `409` with the reason, for example:
+
+   ```text
+   HTTP 409 {"message":"Task d7034f9c-3820-4427-87e8-ea9b175f41d4 is FAILED; only a COMPLETED task has a patch that can be applied locally"}
+   ```
+
+   An unknown task or attempt answers `404`.
+
+3. Export and check the patch without changing your files:
+
+   ```powershell
+   .\scripts\Apply-TaskPatch.ps1 `
+     -TaskId $task.id `
+     -AttemptId $attempt.id `
+     -RepositoryPath 'C:\path\to\your\clone'
+   ```
+
+   ```text
+   Patch exported and checked against 'C:\path\to\your\clone': 'C:\...\e30b7410-....patch'. No repository files were changed. Re-run with -Apply to apply it.
+   ```
+
+   The helper requires a clean worktree and a successful `git apply --check`, writes the patch under the system temporary directory, and surfaces the server's `409` reason instead of re-implementing the export policy.
+
+4. Apply it, then review and test:
+
+   ```powershell
+   .\scripts\Apply-TaskPatch.ps1 `
+     -TaskId $task.id `
+     -AttemptId $attempt.id `
+     -RepositoryPath 'C:\path\to\your\clone' `
+     -Apply
+   ```
+
+   ```text
+   Patch applied to 'C:\path\to\your\clone'. Review the changes and run the repository's tests.
+   ```
+
+   For the recorded attempt this changes exactly two files:
+
+   ```powershell
+   git -C 'C:\path\to\your\clone' status --porcelain
+   ```
+
+   ```text
+    M src/main/java/example/Greeting.java
+    M src/test/java/example/GreetingTest.java
+   ```
+
+5. Commit, branch, and push yourself. Route B never commits, creates a branch, or opens a pull request.
+
+   On Windows, if PowerShell reports that running scripts is disabled, use a process-scoped policy (it does not change the machine policy):
+
+   ```powershell
+   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+   ```
+
+#### Reading the report instead (Route C)
+
+Raw retrieval of the stored report works for any attempt, including one that is not exportable:
+
+```powershell
+$taskId = 'e30b7410-1ffb-461a-9292-694f6e496d5b'
+$attempts = Invoke-RestMethod -Uri "http://localhost:8081/api/tasks/$taskId/attempts"
+$attempt = $attempts | Sort-Object attemptNumber -Descending | Select-Object -First 1
+$attempt.report.patchDiff
+```
+
+Treat `report.patchDiff` as review material, not as a guaranteed-appliable patch: a large diff is stored truncated and flagged (`patchDiffTruncated`), and Route B refuses it for that reason. A task with no acceptance criteria has no criterion checks to verify.
 
 ### Architecture and code map
 
@@ -123,7 +315,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `api/TaskResource.kt` — REST routes, input validation, HTTP status codes.
 - `api/InternalExecutionResource.kt` — bearer-authenticated validation gateway restricted to the shared workspace root.
 - `api/dto/TaskDtos.kt` — API data transfer objects: `CreateTaskRequest`, `TransitionTaskRequest`, `TaskStatusTransitionResponse`, `TaskAttemptResponse`, `ApiError`.
-- `src/main/resources/META-INF/resources/index.html` — local task/PR review page and `NEEDS_INPUT` answer form.
+- `src/main/resources/META-INF/resources/index.html` — local task/PR review page (shows the stored diff and labels it when truncated) and `NEEDS_INPUT` answer form.
 
 #### `dev.agentplatform.domain` — Core business logic (no framework dependencies)
 
@@ -157,32 +349,37 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `infrastructure/docker/DockerValidationRunner.kt` — Disposable Docker Maven/PostgreSQL validation runtime; implements `ValidationRunner`.
 - `infrastructure/ExecutionControlHttp.kt` — Worker HTTP client for the authenticated validation gateway.
 - `infrastructure/process/LocalCommandExecutor.kt` — Argument-vector process runner with bounded output and timeouts; implements `CommandExecutor`.
-- `benchmarks/v1/cases.json` and `benchmarks/v1/Invoke-Benchmark.ps1` — Versioned coding benchmark cases and API-driven evaluator.
+
+#### Resources, tooling, and build
+
+- `src/main/resources/application.properties` — App name, HTTP port (`8081`), database configuration, and every agent setting (model, budgets, workspace roots, Docker images/volumes, control plane, GitHub); optional values use the `disabled` sentinel.
+- `benchmarks/v1/cases.json` and `benchmarks/v1/Invoke-Benchmark.ps1` — Versioned coding benchmark cases and API-driven evaluator; also runs `benchmarks/v2/cases.json` via `-ManifestPath`.
 - `scripts/Apply-TaskPatch.ps1` — Export a completed attempt's patch and optionally apply it to a clean local Git worktree.
-
-#### Resources and build
-
-- `src/main/resources/application.properties` — App name, HTTP port (`8081`), database configuration.
 - `compose.yaml` and `.env.example` — Separate worker/control-plane deployment with named workspace/cache volumes and no Docker socket in the worker.
 - `src/main/resources/db/migration/` — Flyway-managed PostgreSQL schema migrations (V1 tasks, V2 status history, V3 attempts, V4 one-running-attempt constraint, V5 tool execution events).
-- `pom.xml` — Maven build, Kotlin compiler, Quarkus platform and extensions. The Quarkus Maven plugin is configured to disable its default dev-mode debugger; the project has had a conflict on debugger port `5005`.
+- `pom.xml` — Maven build, Kotlin compiler, Quarkus platform and extensions, and the JaCoCo coverage gate (95% line / 85% branch). Quarkus dev mode attaches a JDWP debugger on port `5005`; if that collides with another process, add `<debug>false</debug>` to the `quarkus-maven-plugin` configuration.
 
 #### Tests (mirror the main source structure under `src/test/kotlin/dev/agentplatform/`)
 
-- `api/TaskResourceTest.kt` — Quarkus REST and PostgreSQL integration tests.
+- `AgentWorkflowIntegrationTest.kt` — end-to-end REST submission through workspace creation, the scripted model/tool loop, validation, and the stored report.
+- `AgentWorkflowTestSupport.kt` — shared fixture: scripted Ollama HTTP server and isolated workspace/repository roots.
+- `api/TaskResourceTest.kt` — Quarkus REST and PostgreSQL integration tests, including patch-export responses.
+- `api/InternalExecutionResourceTest.kt` — Validation-gateway authentication, workspace-root, invalid-path, and unavailable-configuration tests.
 - `domain/model/TaskLifecycleTest.kt` — State machine transition-policy unit tests.
 - `application/service/TaskServiceTest.kt` — Task service integration tests.
-- `application/service/TaskAttemptTest.kt` — Attempt lifecycle tests.
-- `application/worker/TaskExecutionWorkerTest.kt` — Worker and model/tool loop tests.
-- `application/worker/TaskExecutionFinalizerTest.kt` — Finalizer state-update tests.
+- `application/service/TaskAttemptTest.kt` — Attempt lifecycle, export-policy, and orphan-recovery query tests.
+- `application/worker/TaskExecutionWorkerTest.kt` — Worker, model/tool loop, budget, and orphan-reaping tests.
+- `application/worker/TaskExecutionFinalizerTest.kt` — Finalizer state-update and orphan-failure tests.
 - `infrastructure/ollama/OllamaCodingModelProviderTest.kt` — Ollama adapter mock-HTTP tests.
-- `infrastructure/workspace/GitRepositoryWorkspaceFactoryTest.kt` — Workspace cloning and safety tests.
+- `infrastructure/ExecutionControlHttpTest.kt` — Worker-to-control-plane HTTP contract and failure tests.
+- `infrastructure/workspace/GitRepositoryWorkspaceFactoryTest.kt` — Workspace cloning, safety, build-output exclusion, and diff-truncation tests.
 - `infrastructure/tool/WorkspaceToolExecutorTest.kt` — Path and patch safety tests.
 - `infrastructure/docker/DockerValidationRunnerTest.kt` — Docker runner tests.
+- `infrastructure/github/GitHubPullRequestPublisherTest.kt` — Allow-list, branch-push, and draft-PR publishing tests.
 - `infrastructure/process/LocalCommandExecutorTest.kt` — Process execution tests.
 - `infrastructure/process/CommandFixture.kt` — Test helper for command execution.
 
-Task data, status history, attempts, and attempt reports are durable in PostgreSQL. Flyway creates and evolves the schema; Hibernate validates the mapped schema at startup rather than creating tables implicitly. Reports are stored as JSON text and include the generated patch diff, validation details, failure and patch-recovery details, acceptance assessments, and model usage. Estimated costs use optional configured per-million-token rates; they default to zero for local Ollama and are estimates, not provider invoices.
+Task data, status history, attempts, and attempt reports are durable in PostgreSQL. Flyway creates and evolves the schema; Hibernate validates the mapped schema at startup rather than creating tables implicitly. Reports are stored as JSON text and include the generated patch diff (and whether it was truncated), validation details, failure and patch-recovery details, acceptance assessments, model usage, and any draft-PR reference/error. Estimated costs use optional configured per-million-token rates; they default to zero for local Ollama and are estimates, not provider invoices.
 
 ## Open in IntelliJ IDEA
 
@@ -199,25 +396,6 @@ $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 ```
 
 The app listens on <http://localhost:8081>. Quarkus Dev UI is at <http://localhost:8081/q/dev/>. Stop dev mode with `Ctrl+C`.
-
-### Reviewing and applying a completed patch
-
-The generated diff is stored in PostgreSQL as `report.patchDiff` on the attempt and served as an applicable patch by `GET /api/tasks/{id}/attempts/{attemptId}/patch` (media type `text/x-patch`). That endpoint owns the export policy — the task and attempt must be `COMPLETED`, every validation check must have passed, and every acceptance criterion must have a matching, in-order, passing, evidence-bearing check — and returns `409` with the reason when a patch cannot be exported, so no client re-implements the rules. A change whose diff exceeds the report's storage limit is stored truncated for review and flagged (`patchDiffTruncated`); the endpoint refuses to serve it rather than return text that `git apply` would reject, so such a change must be taken from the draft pull request. Raw retrieval of the stored report still works:
-
-```powershell
-$taskId = '00000000-0000-0000-0000-000000000000'
-$attempts = Invoke-RestMethod -Uri "http://localhost:8081/api/tasks/$taskId/attempts"
-$attempt = $attempts | Sort-Object attemptNumber -Descending | Select-Object -First 1
-$attempt.report.patchDiff
-```
-
-To export a selected completed attempt to a patch file and check it against a clean target worktree without changing repository files:
-
-```powershell
-.\scripts\Apply-TaskPatch.ps1 -TaskId $taskId -AttemptId $attempt.id -RepositoryPath 'C:\path\to\your\repository'
-```
-
-Add `-Apply` to apply the patch after the same checks pass. The helper is a thin wrapper over the patch endpoint: it downloads the patch, requires a clean Git worktree and a successful `git apply --check`, and surfaces the server's `409` reason when the attempt is not exportable. It writes the patch under the system temporary directory by default. It does not commit, push, create a branch, or open a pull request; inspect and test the applied changes yourself. If the task had no acceptance criteria, there are no criterion checks to verify.
 
 ### PostgreSQL persistence
 
@@ -308,7 +486,7 @@ Create a task against a repository under the configured allowlisted local root, 
 
 - **Quarkus, not Spring Boot:** the original project brief recommended Kotlin/Spring Boot, but the user explicitly chose Quarkus. Continue with Kotlin + Quarkus unless the user changes that decision.
 - **One application, one worker, one repository first:** keep modules separate in code, but avoid microservices and multi-agent orchestration until a measured need appears.
-- **Persist before adding sophisticated orchestration:** task records now live in PostgreSQL. Add attempts, leases, and audit events as the workflow needs them. A database-backed worker with bounded claims is a smaller first reliability step than immediately introducing RabbitMQ or a workflow engine. Revisit a broker when multiple workers or throughput requirements justify it.
+- **Persist before adding sophisticated orchestration:** tasks, attempts, status history, tool-audit events, and reports live in PostgreSQL. Add leases/heartbeats, bounded retries, and cancellation as the workflow needs them. A database-backed worker with bounded claims is a smaller first reliability step than immediately introducing RabbitMQ or a workflow engine. Revisit a broker when multiple workers or throughput requirements justify it.
 - **LLM provider:** the source brief uses Anthropic Claude. Keep the provider behind an interface so model selection and evaluation can change without rewriting the workflow. No provider or API key has been configured.
 - **Human approval:** create draft/proposed pull requests only. Do not auto-merge or deploy.
 - **Repository content is untrusted:** issue text and files can contain prompt injection or malicious code. Model tool requests are proposals; application policy must authorize and constrain each operation.
@@ -406,15 +584,16 @@ The source brief gives a strong direction, but leaves choices that affect implem
 - **What counts as success?** Define benchmark task selection, acceptance checks, regression checks, human review outcomes, and how cost/latency are calculated before publishing scores.
 
 These choices can be discussed while implementing the worker; they do not need to block the attempt/report foundation.
+
 ## Status and handoff for the next coding session
 
 - Ollama is the first model backend. The provider contract and HTTP adapter have mock-HTTP coverage; run the versioned benchmark before making model-quality claims.
-- The scheduled worker, fail-closed local repository-root configuration, tool allowlist, disposable repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, answer-and-requeue flow, local review page, durable per-tool audit events, cumulative task time/cost guardrails, bounded reconciliation of attempts orphaned by a crashed worker, container-separated worker/control-plane deployment, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. GitHub issue intake, private-repository clone authentication, strict egress controls, least-privilege worker database roles, and durable recovery from partial publication are not implemented. The Compose topology still needs execution and containment testing on the deployment host.
+- The scheduled worker, fail-closed local repository-root configuration, tool allowlist, disposable repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, server-side patch export with truncation refusal, answer-and-requeue flow, local review page, durable per-tool audit events, cumulative task time/cost guardrails, bounded reconciliation of attempts orphaned by a crashed worker, container-separated worker/control-plane deployment, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. GitHub issue intake, private-repository clone authentication, strict egress controls, least-privilege worker database roles, and durable recovery from partial publication are not implemented. The Compose topology still needs execution and containment testing on the deployment host.
 - Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces a 95% line / 85% branch coverage gate for measured application code (see `pom.xml` for why a literal 100% is not required); the HTML report is generated under `target/site/jacoco`.
 - PostgreSQL 18.6 databases `coding_agent_platform` and `coding_agent_platform_test` plus limited login `coding_agent_app` are configured locally. The app role password is in the ignored project `.env`; the administrator password is not used by the app.
 - The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. Flyway migrations through V5 add durable tool-execution events.
 - A prior shell lookup resolved `java` to Oracle's `java8path` shim. The IntelliJ JBR at `C:\\Program Files\JetBrains\IntelliJ IDEA 2026.1\jbr` ran Maven as Java 25, compiling for the project's Java 21 target. Configure IntelliJ's Maven Runner JRE explicitly.
-- A previous debug-port collision was reported on `5005`. The Maven plugin now has `<debug>false</debug>` configured; reload the Maven project after pulling this change. If JDWP still appears, inspect IntelliJ's run configuration for an explicit `-agentlib:jdwp` VM option.
+- Quarkus dev mode attaches a JDWP debugger on port `5005`. If that collides with another process, add `<debug>false</debug>` to the `quarkus-maven-plugin` configuration, or remove an explicit `-agentlib:jdwp` VM option from the run configuration.
 
 ## Technology
 

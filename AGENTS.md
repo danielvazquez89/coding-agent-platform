@@ -78,9 +78,14 @@ infrastructure  persistence, Ollama, Git, Docker, process, tools   (outbound ada
 - Tool policy and path/patch checks: `infrastructure/tool/WorkspaceToolExecutor` (`list_files`,
   `search_code`, `read_file`, `apply_patch`, `run_validation`).
 - Patch export policy (task/attempt `COMPLETED`, all validation passed, one matching passing evidenced
-  acceptance check per criterion): `application/service/TaskAttemptService.exportablePatch`, served by
-  `api/TaskResource` at `GET /api/tasks/{id}/attempts/{attemptId}/patch`. Keep it server-side; do not
-  re-implement the rules in clients (the PowerShell helper is a thin wrapper over this endpoint).
+  acceptance check per criterion, and the stored diff not truncated):
+  `application/service/TaskAttemptService.exportablePatch`, served by `api/TaskResource` at
+  `GET /api/tasks/{id}/attempts/{attemptId}/patch`. Keep it server-side; do not re-implement the rules
+  in clients (the PowerShell helper is a thin wrapper over this endpoint).
+- Handoff routes: draft PR (primary) → patch export applied locally (fallback) → stored report (audit).
+  The execution flow, the route decision diagram, and a verified Route B walkthrough are in README under
+  "From task to change" and "Handoff". Route B never applies anything server-side; the opt-in `-Apply`
+  runs `git apply` in the operator's clean worktree.
 - Validation gateway: `api/InternalExecutionResource` (bearer-authenticated, workspace-root scoped).
 - Tests mirror the main tree one class per class (see README for the full list). The end-to-end flow is
   covered by `application/AgentWorkflowIntegrationTest` with `AgentWorkflowTestSupport` (scripted model
@@ -91,7 +96,9 @@ infrastructure  persistence, Ollama, Git, Docker, process, tools   (outbound ada
 - Every external setting is an env var with a default in `src/main/resources/application.properties`,
   e.g. `agent.execution.allowed-local-root=${AGENT_ALLOWED_LOCAL_ROOT:disabled}`.
 - **Optional values use the `disabled` sentinel** (`disabled`, case-insensitive) meaning "feature off".
-  Adapters call an `isConfigured(value)` helper that treats blank and `disabled` as unset.
+  Adapters call an `isConfigured(value)` helper that treats blank and `disabled` as unset. One knob reuses
+  the sentinel with a different meaning: `agent.execution.stale-attempt-timeout-seconds=disabled` means
+  "derive twice the maximum task duration", not "feature off".
 - **Never** write an empty property-file value such as `key=${SOME_ENV:}`. Quarkus treats an empty
   property-file value as missing and fails startup (`Failed to load config value ...`). Empty
   *environment* variables are treated as unset, so `SOME_ENV=""` in Compose is acceptable.
