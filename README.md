@@ -357,7 +357,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `scripts/Apply-TaskPatch.ps1` — Export a completed attempt's patch and optionally apply it to a clean local Git worktree.
 - `compose.yaml` and `.env.example` — Separate worker/control-plane deployment with named workspace/cache volumes and no Docker socket in the worker.
 - `src/main/resources/db/migration/` — Flyway-managed PostgreSQL schema migrations (V1 tasks, V2 status history, V3 attempts, V4 one-running-attempt constraint, V5 tool execution events).
-- `pom.xml` — Maven build, Kotlin compiler, Quarkus platform and extensions, and the JaCoCo coverage gate (95% line / 85% branch). Quarkus dev mode attaches a JDWP debugger on port `5005`; if that collides with another process, add `<debug>false</debug>` to the `quarkus-maven-plugin` configuration.
+- `pom.xml` — Maven build, Kotlin compiler, Quarkus platform and extensions, and the JaCoCo coverage gate (95% line / 85% branch).
 
 #### Tests (mirror the main source structure under `src/test/kotlin/dev/agentplatform/`)
 
@@ -383,14 +383,14 @@ Task data, status history, attempts, and attempt reports are durable in PostgreS
 
 ## Open in IntelliJ IDEA
 
-1. Open `C:\\Users\\danie\\IdeaProjects\\coding-agent-platform` with **File → Open**.
+1. Open the repository root with **File → Open**.
 2. Use the Maven wrapper in **Settings → Build Tools → Maven** and set the Maven Runner JRE to JDK 21 or newer. The installed IntelliJ JBR is suitable.
 3. Reload the Maven project after changing `pom.xml` so IntelliJ picks up the Quarkus plugin configuration.
 
-From PowerShell in the project directory, if `JAVA_HOME` is not already set to a JDK 21+ installation:
+From PowerShell in the project directory, set `JAVA_HOME` to a JDK 21+ installation (IntelliJ's bundled JBR works):
 
 ```powershell
-$env:JAVA_HOME = "C:\Program Files\JetBrains\IntelliJ IDEA 2026.1\jbr"
+$env:JAVA_HOME = 'C:\path\to\jdk-21'
 $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 .\mvnw.cmd quarkus:dev
 ```
@@ -590,10 +590,7 @@ These choices can be discussed while implementing the worker; they do not need t
 - Ollama is the first model backend. The provider contract and HTTP adapter have mock-HTTP coverage; run the versioned benchmark before making model-quality claims.
 - The scheduled worker, fail-closed local repository-root configuration, tool allowlist, disposable repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, server-side patch export with truncation refusal, answer-and-requeue flow, local review page, durable per-tool audit events, cumulative task time/cost guardrails, bounded reconciliation of attempts orphaned by a crashed worker, container-separated worker/control-plane deployment, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. GitHub issue intake, private-repository clone authentication, strict egress controls, least-privilege worker database roles, and durable recovery from partial publication are not implemented. The Compose topology still needs execution and containment testing on the deployment host.
 - Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces a 95% line / 85% branch coverage gate for measured application code (see `pom.xml` for why a literal 100% is not required); the HTML report is generated under `target/site/jacoco`.
-- PostgreSQL 18.6 databases `coding_agent_platform` and `coding_agent_platform_test` plus limited login `coding_agent_app` are configured locally. The app role password is in the ignored project `.env`; the administrator password is not used by the app.
-- The app was built and manually exercised against PostgreSQL: a task with ordered acceptance criteria survived an application restart. Flyway migrations through V5 add durable tool-execution events.
-- A prior shell lookup resolved `java` to Oracle's `java8path` shim. The IntelliJ JBR at `C:\\Program Files\JetBrains\IntelliJ IDEA 2026.1\jbr` ran Maven as Java 25, compiling for the project's Java 21 target. Configure IntelliJ's Maven Runner JRE explicitly.
-- Quarkus dev mode attaches a JDWP debugger on port `5005`. If that collides with another process, add `<debug>false</debug>` to the `quarkus-maven-plugin` configuration, or remove an explicit `-agentlib:jdwp` VM option from the run configuration.
+- Local development expects PostgreSQL 18 with databases `coding_agent_platform` and `coding_agent_platform_test`, a limited login `coding_agent_app`, and the app role password in the ignored project `.env` (the app never uses administrator credentials).
 
 ## Technology
 

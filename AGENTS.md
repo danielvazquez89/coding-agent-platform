@@ -35,7 +35,7 @@ public GitHub repositories. See README for the product surface.
 PowerShell, from the repository root. Tests use real PostgreSQL, so load the app role password first:
 
 ```powershell
-$env:JAVA_HOME = "C:\Program Files\JetBrains\IntelliJ IDEA 2026.1\jbr"
+$env:JAVA_HOME = "C:\path\to\jdk-21"   # IntelliJ's bundled JBR works
 $env:PATH = "$env:JAVA_HOME\bin;$env:PATH"
 $env:DB_PASSWORD = (Get-Content .env | ConvertFrom-StringData).DB_PASSWORD
 
@@ -123,7 +123,7 @@ infrastructure  persistence, Ollama, Git, Docker, process, tools   (outbound ada
 
 ## Known pitfalls
 
-- **Java on `PATH` is a Java 8 shim** on this machine; always set `JAVA_HOME`/`PATH` as above.
+- **Use a JDK 21+ for Maven.** An older `java` on `PATH` is not sufficient; set `JAVA_HOME`/`PATH` as above.
 - **Workspace pollution:** offline Maven validation writes `target/` into the workspace. `changedFiles()`
   and `patchDiff()` deliberately exclude build output; do not reintroduce it into reports or PRs.
 - **A task left `RUNNING` by a crashed worker is failed, not resumed.** On each idle poll tick
