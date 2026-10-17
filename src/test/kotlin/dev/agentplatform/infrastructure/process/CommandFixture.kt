@@ -10,6 +10,7 @@ object CommandFixture {
                 print("$input|${System.getenv("AGENT_TEST_VALUE")}")
             }
             "sleep" -> Thread.sleep(args[1].toLong())
+            "output" -> print(args[1])
             else -> error("Unknown command fixture mode")
         }
     }

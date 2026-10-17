@@ -2,6 +2,7 @@ package dev.agentplatform.infrastructure.process
 
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.Assumptions.assumeTrue
 import java.nio.file.Path
 import java.time.Duration
 
@@ -38,10 +39,46 @@ class LocalCommandExecutorTest {
     }
 
     @Test
+    fun `continues draining output after the capture limit is reached`() {
+        val result = executor.run(javaCommand("output", "x".repeat(20_000)), maxOutputChars = 4096)
+
+        assertEquals(0, result.exitCode)
+        assertTrue(result.output.startsWith("x".repeat(4096)))
+        assertTrue(result.output.endsWith("[output truncated]"))
+    }
+
+    @Test
+    fun `uses a Java argument file for long Windows commands`() {
+        assumeTrue(System.getProperty("os.name").startsWith("Windows", ignoreCase = true))
+        val result = executor.run(
+            javaCommand("stdin", "quoted\\\"argument", "x".repeat(30_001)),
+            standardInput = "argument file works\n",
+            environment = mapOf("AGENT_TEST_VALUE" to "present")
+        )
+
+        assertEquals(0, result.exitCode, result.output)
+        assertEquals("argument file works|present", result.output.trim())
+    }
+
+    @Test
+    fun `reports an interrupted command and restores the interrupt flag`() {
+        try {
+            Thread.currentThread().interrupt()
+            assertThrows(IllegalStateException::class.java) {
+                executor.run(javaCommand("sleep", "5000"), timeout = Duration.ofSeconds(10))
+            }
+            assertTrue(Thread.currentThread().isInterrupted)
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    @Test
     fun `reports invalid commands and process startup failures`() {
         assertThrows(IllegalArgumentException::class.java) { executor.run(emptyList()) }
         assertThrows(IllegalArgumentException::class.java) { executor.run(listOf(" ")) }
         assertThrows(IllegalArgumentException::class.java) { executor.run(javaCommand("stdin"), timeout = Duration.ZERO) }
+        assertThrows(IllegalArgumentException::class.java) { executor.run(javaCommand("stdin"), timeout = Duration.ofMillis(-1)) }
         assertThrows(IllegalArgumentException::class.java) { executor.run(javaCommand("stdin"), maxOutputChars = 0) }
         assertThrows(IllegalStateException::class.java) { executor.run(listOf("agent-command-that-does-not-exist")) }
     }

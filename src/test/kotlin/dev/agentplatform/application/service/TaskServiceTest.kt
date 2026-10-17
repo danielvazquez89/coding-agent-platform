@@ -103,6 +103,8 @@ class TaskServiceTest {
     fun `worker claims queued tasks once and records the worker transition`() {
         taskService.findAll().filter { it.status == TaskStatus.QUEUED }
             .forEach { taskService.transition(it.id, TaskStatus.CANCELLED, "test cleanup") }
+        assertNull(taskService.claim(UUID.randomUUID()))
+        assertNull(taskService.claimNextQueued())
         val first = taskService.create(CreateTaskRequest("First", "Description"))
         val second = taskService.create(CreateTaskRequest("Second", "Description"))
 

@@ -2,6 +2,8 @@ package dev.agentplatform.infrastructure.tool
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.agentplatform.domain.model.CheckOutcome
+import dev.agentplatform.domain.port.CommandExecutor
+import dev.agentplatform.domain.port.CommandResult
 import dev.agentplatform.domain.model.ValidationCheck
 import dev.agentplatform.domain.port.ValidationRunner
 import dev.agentplatform.infrastructure.process.LocalCommandExecutor
@@ -194,6 +196,86 @@ class WorkspaceToolExecutorTest {
             executor().execute("read_file", mapper.readTree("""{"path":"linked.txt"}"""), root)
         }
         assertTrue(executor().execute("list_files", mapper.createObjectNode(), root).content.isNotBlank())
+    }
+
+    @Test
+    fun `enforces file count and search limits while skipping oversized files`() {
+        val root = repository()
+        repeat(251) { index ->
+            Files.writeString(root.resolve("file-%03d.txt".format(index)), "ordinary file")
+        }
+        val listed = executor().execute("list_files", mapper.createObjectNode(), root).content
+        assertTrue(listed.startsWith("(showing first 250 files)"))
+        assertEquals(250, listed.lineSequence().drop(1).count())
+
+        val searchRoot = Files.createDirectory(root.resolve("search"))
+        Files.writeString(searchRoot.resolve("a-large.txt"), "match\n".repeat(50_000))
+        Files.writeString(searchRoot.resolve("b-matches.txt"), "MATCH\n".repeat(30))
+        val matches = executor().execute(
+            "search_code",
+            mapper.readTree("""{"query":"match","path":"search"}"""),
+            root
+        ).content.lines()
+        assertEquals(25, matches.size)
+        assertTrue(matches.all { it.endsWith(": MATCH") })
+
+        Files.writeString(root.resolve("read-limit.txt"), "x".repeat(20_000))
+        assertEquals(12_000, executor().execute(
+            "read_file", mapper.readTree("""{"path":"read-limit.txt"}"""), root
+        ).content.length)
+    }
+
+    @Test
+    fun `rejects malformed paths and patch file lists outside tool bounds`() {
+        val root = repository()
+        val tools = executor()
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("read_file", mapper.createObjectNode().put("path", "\u0000"), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("read_file", mapper.createObjectNode().put("path", root.resolve("README.md").toString()), root)
+        }
+
+        val tooManyFiles = buildString {
+            repeat(11) { index ->
+                append("--- a/file-$index.txt\n+++ b/file-$index.txt\n")
+            }
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("apply_patch", mapper.createObjectNode().put("patch", tooManyFiles), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute(
+                "apply_patch",
+                mapper.createObjectNode().put("patch", "--- /dev/null\n+++ /dev/null\n"),
+                root
+            )
+        }
+    }
+
+    @Test
+    fun `reports patch application failure after a successful dry run`() {
+        val root = repository()
+        val commands = object : CommandExecutor {
+            override fun run(
+                command: List<String>, workingDirectory: Path?, standardInput: String?, timeout: Duration,
+                maxOutputChars: Int, environment: Map<String, String>
+            ) = if (command.contains("--check")) CommandResult(0, "") else CommandResult(1, "write failed")
+        }
+        val tools = WorkspaceToolExecutor(object : ValidationRunner {
+            override fun validate(workspace: Path) = ValidationCheck("Maven tests", outcome = CheckOutcome.PASSED)
+        }, commands, mapper)
+        val patch = """--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-initial
++updated
+"""
+
+        val failure = assertThrows(IllegalStateException::class.java) {
+            tools.execute("apply_patch", mapper.createObjectNode().put("patch", patch), root)
+        }
+        assertTrue(failure.message.orEmpty().contains("Patch application failed: write failed"))
     }
 
     private fun executor() = WorkspaceToolExecutor(object : ValidationRunner {

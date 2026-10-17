@@ -193,6 +193,24 @@ class OllamaCodingModelProviderTest {
     }
 
     @Test
+    fun `does not promote fenced diffs missing either file header`() {
+        val invalidDiffs = listOf(
+            "diff --git a/A.java b/A.java\n+++ b/A.java\n@@ -1 +1 @@\n-old\n+new",
+            "diff --git a/A.java b/A.java\n--- a/A.java\n@@ -1 +1 @@\n-old\n+new"
+        )
+        invalidDiffs.forEach { diff ->
+            val response = mapper.writeValueAsString("```diff\n$diff\n```")
+            withServer(200, """{"message":{"content":$response}}""") { provider, _ ->
+                val turn = provider.chat(
+                    listOf(ModelMessage("user", "Patch")),
+                    listOf(ModelToolDefinition("apply_patch", "Apply patch", mapper.createObjectNode()))
+                )
+                assertTrue(turn.toolCalls.isEmpty())
+            }
+        }
+    }
+
+    @Test
     fun `keeps unmatched or malformed content as ordinary model output`() {
         val offeredTools = listOf(readFileTool())
         val responses = listOf(
@@ -204,7 +222,9 @@ class OllamaCodingModelProviderTest {
             "{\"arguments\":{}}",
             "{\"name\":\"read_file\"}",
             "{\"name\":\"read_file\",\"arguments\":[]}",
-            "{\"name\":\"read_file\",\"arguments\":null}"
+            "{\"name\":\"read_file\",\"arguments\":null}",
+            "{\"name\":bad}",
+            "{\"arguments\":{}} trailing"
         )
         responses.forEach { content ->
             val escapedContent = mapper.writeValueAsString(content)
@@ -316,6 +336,22 @@ class OllamaCodingModelProviderTest {
             assertTrue(assertThrows(ModelProviderException::class.java) {
                 provider.chat(listOf(ModelMessage("user", "hello")), emptyList())
             }.message!!.contains("without arguments"))
+        }
+        withServer(
+            200,
+            """{"message":{"tool_calls":[{"function":{"name":"read_file","arguments":"not-json"}}]}}"""
+        ) { provider, _ ->
+            assertTrue(assertThrows(ModelProviderException::class.java) {
+                provider.chat(listOf(ModelMessage("user", "hello")), emptyList())
+            }.message!!.contains("invalid JSON arguments"))
+        }
+        withServer(
+            200,
+            """{"message":{"tool_calls":[{"function":{"name":"read_file","arguments":"[]"}}]}}"""
+        ) { provider, _ ->
+            assertTrue(assertThrows(ModelProviderException::class.java) {
+                provider.chat(listOf(ModelMessage("user", "hello")), emptyList())
+            }.message!!.contains("without object arguments"))
         }
     }
 
