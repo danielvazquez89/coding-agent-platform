@@ -1,0 +1,56 @@
+{
+  "version": "v1",
+  "description": "Small deterministic Java/Maven coding benchmark. Each task starts from the same clean fixture.",
+  "cases": [
+    {
+      "id": "greeting-message",
+      "title": "Add a greeting message",
+      "description": "Update Greeting.message() to return \"Hello, world!\". Update or add a unit test for the returned value.",
+      "acceptanceCriteria": [
+        "Greeting.message() returns exactly \"Hello, world!\"",
+        "A unit test covers the greeting message"
+      ],
+      "expectedChangedFiles": [
+        "src/main/java/example/Greeting.java",
+        "src/test/java/example/GreetingTest.java"
+      ],
+      "expectedDiffContains": [
+        "Hello, world!"
+      ]
+    },
+    {
+      "id": "greeting-name",
+      "title": "Add personalized greetings",
+      "description": "Add Greeting.message(String name), returning \"Hello, \" followed by the supplied name. Trim surrounding whitespace and reject null or blank names with IllegalArgumentException. Keep the no-argument message() behavior unchanged and add unit tests.",
+      "acceptanceCriteria": [
+        "message(\" Ada \") returns \"Hello, Ada\"",
+        "Null and blank names are rejected with IllegalArgumentException",
+        "The existing no-argument message() behavior remains unchanged"
+      ],
+      "expectedChangedFiles": [
+        "src/main/java/example/Greeting.java",
+        "src/test/java/example/GreetingTest.java"
+      ],
+      "expectedDiffContains": [
+        "Hello, ",
+        "IllegalArgumentException"
+      ]
+    },
+    {
+      "id": "greeting-punctuation",
+      "title": "Add greeting punctuation",
+      "description": "Change Greeting.message() to return \"Hello!\" and update the unit test to assert the new exact value.",
+      "acceptanceCriteria": [
+        "Greeting.message() returns exactly \"Hello!\"",
+        "A unit test asserts the exact updated value"
+      ],
+      "expectedChangedFiles": [
+        "src/main/java/example/Greeting.java",
+        "src/test/java/example/GreetingTest.java"
+      ],
+      "expectedDiffContains": [
+        "Hello!"
+      ]
+    }
+  ]
+}

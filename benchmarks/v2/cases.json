@@ -1,0 +1,77 @@
+{
+  "version": "v2",
+  "promptVersion": "unversioned",
+  "description": "Three baseline Java maintenance cases plus a no-change ambiguity control. Uses the clean v1 Java fixture; this remains a smoke benchmark, not a representative evaluation set.",
+  "cases": [
+    {
+      "id": "greeting-message",
+      "category": "straightforward",
+      "title": "Add a greeting message",
+      "description": "Update Greeting.message() to return \"Hello, world!\". Update or add a unit test for the returned value.",
+      "acceptanceCriteria": [
+        "Greeting.message() returns exactly \"Hello, world!\"",
+        "A unit test covers the greeting message"
+      ],
+      "expectedChangedFiles": [
+        "src/main/java/example/Greeting.java",
+        "src/test/java/example/GreetingTest.java"
+      ],
+      "expectedChangedFilesExact": true,
+      "expectedDiffContains": [
+        "Hello, world!"
+      ]
+    },
+    {
+      "id": "greeting-name",
+      "category": "input-validation",
+      "title": "Add personalized greetings",
+      "description": "Add Greeting.message(String name), returning \"Hello, \" followed by the supplied name. Trim surrounding whitespace and reject null or blank names with IllegalArgumentException. Keep the no-argument message() behavior unchanged and add unit tests.",
+      "acceptanceCriteria": [
+        "message(\" Ada \") returns \"Hello, Ada\"",
+        "Null and blank names are rejected with IllegalArgumentException",
+        "The existing no-argument message() behavior remains unchanged"
+      ],
+      "expectedChangedFiles": [
+        "src/main/java/example/Greeting.java",
+        "src/test/java/example/GreetingTest.java"
+      ],
+      "expectedChangedFilesExact": true,
+      "expectedDiffContains": [
+        "Hello, ",
+        "IllegalArgumentException"
+      ]
+    },
+    {
+      "id": "greeting-punctuation",
+      "category": "regression",
+      "title": "Add greeting punctuation",
+      "description": "Change Greeting.message() to return \"Hello!\" and update the unit test to assert the new exact value.",
+      "acceptanceCriteria": [
+        "Greeting.message() returns exactly \"Hello!\"",
+        "A unit test asserts the exact updated value"
+      ],
+      "expectedChangedFiles": [
+        "src/main/java/example/Greeting.java",
+        "src/test/java/example/GreetingTest.java"
+      ],
+      "expectedChangedFilesExact": true,
+      "expectedDiffContains": [
+        "Hello!"
+      ]
+    },
+    {
+      "id": "greeting-needs-approval",
+      "category": "needs-input",
+      "title": "Use the approved greeting",
+      "description": "Change Greeting.message() to the exact greeting approved by the product owner. The approval is not included in this task. Do not guess or make repository changes; ask a blocking clarification question.",
+      "acceptanceCriteria": [
+        "Greeting.message() returns the exact product-owner-approved greeting"
+      ],
+      "expectedStatus": "NEEDS_INPUT",
+      "expectNoChanges": true,
+      "expectedChangedFilesExact": true,
+      "expectedChangedFiles": [],
+      "expectedDiffContains": []
+    }
+  ]
+}
