@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.HttpServer
 import dev.agentplatform.domain.port.*
+import dev.agentplatform.infrastructure.metrics.MicrometerExecutionMetrics
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import java.net.InetSocketAddress
@@ -245,7 +247,7 @@ class OllamaCodingModelProviderTest {
         val server = startServer(200, """{"message":{"content":""}}""")
         try {
             val endpoint = "http://127.0.0.1:${server.address.port}"
-            val turn = OllamaCodingModelProvider(endpoint, "qwen2.5-coder:7b", 5, nullForEmptyInputMapper)
+            val turn = OllamaCodingModelProvider(endpoint, "qwen2.5-coder:7b", 5, nullForEmptyInputMapper, ExecutionMetrics.NONE)
                 .chat(listOf(ModelMessage("user", "Read the README")), listOf(readFileTool()))
             assertEquals("", turn.content)
             assertTrue(turn.toolCalls.isEmpty())
@@ -409,11 +411,39 @@ class OllamaCodingModelProviderTest {
         assertNotNull(ModelProviderException("failed", IllegalStateException("cause")).cause)
     }
 
+    @Test
+    fun `reports request outcomes to the metrics seam`() {
+        val registry = SimpleMeterRegistry()
+        val metrics = MicrometerExecutionMetrics(registry)
+
+        val server = startServer(200, """{"message":{"content":"Ready"},"done":true}""")
+        try {
+            val provider = provider("http://127.0.0.1:${server.address.port}", metrics = metrics)
+            assertEquals("Ready", provider.chat(listOf(ModelMessage("user", "hello")), emptyList()).content)
+        } finally {
+            server.stop(0)
+        }
+
+        val failing = startServer(500, """{"error":"boom"}""")
+        try {
+            val provider = provider("http://127.0.0.1:${failing.address.port}", metrics = metrics)
+            assertThrows(ModelProviderException::class.java) {
+                provider.chat(listOf(ModelMessage("user", "hello")), emptyList())
+            }
+        } finally {
+            failing.stop(0)
+        }
+
+        assertEquals(1.0, registry.counter("agent.model.requests", "provider", "ollama", "outcome", "success").count())
+        assertEquals(1.0, registry.counter("agent.model.requests", "provider", "ollama", "outcome", "failure").count())
+    }
+
     private fun provider(
         baseUrl: String,
         model: String = "qwen2.5-coder:7b",
-        timeoutSeconds: Long = 5
-    ) = OllamaCodingModelProvider(baseUrl, model, timeoutSeconds, mapper)
+        timeoutSeconds: Long = 5,
+        metrics: ExecutionMetrics = ExecutionMetrics.NONE
+    ) = OllamaCodingModelProvider(baseUrl, model, timeoutSeconds, mapper, metrics)
 
     private fun readFileTool() = ModelToolDefinition(
         "read_file",

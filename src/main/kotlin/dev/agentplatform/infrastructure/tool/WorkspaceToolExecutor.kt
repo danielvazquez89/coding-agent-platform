@@ -3,6 +3,7 @@ package dev.agentplatform.infrastructure.tool
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.agentplatform.domain.port.CommandExecutor
+import dev.agentplatform.domain.port.ExecutionMetrics
 import dev.agentplatform.domain.port.ModelToolDefinition
 import dev.agentplatform.domain.port.ToolExecutionResult
 import dev.agentplatform.domain.port.ValidationRunner
@@ -19,7 +20,8 @@ import java.time.Duration
 class WorkspaceToolExecutor(
     private val validationRunner: ValidationRunner,
     private val commands: CommandExecutor,
-    private val objectMapper: ObjectMapper
+    private val objectMapper: ObjectMapper,
+    private val metrics: ExecutionMetrics
 ) {
     private val codexPatches = CodexPatchNormalizer()
     private val repositoryMapBuilder: RepositoryMapBuilder by lazy { RepositoryMapBuilder.fromConfig() }
@@ -41,7 +43,21 @@ class WorkspaceToolExecutor(
         tool("run_validation", "Run the repository's Maven tests in a disposable, resource-limited Docker container.", """{"type":"object","properties":{},"additionalProperties":false}""")
     )
 
-    fun execute(name: String, arguments: JsonNode, workspace: Path): ToolExecutionResult = when (name) {
+    fun execute(name: String, arguments: JsonNode, workspace: Path): ToolExecutionResult {
+        val result = try {
+            executeAllowed(name, arguments, workspace)
+        } catch (failure: IllegalArgumentException) {
+            metrics.toolCall(name, "rejected")
+            throw failure
+        } catch (failure: Exception) {
+            metrics.toolCall(name, "failed")
+            throw failure
+        }
+        metrics.toolCall(name, "success")
+        return result
+    }
+
+    private fun executeAllowed(name: String, arguments: JsonNode, workspace: Path): ToolExecutionResult = when (name) {
         "list_files" -> ToolExecutionResult(
             listFiles(
                 workspace,

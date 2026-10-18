@@ -73,6 +73,11 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
 | `PullRequestPublisher` | `github/GitHubPullRequestPublisher` | `github/GitHubPullRequestPublisherTest` |
 | `TaskExecutionState` | `application/service/TaskService` | `application/service/TaskServiceTest` |
 | `AttemptOperations` | `application/service/TaskAttemptService` | `application/service/TaskAttemptTest` |
+| `ExecutionMetrics` | `infrastructure/metrics/MicrometerExecutionMetrics` (Micrometer, scraped from `/q/metrics`) | `infrastructure/metrics/MicrometerExecutionMetricsTest` |
+
+- Observability: events go through the framework-free `domain/port/ExecutionMetrics` seam (no-op by
+  default) so the application, tools and providers stay decoupled from Micrometer. Meter tags must stay
+  low-cardinality; never tag with task ids, paths, tool output or prompt text.
 
 - Worker entry point: `application/worker/TaskExecutionWorker` (scheduled, claims one queued task with a
   DB lock; also reaps attempts orphaned by a stopped worker). Terminal updates:

@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.Headers
 import com.sun.net.httpserver.HttpServer
 import dev.agentplatform.domain.port.*
+import dev.agentplatform.infrastructure.metrics.MicrometerExecutionMetrics
 import dev.agentplatform.infrastructure.model.ModelRateLimiter
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import java.net.InetSocketAddress
@@ -71,6 +73,43 @@ class OpenAiCompatibleCodingModelProviderTest {
         }
 
         assertEquals(2, limiter.reservations())
+    }
+
+    @Test
+    fun `reports retries and outcomes to the metrics seam`() {
+        val registry = SimpleMeterRegistry()
+        val requests = AtomicInteger()
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/chat/completions") { exchange ->
+            val first = requests.getAndIncrement() == 0
+            val (status, body) = if (first) {
+                429 to """{"error":{"message":"slow down"}}"""
+            } else {
+                200 to """{"choices":[{"message":{"content":"ok"}}]}"""
+            }
+            val bytes = body.toByteArray()
+            exchange.sendResponseHeaders(status, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        server.start()
+        try {
+            val provider = provider(
+                "http://127.0.0.1:${server.address.port}",
+                metrics = MicrometerExecutionMetrics(registry)
+            )
+            assertEquals("ok", provider.chat(listOf(ModelMessage("user", "hello")), emptyList()).content)
+        } finally {
+            server.stop(0)
+        }
+
+        assertEquals(
+            1.0,
+            registry.counter("agent.model.retries", "provider", "openai-compatible", "reason", "rate_limited").count()
+        )
+        assertEquals(
+            1.0,
+            registry.counter("agent.model.requests", "provider", "openai-compatible", "outcome", "success").count()
+        )
     }
 
     @Test
@@ -437,6 +476,7 @@ class OpenAiCompatibleCodingModelProviderTest {
         retryMaxAttempts: Int = 3,
         retryInitialBackoffMillis: Long = 1,
         retryMaxBackoffMillis: Long = 5,
+        metrics: ExecutionMetrics = ExecutionMetrics.NONE,
         rateLimiter: ModelRateLimiter = ModelRateLimiter("disabled", "disabled", 60_000)
     ) = OpenAiCompatibleCodingModelProvider(
         baseUrl,
@@ -447,7 +487,8 @@ class OpenAiCompatibleCodingModelProviderTest {
         retryInitialBackoffMillis,
         retryMaxBackoffMillis,
         mapper,
-        rateLimiter
+        rateLimiter,
+        metrics
     )
 
     private fun readFileTool() = ModelToolDefinition(

@@ -3,6 +3,7 @@ package dev.agentplatform.infrastructure.model
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import dev.agentplatform.domain.port.ExecutionMetrics
 import dev.agentplatform.domain.port.ModelMessage
 import dev.agentplatform.infrastructure.ollama.OllamaCodingModelProvider
 import dev.agentplatform.infrastructure.openai.OpenAiCompatibleCodingModelProvider
@@ -49,10 +50,10 @@ class SelectingCodingModelProviderTest {
     }
 
     private fun selector(baseUrl: String, provider: String) = SelectingCodingModelProvider(
-        OllamaCodingModelProvider(baseUrl, "ollama-model", 5, mapper),
+        OllamaCodingModelProvider(baseUrl, "ollama-model", 5, mapper, ExecutionMetrics.NONE),
         OpenAiCompatibleCodingModelProvider(
             baseUrl, "openai-model", "disabled", 5, 5, 1000, 60000, mapper,
-            ModelRateLimiter("disabled", "disabled", 60_000)
+            ModelRateLimiter("disabled", "disabled", 60_000), ExecutionMetrics.NONE
         ),
         provider
     )

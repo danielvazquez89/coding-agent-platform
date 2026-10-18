@@ -5,6 +5,7 @@ import dev.agentplatform.domain.model.AttemptStatus
 import dev.agentplatform.domain.model.TaskExecutionReport
 import dev.agentplatform.domain.model.TaskStatus
 import dev.agentplatform.domain.port.AttemptOperations
+import dev.agentplatform.domain.port.ExecutionMetrics
 import dev.agentplatform.domain.port.TaskExecutionState
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.transaction.Transactional
@@ -13,7 +14,8 @@ import java.util.*
 @ApplicationScoped
 class TaskExecutionFinalizer(
     private val taskState: TaskExecutionState,
-    private val attempts: AttemptOperations
+    private val attempts: AttemptOperations,
+    private val metrics: ExecutionMetrics
 ) {
     @Transactional
     fun finish(
@@ -34,6 +36,7 @@ class TaskExecutionFinalizer(
         checkNotNull(attempts.finish(taskId, attemptId, attemptStatus, report, errorSummary)) {
             "Attempt $attemptId disappeared during execution"
         }
+        metrics.taskFinished(taskStatus.name)
     }
 
     /**

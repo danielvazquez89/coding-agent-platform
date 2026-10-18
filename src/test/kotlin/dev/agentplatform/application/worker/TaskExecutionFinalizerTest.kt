@@ -2,6 +2,7 @@ package dev.agentplatform.application.worker
 
 import dev.agentplatform.domain.model.*
 import dev.agentplatform.domain.port.AttemptOperations
+import dev.agentplatform.domain.port.ExecutionMetrics
 import dev.agentplatform.domain.port.TaskBudgetUsage
 import dev.agentplatform.domain.port.TaskExecutionState
 import org.junit.jupiter.api.Assertions.assertEquals
@@ -37,7 +38,7 @@ class TaskExecutionFinalizerTest {
         )
         val state = State(task)
         val attempts = Attempts()
-        val finalizer = TaskExecutionFinalizer(state, attempts)
+        val finalizer = TaskExecutionFinalizer(state, attempts, ExecutionMetrics.NONE)
 
         assertThrows(IllegalArgumentException::class.java) {
             finalizer.finish(task.id, UUID.randomUUID(), TaskStatus.COMPLETED, AttemptStatus.COMPLETED, report(), null)
@@ -58,7 +59,7 @@ class TaskExecutionFinalizerTest {
         val task =
             CodingTask(id = UUID.randomUUID(), title = "Task", description = "Description", status = TaskStatus.QUEUED)
         val attempts = Attempts()
-        val finalizer = TaskExecutionFinalizer(State(task), attempts)
+        val finalizer = TaskExecutionFinalizer(State(task), attempts, ExecutionMetrics.NONE)
 
         assertThrows(IllegalArgumentException::class.java) {
             finalizer.finish(task.id, UUID.randomUUID(), TaskStatus.FAILED, AttemptStatus.FAILED, report(), null)
@@ -74,7 +75,7 @@ class TaskExecutionFinalizerTest {
             description = "Description",
             status = TaskStatus.RUNNING
         )
-        val finalizer = TaskExecutionFinalizer(State(task), Attempts(returnMissing = true))
+        val finalizer = TaskExecutionFinalizer(State(task), Attempts(returnMissing = true), ExecutionMetrics.NONE)
 
         assertThrows(IllegalStateException::class.java) {
             finalizer.finish(
@@ -87,6 +88,29 @@ class TaskExecutionFinalizerTest {
             )
         }
         assertEquals(TaskStatus.FAILED, task.status)
+    }
+
+    @Test
+    fun `records the terminal status after it is persisted`() {
+        val task = CodingTask(
+            id = UUID.randomUUID(),
+            title = "Task",
+            description = "Description",
+            status = TaskStatus.RUNNING
+        )
+        val attempts = Attempts()
+        val statuses = mutableListOf<String>()
+        val finalizer = TaskExecutionFinalizer(State(task), attempts, object : ExecutionMetrics {
+            override fun taskFinished(status: String) {
+                statuses += status
+            }
+        })
+
+        finalizer.finish(task.id, UUID.randomUUID(), TaskStatus.COMPLETED, AttemptStatus.COMPLETED, report(), null)
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals("COMPLETED", attempts.finished?.status?.name)
+        assertEquals(listOf("COMPLETED"), statuses)
     }
 
     private fun report() = TaskExecutionReport("summary", "implementation")

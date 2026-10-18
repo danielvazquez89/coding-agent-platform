@@ -1,11 +1,13 @@
 package dev.agentplatform.infrastructure.tool
 
 import com.fasterxml.jackson.databind.ObjectMapper
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry
 import dev.agentplatform.domain.model.CheckOutcome
 import dev.agentplatform.domain.port.CommandExecutor
 import dev.agentplatform.domain.port.CommandResult
 import dev.agentplatform.domain.model.ValidationCheck
 import dev.agentplatform.domain.port.ValidationRunner
+import dev.agentplatform.infrastructure.metrics.MicrometerExecutionMetrics
 import dev.agentplatform.infrastructure.process.LocalCommandExecutor
 import org.junit.jupiter.api.AfterEach
 import org.junit.jupiter.api.Assertions.*
@@ -18,6 +20,7 @@ import java.time.Duration
 class WorkspaceToolExecutorTest {
     private lateinit var temporary: Path
     private val mapper = ObjectMapper()
+    private val registry = SimpleMeterRegistry()
 
     @BeforeEach
     fun createTestDirectory() {
@@ -87,6 +90,9 @@ class WorkspaceToolExecutorTest {
         assertThrows(IllegalArgumentException::class.java) { tools.execute("search_code", mapper.readTree("""{"query":"x","path":"../"}"""), root) }
         assertThrows(IllegalArgumentException::class.java) { tools.execute("search_code", mapper.readTree("{}"), root) }
         assertThrows(IllegalArgumentException::class.java) { tools.execute("read_file", mapper.readTree("""{"path":" "}"""), root) }
+
+        assertEquals(6.0, registry.counter("agent.tool.calls", "tool", "read_file", "outcome", "rejected").count())
+        assertEquals(1.0, registry.counter("agent.tool.calls", "tool", "unknown", "outcome", "rejected").count())
     }
 
     @Test
@@ -254,7 +260,7 @@ class WorkspaceToolExecutorTest {
         val check = ValidationCheck("Maven tests", "mvn test", CheckOutcome.PASSED, 0, "passed", 100)
         val tools = WorkspaceToolExecutor(object : ValidationRunner {
             override fun validate(workspace: Path) = check
-        }, LocalCommandExecutor(), mapper)
+        }, LocalCommandExecutor(), mapper, MicrometerExecutionMetrics(registry))
         val result = tools.execute("run_validation", mapper.createObjectNode(), temporary)
         assertEquals(check, result.validation)
         assertTrue(result.content.contains("PASSED"))
@@ -476,7 +482,7 @@ class WorkspaceToolExecutorTest {
         }
         val tools = WorkspaceToolExecutor(object : ValidationRunner {
             override fun validate(workspace: Path) = ValidationCheck("Maven tests", outcome = CheckOutcome.PASSED)
-        }, commands, mapper)
+        }, commands, mapper, MicrometerExecutionMetrics(registry))
         val patch = """--- a/README.md
 +++ b/README.md
 @@ -1 +1 @@
@@ -572,7 +578,7 @@ class WorkspaceToolExecutorTest {
 
     private fun executor() = WorkspaceToolExecutor(object : ValidationRunner {
         override fun validate(workspace: Path) = ValidationCheck("Maven tests", outcome = CheckOutcome.PASSED)
-    }, LocalCommandExecutor(), mapper)
+    }, LocalCommandExecutor(), mapper, MicrometerExecutionMetrics(registry))
 
     private fun repository(): Path {
         val root = Files.createTempDirectory(temporary, "repo-")

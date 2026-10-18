@@ -3,6 +3,7 @@ package dev.agentplatform.infrastructure.openai
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.agentplatform.domain.port.CodingModelProvider
+import dev.agentplatform.domain.port.ExecutionMetrics
 import dev.agentplatform.domain.port.ModelMessage
 import dev.agentplatform.domain.port.ModelProviderException
 import dev.agentplatform.domain.port.ModelToolCall
@@ -49,7 +50,8 @@ class OpenAiCompatibleCodingModelProvider(
     @ConfigProperty(name = "agent.model.openai.retry.max-backoff-millis", defaultValue = "60000")
     private val retryMaxBackoffMillis: Long,
     private val objectMapper: ObjectMapper,
-    private val rateLimiter: ModelRateLimiter
+    private val rateLimiter: ModelRateLimiter,
+    private val metrics: ExecutionMetrics
 ) : CodingModelProvider {
     private val logger = Logger.getLogger(OpenAiCompatibleCodingModelProvider::class.java)
     private val httpClient by lazy {
@@ -71,7 +73,14 @@ class OpenAiCompatibleCodingModelProvider(
         }
     }
 
-    override fun chat(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): ModelTurn {
+    override fun chat(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): ModelTurn = try {
+        chatOnce(messages, tools).also { metrics.modelRequest(PROVIDER_NAME, "success") }
+    } catch (failure: ModelProviderException) {
+        metrics.modelRequest(PROVIDER_NAME, "failure")
+        throw failure
+    }
+
+    private fun chatOnce(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): ModelTurn {
         require(messages.isNotEmpty()) { "At least one model message is required" }
         if (!isConfigured(baseUrl)) {
             throw ModelProviderException(
@@ -95,7 +104,8 @@ class OpenAiCompatibleCodingModelProvider(
         }
 
         val payload = serializeRequest(messages, tools)
-        rateLimiter.acquire(ModelRateLimiter.estimateTokens(payload.length))
+        val waited = rateLimiter.acquire(ModelRateLimiter.estimateTokens(payload.length))
+        if (waited > 0) metrics.rateLimitWait(PROVIDER_NAME, waited)
         val response = sendWithRetries(endpoint, payload)
 
         if (!isSuccessfulStatusCode(response.statusCode())) {
@@ -159,6 +169,10 @@ class OpenAiCompatibleCodingModelProvider(
             if (!isRetryableStatusCode(response.statusCode()) || attempt >= retryMaxAttempts) {
                 return response
             }
+            metrics.modelRetry(
+                PROVIDER_NAME,
+                if (response.statusCode() == TOO_MANY_REQUESTS) "rate_limited" else "server_error"
+            )
             val delayMillis = retryDelayMillis(response, attempt)
             logger.warn(
                 "OpenAI-compatible provider returned HTTP ${response.statusCode()}; " +
@@ -291,6 +305,7 @@ class OpenAiCompatibleCodingModelProvider(
         value.isNotBlank() && !value.trim().equals(DISABLED_SENTINEL, ignoreCase = true)
 
     private companion object {
+        const val PROVIDER_NAME = "openai-compatible"
         const val MAX_ERROR_LENGTH = 1000
         const val DISABLED_SENTINEL = "disabled"
         const val TOO_MANY_REQUESTS = 429

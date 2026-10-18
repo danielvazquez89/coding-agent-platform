@@ -24,7 +24,8 @@ class OllamaCodingModelProvider(
     private val model: String,
     @ConfigProperty(name = "agent.model.ollama.timeout-seconds", defaultValue = "1200")
     private val timeoutSeconds: Long,
-    private val objectMapper: ObjectMapper
+    private val objectMapper: ObjectMapper,
+    private val metrics: ExecutionMetrics
 ) : CodingModelProvider {
     override val modelName: String get() = model
 
@@ -40,7 +41,14 @@ class OllamaCodingModelProvider(
         require(timeoutSeconds > 0) { "Ollama timeout must be greater than zero" }
     }
 
-    override fun chat(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): ModelTurn {
+    override fun chat(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): ModelTurn = try {
+        chatOnce(messages, tools).also { metrics.modelRequest(PROVIDER_NAME, "success") }
+    } catch (failure: ModelProviderException) {
+        metrics.modelRequest(PROVIDER_NAME, "failure")
+        throw failure
+    }
+
+    private fun chatOnce(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): ModelTurn {
         require(messages.isNotEmpty()) { "At least one model message is required" }
         val endpoint = try {
             URI.create("${baseUrl.trimEnd('/')}/api/chat")
@@ -166,6 +174,7 @@ class OllamaCodingModelProvider(
     }
 
     private companion object {
+        const val PROVIDER_NAME = "ollama"
         const val MAX_ERROR_LENGTH = 1000
     }
 }

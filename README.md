@@ -525,6 +525,20 @@ rate **together with** the false-success rate and a failure taxonomy. Until that
 about model quality as unproven. The scaffolding for this is in `benchmarks/`; the missing part is cases
 and sample size, not tooling.
 
+### Metrics
+
+`quarkus-micrometer-registry-prometheus` exposes the standard scrape endpoint at `/q/metrics`, so a local Prometheus (or `curl localhost:8081/q/metrics`) can show how an agent run behaves over time. The meters are deliberately low-cardinality: task ids, repository paths and prompt text never become tags.
+
+| Meter | Tags | Recorded when |
+| --- | --- | --- |
+| `agent.model.requests` | `provider`, `outcome=success\|failure` | one model call finishes or throws |
+| `agent.model.retries` | `provider`, `reason=rate_limited\|server_error` | a transient 429/5xx response is retried |
+| `agent.model.rate.limit.wait` | `provider` | a request waits on the pacing budget (timer) |
+| `agent.tool.calls` | `tool`, `outcome=success\|rejected\|failed` | an allow-listed tool call returns or throws |
+| `agent.tasks.finished` | `status=COMPLETED\|FAILED\|NEEDS_INPUT` | a terminal task status is persisted |
+
+`rejected` is a policy failure (unknown tool, path escape, size or file-count limit); `failed` is an execution error. Both matter: a rising rejection count means the model is probing the boundary, which is a prompt or tool-description problem rather than an infrastructure one. The endpoint is unauthenticated like the API, so keep it on localhost or a trusted network.
+
 ### Try the API
 
 ```powershell

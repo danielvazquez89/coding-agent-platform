@@ -697,7 +697,7 @@ class TaskExecutionWorkerTest {
             }
         }
         val timeWorker = TaskExecutionWorker(
-            FakeState(timeTask), timeAttempts, TaskExecutionFinalizer(FakeState(timeTask), timeAttempts),
+            FakeState(timeTask), timeAttempts, TaskExecutionFinalizer(FakeState(timeTask), timeAttempts, ExecutionMetrics.NONE),
             slowProvider, object : RepositoryWorkspaceFactory {
                 override fun open(repositoryUrl: String) = FakeWorkspace(temporary)
             }, tools(), FakePullRequestPublisher(), mapper, true, false, 5, 0.0, 0.0,
@@ -726,7 +726,7 @@ class TaskExecutionWorkerTest {
         val badWorkspaceAttempts = FakeAttempts()
         val badWorkspaceWorker = TaskExecutionWorker(
             FakeState(badWorkspaceTask), badWorkspaceAttempts,
-            TaskExecutionFinalizer(FakeState(badWorkspaceTask), badWorkspaceAttempts),
+            TaskExecutionFinalizer(FakeState(badWorkspaceTask), badWorkspaceAttempts, ExecutionMetrics.NONE),
             ScriptedProvider(), object : RepositoryWorkspaceFactory {
                 override fun open(repositoryUrl: String): RepositoryWorkspace =
                     throw IllegalArgumentException("invalid repository")
@@ -739,7 +739,7 @@ class TaskExecutionWorkerTest {
             TaskExecutionWorker(
                 FakeState(null),
                 FakeAttempts(),
-                TaskExecutionFinalizer(FakeState(null), FakeAttempts()),
+                TaskExecutionFinalizer(FakeState(null), FakeAttempts(), ExecutionMetrics.NONE),
                 ScriptedProvider(),
                 object : RepositoryWorkspaceFactory {
                     override fun open(repositoryUrl: String) = FakeWorkspace(temporary)
@@ -804,7 +804,7 @@ class TaskExecutionWorkerTest {
         TaskExecutionWorker(
             failedState,
             attempts,
-            TaskExecutionFinalizer(failedState, attempts),
+            TaskExecutionFinalizer(failedState, attempts, ExecutionMetrics.NONE),
             ScriptedProvider(),
             object : RepositoryWorkspaceFactory {
                 override fun open(repositoryUrl: String) = FakeWorkspace(temporary)
@@ -990,12 +990,12 @@ class TaskExecutionWorkerTest {
         val defaultValidationRunner = object : ValidationRunner {
             override fun validate(workspace: Path) = validation
         }
-        val toolExecutor = WorkspaceToolExecutor(validationRunner ?: defaultValidationRunner, LocalCommandExecutor(), mapper)
+        val toolExecutor = WorkspaceToolExecutor(validationRunner ?: defaultValidationRunner, LocalCommandExecutor(), mapper, ExecutionMetrics.NONE)
         val workspaceFactory = object : RepositoryWorkspaceFactory {
             override fun open(repositoryUrl: String) = workspace
         }
         return TaskExecutionWorker(
-            state, attempts, TaskExecutionFinalizer(state, attempts), provider, workspaceFactory,
+            state, attempts, TaskExecutionFinalizer(state, attempts, ExecutionMetrics.NONE), provider, workspaceFactory,
             toolExecutor, publisher, mapper, enabled, publishPullRequests, maxToolCalls,
             inputCostPerMillionUsd, outputCostPerMillionUsd, maxDurationSeconds, maxEstimatedCostUsd, workerEnabled,
             staleAttemptTimeoutSeconds
@@ -1004,7 +1004,7 @@ class TaskExecutionWorkerTest {
 
     private fun tools() = WorkspaceToolExecutor(object : ValidationRunner {
         override fun validate(workspace: Path) = ValidationCheck("Maven tests", outcome = CheckOutcome.PASSED)
-    }, LocalCommandExecutor(), mapper)
+    }, LocalCommandExecutor(), mapper, ExecutionMetrics.NONE)
 
     private fun task(
         repository: String? = "local-repo",
