@@ -51,10 +51,12 @@ The conservatism is deliberate:
   size, and changed-file count.
 - **Honest completion.** A task reaches `COMPLETED` only when the workspace changed, every supplied
   acceptance criterion has an evidence-bearing passing assessment, and supported validation passed.
-  Unknown outcomes stay `NEEDS_INPUT` or `FAILED`, never a pass.
+  Unknown outcomes stay `NEEDS_INPUT` or `FAILED`, never a pass. A final report that cannot be parsed as
+  JSON is re-requested at most twice, because a formatting slip should not hide an otherwise validated
+  change; if it still cannot be parsed, every criterion stays unverified.
 - **Draft pull requests only.** Nothing merges, deploys, or writes to a default branch.
 
-The honest trade-off: this conservatism caps capability. A bounded five-tool loop driven by a small local
+The honest trade-off: this conservatism caps capability. A bounded seven-tool loop driven by a small local
 model will fail on tasks a shell-enabled agent with a frontier model completes. The value here is the
 policy and verification substrate around the model. What has and has not been measured is in
 [Repeatable coding benchmark](#repeatable-coding-benchmark).

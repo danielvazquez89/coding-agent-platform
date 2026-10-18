@@ -455,6 +455,66 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `re-asks for the report when the final answer cannot be parsed`() {
+        val criterion = "README documents the new behavior"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", null, null),
+            ModelTurn("""{"summary":"Updated README","decisions":[{"topic":"a"},{"topic":"b"}]""", emptyList(), "stop", null, null),
+            ModelTurn(
+                """{"summary":"Updated README","implementation":"Updated the file.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"README now says new."}]}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(3, provider.calls)
+        assertTrue(provider.messages.last().content!!.contains("single valid JSON object"))
+        assertEquals(AcceptanceOutcome.PASSED, attempts.finishedReport!!.acceptanceChecks.single().outcome)
+    }
+
+    @Test
+    fun `stops re-asking after the bounded number of malformed reports`() {
+        val criterion = "README documents the new behavior"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val broken = """{"summary":"Updated README","decisions":[{"topic":"a"}"""
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", null, null),
+            ModelTurn(broken, emptyList(), "stop", null, null),
+            ModelTurn(broken, emptyList(), "stop", null, null),
+            ModelTurn(broken, emptyList(), "stop", null, null)
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        assertEquals(4, provider.calls)
+        assertEquals(AcceptanceOutcome.UNVERIFIED, attempts.finishedReport!!.acceptanceChecks.single().outcome)
+    }
+
+    @Test
     fun `reruns validation when the model patches after a successful validation`() {
         val task = task()
         val attempts = FakeAttempts()

@@ -349,12 +349,13 @@ class TaskExecutionWorker @Inject constructor(
         var toolCallCount = 0
         var prematureFinalRetries = 0
         var patchFailureRetries = 0
+        var reportFormatRetries = 0
         var lastPatchFailure: String? = null
         var lastToolResult: String? = null
         var patchApplied = false
         var validationCurrent = false
         var lastModelText: String? = null
-        repeat(maxToolCalls + MAX_PATCH_FAILURE_RETRIES + 4) {
+        repeat(maxToolCalls + MAX_PATCH_FAILURE_RETRIES + MAX_REPORT_FORMAT_RETRIES + 4) {
             checkBudget(trace.startedAtNanos, trace)
             val modelCallStartedAt = System.nanoTime()
             val turn = try {
@@ -395,6 +396,20 @@ class TaskExecutionWorker @Inject constructor(
                     return@repeat
                 }
                 val response = (turn.content?.takeIf(String::isNotBlank) ?: lastModelText).orEmpty()
+                if (
+                    lastPatchFailure == null &&
+                    reportFormatRetries < MAX_REPORT_FORMAT_RETRIES &&
+                    task.acceptanceCriteria.isNotEmpty() &&
+                    parseReport(response).isEmpty
+                ) {
+                    reportFormatRetries++
+                    messages += ModelMessage("assistant", response)
+                    messages += ModelMessage(
+                        "user",
+                        "That final answer is not the required report: it must be a single valid JSON object with summary, implementation, decisions, openQuestions and acceptanceChecks, and every acceptance criterion must be copied verbatim. Resend only the corrected JSON object. Do not wrap it in prose, Markdown fences, function-call tags, or a second object. A report that still cannot be parsed leaves the criteria unverified."
+                    )
+                    return@repeat
+                }
                 val remainingPatchFailure = lastPatchFailure
                 val finalText = if (remainingPatchFailure == null) response else buildString {
                     append(response)
@@ -800,7 +815,11 @@ class TaskExecutionWorker @Inject constructor(
         val implementation: String?,
         val decisions: List<AgentDecision>,
         val acceptanceChecks: List<AcceptanceCheck>
-    )
+    ) {
+        /** True when nothing at all could be read, which means the payload was not a report. */
+        val isEmpty: Boolean
+            get() = questions.isEmpty() && implementation == null && decisions.isEmpty() && acceptanceChecks.isEmpty()
+    }
 
     private class ExecutionTrace(
         private val modelName: String,
@@ -881,6 +900,7 @@ class TaskExecutionWorker @Inject constructor(
         const val MAX_FINAL_TEXT_CHARS = 15_000
         const val MAX_DIFF_CHARS = 30_000
         const val MAX_PATCH_FAILURE_RETRIES = 3
+        const val MAX_REPORT_FORMAT_RETRIES = 2
         const val DISABLED_SENTINEL = "disabled"
 
         fun resolveStaleAfter(configuredSeconds: String, maxDurationSeconds: Long): Duration {
