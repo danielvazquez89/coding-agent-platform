@@ -114,6 +114,30 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   `/q/metrics` through the framework-free `ExecutionMetrics` port, and were observed on a live run. Tags
   stay low-cardinality: no task ids, paths, tool output or prompt text.
 
+## Where this stands after the real-repository runs
+
+The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
+to use an enum's `toString()` and update `EnumTest` — has **not** completed on Groq's free tier. This is
+recorded rather than glossed over, because the failures are informative.
+
+| Run | Model | Outcome |
+| --- | --- | --- |
+| A `83ed833d` | `openai/gpt-oss-120b` | HTTP 413 after 13 tool calls: the request itself outgrew the tier's per-minute cap (the finding that produced `boundedHistory`) |
+| B `0d6ca02b` | `openai/gpt-oss-120b` | HTTP 400 `output_parse_failed` treated as terminal (the finding that produced the generation-error retry) |
+| C `7d1505a3` | `openai/gpt-oss-120b` | 25 tool calls, no patch: the too-small window made the model re-read files (the finding that sized the budget) |
+| D `a3c7b4ef` | `openai/gpt-oss-120b` | 8 model calls, repeated `output_parse_failed` and a 429, no patch — Groq's decoder kept rejecting this model's output |
+| E `e3be1cd1` | `qwen/qwen3.8-27b` | read `JSONObject.java`, proposed `apply_patch` with an unsupported `*** Find File:` directive (rejected honestly, as designed), then HTTP 413: `7250 > 7000` input tokens per minute |
+| F `3766f0a7` | `qwen/qwen3.8-27b`, 12000-char window | 16 model calls, 25 tool calls (11 `search_code`, 7 `read_file`, 5 `list_files`, 2 `related_tests`), no patch, tool-call limit reached |
+
+What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
+unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
+HTTP 413 and re-read loop were fixed and did not recur, and the generation-error retry visibly recovered
+attempts that previously died. What they also show is the real gap: on a free tier with a small
+per-request cap, both models spend their whole tool budget exploring a repository of a few hundred files
+and never propose a change. The next capability investment pointed at by this evidence is **localization**
+— symbol-level search and a short, explicit plan — not more retries. Hosted OpenAI API models
+(`gpt-4o`, `gpt-4.1`, the o-series) remain untested here: no key is available.
+
 ## Repository selection (the gate, in practice)
 
 Every candidate is green-from-a-fresh-clone or it is disqualified, because a red validation would otherwise
