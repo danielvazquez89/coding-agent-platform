@@ -151,9 +151,11 @@ class OpenAiCompatibleCodingModelProvider(
 
     /**
      * Sends the request, retrying transient provider responses (HTTP 429 and 5xx) with exponential
-     * backoff and jitter. Hosted free tiers throttle per-minute token budgets, and a bounded wait is
-     * preferable to failing an attempt outright. Non-transient responses and the final attempt are
-     * returned as-is so the caller keeps reporting the provider's own error detail.
+     * backoff and jitter. Some providers also answer HTTP 400 when their own constrained decoder could
+     * not parse the model's output; that request was valid and a fresh sample usually decodes, so it is
+     * retried too. Hosted free tiers throttle per-minute token budgets, and a bounded wait is preferable
+     * to failing an attempt outright. Non-transient responses and the final attempt are returned as-is so
+     * the caller keeps reporting the provider's own error detail.
      */
     private fun sendWithRetries(endpoint: URI, payload: String): HttpResponse<String> {
         var attempt = 1
@@ -166,21 +168,45 @@ class OpenAiCompatibleCodingModelProvider(
             } catch (exception: IOException) {
                 throw ModelProviderException("Could not reach the OpenAI-compatible server at $baseUrl", exception)
             }
-            if (!isRetryableStatusCode(response.statusCode()) || attempt >= retryMaxAttempts) {
+            if (!isRetryable(response) || attempt >= retryMaxAttempts) {
                 return response
             }
-            metrics.modelRetry(
-                PROVIDER_NAME,
-                if (response.statusCode() == TOO_MANY_REQUESTS) "rate_limited" else "server_error"
-            )
+            metrics.modelRetry(PROVIDER_NAME, retryReason(response))
             val delayMillis = retryDelayMillis(response, attempt)
             logger.warn(
-                "OpenAI-compatible provider returned HTTP ${response.statusCode()}; " +
-                    "retrying in ${delayMillis}ms (attempt ${attempt + 1} of $retryMaxAttempts)"
+                "OpenAI-compatible provider returned HTTP ${response.statusCode()} " +
+                    "(${retryReason(response)}); retrying in ${delayMillis}ms (attempt ${attempt + 1} of $retryMaxAttempts)"
             )
             sleepBeforeRetry(delayMillis)
             attempt++
         }
+    }
+
+    private fun retryReason(response: HttpResponse<String>): String = when {
+        response.statusCode() == TOO_MANY_REQUESTS -> "rate_limited"
+        isRetryableStatusCode(response.statusCode()) -> "server_error"
+        else -> "provider_generation_error"
+    }
+
+    internal fun isRetryable(response: HttpResponse<String>): Boolean =
+        isRetryableStatusCode(response.statusCode()) || isUnparseableGeneration(response)
+
+    /**
+     * True when the provider rejected the request because it could not parse the model's own output,
+     * not because the request was malformed. Groq answers this way with HTTP 400 and an error code such
+     * as `output_parse_failed` (the model emitted plain text where its tool-call format was required) or
+     * `tool_use_failed` (the model called a tool that was not offered, or with unusable arguments). A
+     * genuinely malformed request carries neither code, so it stays terminal.
+     */
+    internal fun isUnparseableGeneration(response: HttpResponse<String>): Boolean {
+        if (response.statusCode() != BAD_REQUEST) return false
+        val root = try {
+            objectMapper.readTree(response.body())
+        } catch (_: IOException) {
+            return false
+        } ?: return false
+        val code = root.path("error").path("code").takeIf(JsonNode::isTextual)?.asText()?.trim().orEmpty()
+        return code in UNPARSEABLE_GENERATION_CODES
     }
 
     private fun buildRequest(endpoint: URI, payload: String): HttpRequest {
@@ -309,6 +335,8 @@ class OpenAiCompatibleCodingModelProvider(
         const val MAX_ERROR_LENGTH = 1000
         const val DISABLED_SENTINEL = "disabled"
         const val TOO_MANY_REQUESTS = 429
+        const val BAD_REQUEST = 400
         const val MAX_BACKOFF_EXPONENT = 6
+        val UNPARSEABLE_GENERATION_CODES = setOf("output_parse_failed", "tool_use_failed")
     }
 }

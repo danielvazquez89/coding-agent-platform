@@ -304,6 +304,42 @@ class OpenAiCompatibleCodingModelProviderTest {
     }
 
     @Test
+    fun `retries a request the provider rejected because it could not parse the model output`() =
+        withSequenceServer(
+            listOf(
+                400 to """{"error":{"message":"Parsing failed. The model generated output that could not be parsed.","type":"invalid_request_error","code":"output_parse_failed","failed_generation":"We need to find writeValue method."}}""",
+                200 to """{"choices":[{"message":{"content":"ok"}}]}"""
+            )
+        ) { provider, requests ->
+            assertEquals("ok", provider.chat(listOf(ModelMessage("user", "hello")), emptyList()).content)
+            assertEquals(2, requests.get())
+        }
+
+    @Test
+    fun `retries a provider tool use failure`() = withSequenceServer(
+        listOf(
+            400 to """{"error":{"message":"Failed to call a function.","code":"tool_use_failed"}}""",
+            200 to """{"choices":[{"message":{"content":"recovered"}}]}"""
+        )
+    ) { provider, requests ->
+        assertEquals("recovered", provider.chat(listOf(ModelMessage("user", "hello")), emptyList()).content)
+        assertEquals(2, requests.get())
+    }
+
+    @Test
+    fun `reports the provider generation failure once the retry budget is exhausted`() =
+        withSequenceServer(
+            listOf(400 to """{"error":{"message":"Parsing failed.","code":"output_parse_failed"}}""")
+        ) { provider, requests ->
+            val exception = assertThrows(ModelProviderException::class.java) {
+                provider.chat(listOf(ModelMessage("user", "hello")), emptyList())
+            }
+            assertTrue(exception.message!!.contains("HTTP 400"))
+            assertTrue(exception.message!!.contains("output_parse_failed"))
+            assertEquals(3, requests.get())
+        }
+
+    @Test
     fun `does not retry a non-transient client error`() =
         withSequenceServer(listOf(400 to """{"error":{"message":"bad request"}}""")) { provider, requests ->
             val exception = assertThrows(ModelProviderException::class.java) {

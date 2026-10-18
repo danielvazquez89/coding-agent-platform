@@ -81,7 +81,21 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   The default is deliberately conservative; set it below the provider's per-request limit minus the fixed
   prompt.
 
-### 6. Observability
+### 6. A valid request rejected because the provider could not parse the model's output
+
+- **Symptom.** A fresh run of the JSON-java task against `openai/gpt-oss-120b` failed with
+  `HTTP 400 ... code: "output_parse_failed", "failed_generation": "We need to find writeValue method."`
+  after eight model calls. The request was well-formed; the model emitted a plain-text fragment where
+  Groq's constrained tool-call decoder required its own format.
+- **Evidence.** Task `0d6ca02b-8efd-4a31-968b-4661ccafecc1`, attempt
+  `a91b0292-bc59-4787-bbb5-9ce7d94aba08`: accepted as terminal because the adapter classified all
+  `400`s as non-transient, wasting the attempt.
+- **Decision.** Retry a `400` only when the provider's error code marks a generation/decoding failure
+  (`output_parse_failed`, `tool_use_failed`), using the existing bounded backoff, and report the
+  provider error honestly if the retries are exhausted. A malformed request carries neither code and
+  still fails immediately. The retry keeps its own metrics reason (`provider_generation_error`).
+
+### 7. Observability
 
 - Micrometer meters for model turns, retries, rate-limit waits, tool calls and task outcomes are exposed at
   `/q/metrics` through the framework-free `ExecutionMetrics` port, and were observed on a live run. Tags
