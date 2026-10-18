@@ -26,6 +26,12 @@ class CodexPatchNormalizer {
         return render(sections, workspace)
     }
 
+    /** True when the text is the Codex envelope rather than a unified diff. */
+    fun isEnvelope(patch: String): Boolean {
+        val first = patch.replace("\r\n", "\n").replace("\r", "\n").lines().firstOrNull { it.isNotBlank() }
+        return first?.trim() == BEGIN
+    }
+
     private fun parse(lines: List<String>): List<Section> {
         val sections = mutableListOf<Section>()
         var current: Section? = null

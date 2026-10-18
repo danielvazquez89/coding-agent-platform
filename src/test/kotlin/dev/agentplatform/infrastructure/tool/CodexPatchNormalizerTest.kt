@@ -36,6 +36,13 @@ class CodexPatchNormalizerTest {
     fun `leaves unified diffs untouched`() {
         val diff = "--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-initial\n+changed\n"
         assertNull(normalizer.normalize(diff, workspace))
+        assertFalse(normalizer.isEnvelope(diff))
+    }
+
+    @Test
+    fun `recognises an envelope behind blank lines and CRLF`() {
+        assertTrue(normalizer.isEnvelope("\r\n  *** Begin Patch\r\n*** Update File: README.md\r\n*** End Patch\r\n"))
+        assertFalse(normalizer.isEnvelope("   "))
     }
 
     @Test

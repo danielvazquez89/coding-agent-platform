@@ -11,6 +11,7 @@ import dev.agentplatform.infrastructure.retrieval.RepositoryFiles
 import dev.agentplatform.infrastructure.retrieval.RepositoryMapBuilder
 import dev.agentplatform.infrastructure.retrieval.TestImpactAnalyzer
 import jakarta.enterprise.context.ApplicationScoped
+import org.jboss.logging.Logger
 import java.io.IOException
 import java.nio.file.*
 import java.nio.file.attribute.BasicFileAttributes
@@ -23,6 +24,7 @@ class WorkspaceToolExecutor(
     private val objectMapper: ObjectMapper,
     private val metrics: ExecutionMetrics
 ) {
+    private val log = Logger.getLogger(WorkspaceToolExecutor::class.java)
     private val codexPatches = CodexPatchNormalizer()
     private val repositoryMapBuilder: RepositoryMapBuilder by lazy { RepositoryMapBuilder.fromConfig() }
     private val testImpact = TestImpactAnalyzer()
@@ -258,6 +260,9 @@ class WorkspaceToolExecutor(
         require(patch.length <= PATCH_SIZE_LIMIT) { "Patch exceeds the ${PATCH_SIZE_LIMIT / 1024} KB limit" }
         val sanitized = sanitizePatch(patch)
         val normalized = codexPatches.normalize(sanitized, workspace) ?: sanitized
+        if (codexPatches.isEnvelope(sanitized)) {
+            log.infof("apply_patch normalized a Codex envelope (%d characters) to a unified diff", sanitized.length)
+        }
         val paths = normalized.lineSequence().filter { it.startsWith("+++ ") || it.startsWith("--- ") }
             .map { it.substring(4).substringBefore('\t').trim() }
             .filterNot { it == "/dev/null" }
