@@ -1,5 +1,7 @@
 # Coding Agent Platform
 
+[![CI](https://github.com/danielvazquez89/coding-agent-platform/actions/workflows/ci.yml/badge.svg)](https://github.com/danielvazquez89/coding-agent-platform/actions/workflows/ci.yml)
+
 A Kotlin + Quarkus project for a controlled software engineering agent. The intended product takes a GitHub issue, inspects one repository, proposes a patch, runs validation in isolation, and opens a pull request for a person to review.
 
 The project runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and validates Maven projects in a separate Docker container. The included Compose deployment separates the API/control plane from a resource-limited worker container; the worker has no Docker socket, and validation requests go through an authenticated, workspace-scoped control-plane endpoint. A local review page shows reports, diffs, validation, tool-audit events, and draft-PR links; a completed attempt's diff can also be exported as an applicable patch, and users can answer a `NEEDS_INPUT` question and queue a new attempt. Per-task time and estimated-cost limits are configurable. When explicitly enabled and configured for an allow-listed public GitHub repository, the worker can push a task branch and open a draft pull request after validation. GitHub issue ingestion and private-repository clone authentication are not implemented.
@@ -19,6 +21,42 @@ The engineering challenge is making the workflow dependable and safe, not adding
 - recover from duplicate work, worker crashes, and restarts without opening duplicate pull requests;
 - report actual validation results and limitations, then leave merge approval to a human;
 - measure success and failure against a repeatable benchmark instead of claiming unmeasured improvements.
+
+## How this compares to other coding agents
+
+For raw capability, mature tools win, and this project does not try to compete there. Aider, OpenHands,
+and SWE-agent run stronger models, expose richer tool sets (shell, semantic search, LSP, subagents), and
+are backed by large evaluation suites; the commercial CLI agents (Claude Code, Codex, Gemini CLI) are
+more polished still. If the goal is the highest chance that an arbitrary repository change lands, use one
+of those.
+
+This project optimizes a different axis: **running an agent under policy you control and being able to
+prove what it did.** It targets self-hosted, model-agnostic execution where the requirement is a
+trustworthy, auditable outcome rather than the best possible patch.
+
+| | Aider / OpenHands / SWE-agent | Commercial CLI agents | This project |
+| --- | --- | --- | --- |
+| Model | many, hosted or local | vendor models | any Ollama model behind one SPI, local-first |
+| Tools | shell, search, editors, plugins | shell, search, MCP, subagents | five allow-listed, path-checked tools, no shell |
+| Isolation | varies; some sandboxing | vendor-managed | disposable workspace plus an offline, capability-dropped validation container |
+| Audit trail | application logs | vendor logs | durable per-tool audit written **before** execution, plus task/attempt/state history |
+| Failure honesty | reports what happened | reports what happened | will not mark a task complete without a workspace change, evidenced criteria, and passing validation |
+| Network / data | often calls hosted APIs | hosted | no external egress required; local model by default |
+| Deploy | local or self-hosted | SaaS | local or Compose; no hosted API keys |
+
+The conservatism is deliberate:
+
+- **No shell and no network tool.** Every action is one of `list_files`, `search_code`, `read_file`,
+  `apply_patch`, or `run_validation`; the application validates paths, patch size, and changed-file count.
+- **Honest completion.** A task reaches `COMPLETED` only when the workspace changed, every supplied
+  acceptance criterion has an evidence-bearing passing assessment, and supported validation passed.
+  Unknown outcomes stay `NEEDS_INPUT` or `FAILED`, never a pass.
+- **Draft pull requests only.** Nothing merges, deploys, or writes to a default branch.
+
+The honest trade-off: this conservatism caps capability. A bounded five-tool loop driven by a small local
+model will fail on tasks a shell-enabled agent with a frontier model completes. The value here is the
+policy and verification substrate around the model. What has and has not been measured is in
+[Repeatable coding benchmark](#repeatable-coding-benchmark).
 
 ## Current implementation
 
@@ -449,6 +487,24 @@ The first run initializes and commits the benchmark fixture locally; later runs 
 ```
 
 The scorecard uses the **last** validation result, requires exactly one evidence-bearing passing assessment for each supplied criterion, can require an exact changed-file set, and checks that a clarification case produced neither changed files nor a diff. It reports false-success count/rate for expected non-completion cases, per-case patch failures, elapsed time, model usage, and validation outcomes. The diff/file checks are lightweight benchmark oracles, not proof of behavior; acceptance assessments remain model-authored. The prompt version is currently marked `unversioned`, and four cases are still only a smoke suite. Expand the suite with independently tested outcomes and diverse maintenance tasks before making quality claims.
+
+#### What the numbers do and do not say
+
+There is **no published success rate yet**, and that is a deliberate limitation rather than an oversight:
+three and four smoke cases are not enough evidence to claim the agent is useful on real repositories.
+
+- **Measured today:** task status, the last Maven validation outcome, evidence-bearing acceptance
+  assessments (exactly one per criterion), expected changed-file sets and diff fragments, elapsed time,
+  token usage, estimated cost, and — for the v2 negative control — the **false-success rate** (a case
+  that should have stopped for input but reported success instead).
+- **Not measured:** generalization to unfamiliar repositories, multi-file reasoning, languages other than
+  Java/Maven, or long-horizon tasks. No SWE-bench-style or real-repository evaluation has been run.
+
+To publish a credible number: expand to at least 20–30 independently specified maintenance tasks across
+more than one repository, freeze the prompt and model version, run each case N times, and report the pass
+rate **together with** the false-success rate and a failure taxonomy. Until that exists, treat any claim
+about model quality as unproven. The scaffolding for this is in `benchmarks/`; the missing part is cases
+and sample size, not tooling.
 
 ### Try the API
 

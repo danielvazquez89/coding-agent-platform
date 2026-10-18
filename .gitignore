@@ -38,6 +38,7 @@ nb-configuration.xml
 
 # Local environment
 .env
+/NEXT-STEPS.md
 /benchmarks/v1/fixture/.git/
 /benchmarks/v1/results-v1.json
 /benchmarks/v2/results-v2.json
