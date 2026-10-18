@@ -73,15 +73,28 @@ a committed document; the day-to-day roadmap and open questions live in the unco
 - **Root cause.** The tool loop appended every tool result and never bounded the conversation. Tool output
   from a real repository (whole files, search results) is large, so the request grew monotonically until
   no request could be valid.
-- **Decision.** `TaskExecutionWorker.boundedHistory` keeps a request within
-  `AGENT_MAX_HISTORY_CHARACTERS` (default `16000`; `disabled` keeps everything). It never drops the system
-  prompt or the task prompt (which carries the repository map), replaces the dropped exchanges with one
-  note that a re-read is allowed, and never separates a `tool` message from the assistant call it answers
-  (an orphaned `tool` message is invalid for OpenAI-compatible APIs). Truncation is logged, not hidden.
-  The default is deliberately conservative; set it below the provider's per-request limit minus the fixed
-  prompt.
+- **Decision.** `TaskExecutionWorker.boundedHistory` keeps a request's tool history within
+  `AGENT_MAX_HISTORY_CHARACTERS` (default `24000`; `disabled` keeps everything). It never drops the system
+  prompt or the task prompt (which carries the repository map) and does not count them against the budget,
+  replaces the dropped exchanges with one note that a re-read is allowed, and never separates a `tool`
+  message from the assistant call it answers (an orphaned `tool` message is invalid for OpenAI-compatible
+  APIs). Truncation is logged, not hidden.
 
-### 6. A valid request rejected because the provider could not parse the model's output
+### 6. The first window size made the model loop instead of fixing the bug
+
+- **Symptom.** With the window at `16000` characters counted over the whole request, a run of the same
+  JSON-java task read `JSONObject.java` and `EnumTest.java`, lost whichever it had read first, read it
+  again, and repeated that until it died on the 24-tool-call limit — no patch, no validation.
+- **Evidence.** Task `7d1505a3-1cd3-4c1b-a74f-7d0e8b98054f`: 25 tool calls, all `list_files`/`read_file`/
+  `search_code`, with the log showing "dropped 9…20 older tool exchange(s)" on almost every turn and
+  `changedFiles=[]`. The two files total roughly 19,000 characters, so a whole-request budget of 16,000
+  could never hold both at once, and the repository map shrank the usable window further.
+- **Decision.** Count only the droppable tool history against the budget; the fixed prompts are bounded
+  separately and never eat the working set. Raise the default to `24000` so a realistic two-file working
+  set fits, while prompt plus history stays under Groq's 8000-token per-minute cap. The drop note now asks
+  the model not to re-read a file it has already seen and to read only the lines it needs.
+
+### 7. A valid request rejected because the provider could not parse the model's output
 
 - **Symptom.** A fresh run of the JSON-java task against `openai/gpt-oss-120b` failed with
   `HTTP 400 ... code: "output_parse_failed", "failed_generation": "We need to find writeValue method."`
@@ -95,7 +108,7 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   provider error honestly if the retries are exhausted. A malformed request carries neither code and
   still fails immediately. The retry keeps its own metrics reason (`provider_generation_error`).
 
-### 7. Observability
+### 8. Observability
 
 - Micrometer meters for model turns, retries, rate-limit waits, tool calls and task outcomes are exposed at
   `/q/metrics` through the framework-free `ExecutionMetrics` port, and were observed on a live run. Tags

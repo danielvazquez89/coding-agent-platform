@@ -43,8 +43,8 @@ class TaskExecutionWorker @Inject constructor(
     private val workerEnabled: Boolean = true,
     @ConfigProperty(name = "agent.execution.stale-attempt-timeout-seconds", defaultValue = "disabled")
     private val staleAttemptTimeoutSeconds: String = "disabled",
-    @ConfigProperty(name = "agent.model.max-history-characters", defaultValue = "16000")
-    private val maxHistoryCharacters: String = "16000"
+    @ConfigProperty(name = "agent.model.max-history-characters", defaultValue = "24000")
+    private val maxHistoryCharacters: String = "24000"
 ) {
     private val log = Logger.getLogger(TaskExecutionWorker::class.java)
 
@@ -500,32 +500,28 @@ class TaskExecutionWorker @Inject constructor(
 
     /**
      * Returns the messages a model request may carry, dropping the oldest tool exchanges when the
-     * conversation has outgrown [budgetCharacters]. The system prompt and the task prompt (which
-     * carries the repository map) are never dropped, and a dropped exchange is replaced by one note so
-     * the model knows a re-read is allowed. Tool results always stay with the assistant call they
-     * answer, because an orphaned `tool` message is rejected by OpenAI-compatible providers.
+     * accumulated history has outgrown [budgetCharacters]. The system prompt and the task prompt (which
+     * carries the repository map) are never dropped and are not counted against the budget: they are
+     * bounded separately, and a large repository map must not shrink the working set of files the model
+     * can hold at once. A dropped exchange is replaced by one note so the model knows a re-read is
+     * allowed. Tool results always stay with the assistant call they answer, because an orphaned `tool`
+     * message is rejected by OpenAI-compatible providers.
      */
     private fun boundedHistory(messages: List<ModelMessage>, budgetCharacters: Int): List<ModelMessage> {
         if (budgetCharacters <= 0 || messages.size <= FIXED_MESSAGE_COUNT) return messages
-        var total = messages.sumOf { it.estimatedCharacters() }
-        if (total <= budgetCharacters) return messages
-
         val head = messages.take(FIXED_MESSAGE_COUNT)
-        val headCharacters = head.sumOf { it.estimatedCharacters() }
-        if (headCharacters >= budgetCharacters) {
-            log.warnf(
-                "The fixed prompt is %d characters, at or above the %d character history budget; " +
-                    "the request may still exceed the provider limit",
-                headCharacters, budgetCharacters
-            )
-        }
+        val tail = messages.drop(FIXED_MESSAGE_COUNT)
+        var history = tail.sumOf { it.estimatedCharacters() }
+        // The note is added to the tail, so it has to fit the same budget.
+        val noteCharacters = HISTORY_DROP_NOTE.length
+        if (history + noteCharacters <= budgetCharacters) return messages
 
-        val blocks = exchangeBlocks(messages.drop(FIXED_MESSAGE_COUNT))
+        val blocks = exchangeBlocks(tail)
         var retained = blocks
         var droppedExchanges = 0
-        while (retained.size > 1 && total > budgetCharacters) {
+        while (retained.size > 1 && history + noteCharacters > budgetCharacters) {
             val dropped = retained.first()
-            total -= dropped.sumOf { it.estimatedCharacters() }
+            history -= dropped.sumOf { it.estimatedCharacters() }
             retained = retained.drop(1)
             droppedExchanges++
         }
@@ -971,8 +967,9 @@ class TaskExecutionWorker @Inject constructor(
         const val FIXED_MESSAGE_COUNT = 2
         const val TOOL_ROLE = "tool"
         const val HISTORY_DROP_NOTE =
-            "Earlier tool results were dropped from this conversation to stay inside the model's request limit. " +
-                "Read a file again with read_file if you still need its contents."
+            "Older tool results were dropped from this conversation to stay inside the model's request limit. " +
+                "Do not re-read a file whose contents you have already seen unless the change needs its current " +
+                "text; if you still need one, read only the lines you need with read_file's range."
 
         fun resolveHistoryBudget(configured: String): Int {
             val trimmed = configured.trim()

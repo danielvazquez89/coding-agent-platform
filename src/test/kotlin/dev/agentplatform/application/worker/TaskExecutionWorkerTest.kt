@@ -563,10 +563,47 @@ class TaskExecutionWorkerTest {
                 "tool result ${result.toolCallId} must answer a retained assistant tool call"
             )
         }
-        val characters = request.sumOf { message ->
+        val characters = request.drop(2).sumOf { message ->
             message.content.length + message.toolCalls.sumOf { it.name.length + it.arguments.toString().length }
         }
-        assertTrue(characters <= 5000, "the request ($characters characters) must fit the configured budget")
+        assertTrue(characters <= 5000, "the retained history ($characters characters) must fit the configured budget")
+    }
+
+    @Test
+    fun `keeps tool results that fit the history budget even though the fixed prompt is larger`() {
+        val criterion = "README lists the release notes"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        Files.writeString(temporary.resolve("First.java"), "A".repeat(2400))
+        Files.writeString(temporary.resolve("Second.java"), "B".repeat(2400))
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("read_file", """{"path":"First.java"}""")), "tool_calls", 10, 5),
+            ModelTurn(null, listOf(call("read_file", """{"path":"Second.java"}""")), "tool_calls", 10, 5),
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", 10, 5),
+            ModelTurn(
+                """{"summary":"Updated README","implementation":"Added the release notes.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"README lists them."}]}""",
+                emptyList(), "stop", 10, 5
+            )
+        )
+
+        worker(
+            FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("README.md")),
+            maxHistoryCharacters = "6000"
+        ).execute(task.id)
+
+        val request = provider.messages
+        assertTrue(request.any { it.role == "tool" && it.content.contains("AAAA") }, "the first read must be kept")
+        assertTrue(request.any { it.role == "tool" && it.content.contains("BBBB") }, "the second read must be kept")
+        assertTrue(request.none { it.role == "user" && it.content.contains("dropped from this conversation") })
     }
 
     @Test
@@ -1148,7 +1185,7 @@ class TaskExecutionWorkerTest {
         maxEstimatedCostUsd: Double = 1.0,
         workerEnabled: Boolean = true,
         staleAttemptTimeoutSeconds: String = "disabled",
-        maxHistoryCharacters: String = "16000"
+        maxHistoryCharacters: String = "24000"
     ): TaskExecutionWorker {
         val defaultValidationRunner = object : ValidationRunner {
             override fun validate(workspace: Path) = validation

@@ -154,8 +154,12 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
 - **A long task can outgrow the provider's per-request cap.** Pacing protects the rate, not the size of a
   single request; a hosted free tier answers an oversized request with HTTP 413 instead of throttling it.
   `TaskExecutionWorker.boundedHistory` drops the oldest tool exchanges beyond `AGENT_MAX_HISTORY_CHARACTERS`
-  (default `16000`, `disabled` to keep everything), always keeping the two fixed prompts and never
-  orphaning a `tool` message from its assistant call. Do not raise the cap above the provider's own limit.
+  (default `24000`, `disabled` to keep everything). The budget covers tool history only: the system and task
+  prompts are always kept and are **not** counted against it, because a large repository map must not shrink
+  the working set. A budget smaller than the files a task needs makes the model re-read whichever file was
+  dropped and can exhaust the tool-call limit, so keep it large enough for a task's working set while
+  prompt plus history stays under the provider's own limit. Never orphan a `tool` message from its
+  assistant call.
 - **Patch format differs by model family, and both common formats are accepted.** `apply_patch` takes a
   git unified diff, or the Codex `*** Begin Patch` / `*** Update File:` envelope that the OpenAI
   open-weight `gpt-oss` family emits. The envelope is converted to a unified diff first
