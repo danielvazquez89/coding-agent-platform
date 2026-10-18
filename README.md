@@ -46,9 +46,9 @@ trustworthy, auditable outcome rather than the best possible patch.
 
 The conservatism is deliberate:
 
-- **No shell and no network tool.** Every action is one of `list_files`, `search_code`, `read_file`,
-  `create_file`, `related_tests`, `apply_patch`, or `run_validation`; the application validates paths,
-  size, and changed-file count.
+- **No shell and no network tool.** Every action is one of `list_files`, `search_code`, `find_symbol`,
+  `read_file`, `create_file`, `related_tests`, `apply_patch`, or `run_validation`; the application
+  validates paths, size, and changed-file count.
 - **Honest completion.** A task reaches `COMPLETED` only when the workspace changed, every supplied
   acceptance criterion has an evidence-bearing passing assessment, and supported validation passed.
   Unknown outcomes stay `NEEDS_INPUT` or `FAILED`, never a pass. A final report that cannot be parsed as
@@ -56,7 +56,7 @@ The conservatism is deliberate:
   change; if it still cannot be parsed, every criterion stays unverified.
 - **Draft pull requests only.** Nothing merges, deploys, or writes to a default branch.
 
-The honest trade-off: this conservatism caps capability. A bounded seven-tool loop driven by a small local
+The honest trade-off: this conservatism caps capability. A bounded eight-tool loop driven by a small local
 model will fail on tasks a shell-enabled agent with a frontier model completes. The value here is the
 policy and verification substrate around the model. What has and has not been measured is in
 [Repeatable coding benchmark](#repeatable-coding-benchmark).
@@ -94,7 +94,7 @@ Models also differ in how they mark up changes, so `apply_patch` accepts both a 
 
 The current local default is Ollama with `qwen3:8b`. If needed, install it with `ollama pull qwen3:8b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL. Setting `AGENT_MODEL_PROVIDER=openai-compatible` switches to the hosted/OpenAI-compatible adapter instead; see the example in `.env.example`.
 
-The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `create_file`, `related_tests`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Reads are bounded (whole files to 50 KB, any single result to 12,000 characters), `read_file` takes a 1-based line range, and `search_code` and `list_files` accept a glob, a depth, and paginated limits so a large repository can be navigated without dumping it into the prompt. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff (with a truncation flag), validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, elapsed time, configured budgets, draft-PR reference/error, and per-tool audit summaries. Before an allowed tool runs, its invocation is committed to a separate audit-event table; after it returns, the event is updated with its outcome and duration. Events remain readable if the process stops before finalizing the attempt report. A `STARTED` event left after a crash means the operation's final outcome is unknown, not proof that it did or did not take effect. Audit records retain tool name, a redacted argument summary, outcome, duration, and a short result summary; they deliberately omit source contents, full patches, and tool outputs.
+The worker's tool allowlist is `list_files`, `search_code`, `find_symbol`, `read_file`, `create_file`, `related_tests`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Reads are bounded (whole files to 50 KB, any single result to 12,000 characters), `read_file` takes a 1-based line range, and `search_code`, `find_symbol` and `list_files` accept a glob, a depth, and paginated limits so a large repository can be navigated without dumping it into the prompt. `find_symbol` answers "where is this declared?" with `path:line` for declarations before other occurrences, a bounded line scan rather than a compiler, so a model can jump to a method deep inside a large file instead of reading it from the top. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff (with a truncation flag), validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, elapsed time, configured budgets, draft-PR reference/error, and per-tool audit summaries. Before an allowed tool runs, its invocation is committed to a separate audit-event table; after it returns, the event is updated with its outcome and duration. Events remain readable if the process stops before finalizing the attempt report. A `STARTED` event left after a crash means the operation's final outcome is unknown, not proof that it did or did not take effect. Audit records retain tool name, a redacted argument summary, outcome, duration, and a short result summary; they deliberately omit source contents, full patches, and tool outputs.
 
 `AGENT_MAX_TASK_DURATION_SECONDS` defaults to `1800`; `AGENT_MAX_TASK_COST_USD` defaults to `1.0`. Budgets are cumulative across completed attempts for one task, including clarification/resume attempts; queue waiting time is excluded. Time is checked between model/tool operations and after each model response; cost is checked against cumulative reported token usage after each response. These are operation-boundary guardrails, not hard preemptive ceilings: an in-progress operation is not forcibly interrupted when a limit is reached. Cost enforcement requires non-zero input/output rates (`AGENT_MODEL_INPUT_COST_PER_MILLION_USD` and `AGENT_MODEL_OUTPUT_COST_PER_MILLION_USD`) and reported token counts; if rates are set but current or prior token usage is unavailable, the attempt fails closed. Time enforcement also fails closed when prior attempt duration is unavailable. With the default zero rates, estimated cost is zero and the cost ceiling cannot represent actual inference costs. A worker that stops mid-attempt is reconciled rather than resumed: an attempt left `RUNNING` by a crashed or restarted worker is failed once it is older than `AGENT_STALE_ATTEMPT_TIMEOUT_SECONDS` (default: twice `AGENT_MAX_TASK_DURATION_SECONDS`), recording an explicit "outcome unknown" report so a task is never stuck in `RUNNING` and is never reported as a pass; retrying means creating a new task.
 
@@ -165,8 +165,8 @@ POST /api/tasks ──► QUEUED (persisted in PostgreSQL)
       bounded model/tool loop ─────────────────────────────────────────────────┐
         prompt: ranked repository map (BM25 + PageRank, token-budgeted)        │
         model proposes ─► application authorizes ─► audit ─► execute           │
-        tools: list_files · search_code · read_file · create_file ·            │
-               related_tests · apply_patch · run_validation                    │
+        tools: list_files · search_code · find_symbol · read_file ·                  │
+               create_file · related_tests · apply_patch · run_validation          │
                (Docker, offline `mvn -B -o test`)                              │
         limits: tool calls · elapsed time · estimated cost                     │
         ▲──────────────────────────────────────────────────────────────────────┘

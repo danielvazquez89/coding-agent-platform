@@ -137,7 +137,7 @@ class RepositoryMapBuilder(
 
     companion object {
         const val HEADER = "Repository map (ranked from the task text; a heuristic, not exhaustive):"
-        const val FOOTER = "Use read_file and search_code to confirm content before changing anything."
+        const val FOOTER = "Use find_symbol, read_file and search_code to confirm content before changing anything."
 
         private const val BM25_K1 = 1.2
         private const val BM25_B = 0.75

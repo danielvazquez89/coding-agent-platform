@@ -87,7 +87,8 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   heuristic, labelled as such in the prompt, bounded by file count/bytes, and fail-soft: a failure to
   build it must never fail a task.
 - Tool policy and path/patch checks: `infrastructure/tool/WorkspaceToolExecutor` (`list_files`,
-  `search_code`, `read_file`, `create_file`, `related_tests`, `apply_patch`, `run_validation`).
+  `search_code`, `find_symbol`, `read_file`, `create_file`, `related_tests`, `apply_patch`,
+  `run_validation`).
 - Patch export policy (task/attempt `COMPLETED`, all validation passed, one matching passing evidenced
   acceptance check per criterion, and the stored diff not truncated):
   `application/service/TaskAttemptService.exportablePatch`, served by `api/TaskResource` at

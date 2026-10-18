@@ -41,8 +41,8 @@ class WorkspaceToolExecutorTest {
         val tools = executor().definitions()
         assertEquals(
             listOf(
-                "list_files", "search_code", "read_file", "create_file", "related_tests", "apply_patch",
-                "run_validation"
+                "list_files", "search_code", "find_symbol", "read_file", "create_file", "related_tests",
+                "apply_patch", "run_validation"
             ),
             tools.map { it.name }
         )
@@ -71,6 +71,82 @@ class WorkspaceToolExecutorTest {
         assertEquals("No files found.", tools.execute("list_files", mapper.readTree("""{"path":"empty"}"""), root).content)
         assertThrows(IllegalArgumentException::class.java) {
             tools.execute("list_files", mapper.readTree("""{"path":"missing"}"""), root)
+        }
+    }
+
+    @Test
+    fun `finds declaration sites for a symbol by path and line`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src/main/java/dev/example"))
+        Files.createDirectories(root.resolve("src/main/kotlin/sample"))
+        Files.createDirectories(root.resolve("src/test/java/dev/example"))
+        Files.writeString(
+            root.resolve("src/main/java/dev/example/Writer.java"),
+            """
+            |package dev.example;
+            |
+            |public final class Writer {
+            |    private final StringBuilder buffer = new StringBuilder();
+            |
+            |    public static String writeValue(Object value) {
+            |        return render(value);
+            |    }
+            |}
+            |""".trimMargin() + "\n"
+        )
+        Files.writeString(
+            root.resolve("src/main/kotlin/sample/Sample.kt"),
+            """
+            |package sample
+            |
+            |fun writeValue(x: Int): Int {
+            |    return x
+            |}
+            |""".trimMargin() + "\n"
+        )
+        Files.writeString(
+            root.resolve("src/test/java/dev/example/WriterTest.java"),
+            """
+            |package dev.example;
+            |
+            |public class WriterTest {
+            |    void checks() {
+            |        Writer.writeValue(value);
+            |    }
+            |}
+            |""".trimMargin() + "\n"
+        )
+        val tools = executor()
+
+        val method = tools.execute("find_symbol", mapper.readTree("""{"name":"writeValue"}"""), root).content
+        assertTrue(method.contains("src/main/java/dev/example/Writer.java:6: [method]"), method)
+        assertTrue(method.contains("src/main/kotlin/sample/Sample.kt:3: [function]"), method)
+        assertTrue(method.contains("src/test/java/dev/example/WriterTest.java:5: [reference]"), method)
+        assertTrue(
+            method.indexOf("Writer.java:6") < method.indexOf("WriterTest.java:5"),
+            "a declaration must be listed before a reference: $method"
+        )
+
+        val type = tools.execute("find_symbol", mapper.readTree("""{"name":"Writer"}"""), root).content
+        assertTrue(type.contains("src/main/java/dev/example/Writer.java:3: [type]"), type)
+        val field = tools.execute("find_symbol", mapper.readTree("""{"name":"buffer"}"""), root).content
+        assertTrue(field.contains("src/main/java/dev/example/Writer.java:4: [field]"), field)
+
+        val bounded = tools.execute("find_symbol", mapper.readTree("""{"name":"writeValue","maxResults":1}"""), root).content
+        assertEquals(1, bounded.lines().count { it.trimStart().startsWith("src/") })
+
+        assertEquals(
+            "No declaration or occurrence of 'absentSymbol' found.",
+            tools.execute("find_symbol", mapper.readTree("""{"name":"absentSymbol"}"""), root).content
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("find_symbol", mapper.readTree("""{"name":"not a symbol"}"""), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("find_symbol", mapper.readTree("""{"name":"writeValue","path":"../"}"""), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("find_symbol", mapper.createObjectNode(), root)
         }
     }
 

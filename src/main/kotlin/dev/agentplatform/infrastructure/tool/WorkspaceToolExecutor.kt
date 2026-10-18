@@ -38,6 +38,7 @@ class WorkspaceToolExecutor(
     fun definitions(): List<ModelToolDefinition> = listOf(
         tool("list_files", "List repository files, optionally under a relative directory, filtered by a glob and a depth.", """{"type":"object","properties":{"path":{"type":"string"},"depth":{"type":"integer","minimum":1,"description":"Maximum directory levels below path. Omit for the whole tree."},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example **/*.kt or src/**/*.java."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 250, capped at 1000."}},"additionalProperties":false}"""),
         tool("search_code", "Search repository text line by line. The query is a literal unless regex is true. Results are paginated with offset and maxResults.", """{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example **/*.kt."},"regex":{"type":"boolean","description":"Treat the query as a Java regular expression. Invalid expressions are rejected."},"ignoreCase":{"type":"boolean","description":"Defaults to true."},"offset":{"type":"integer","minimum":0,"description":"Number of matches to skip. Defaults to 0."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 25, capped at 200."}},"required":["query"],"additionalProperties":false}"""),
+        tool("find_symbol", "Locate where a class, interface, enum, record, method, function or field is declared. Use this first when the task names an identifier or when the repository map points at a file: it returns path:line for declarations before other occurrences, so you can read only the surrounding lines. A bounded line scan, not a compiler; confirm the line before editing.", """{"type":"object","properties":{"name":{"type":"string","description":"A single identifier, for example writeValue or JSONObject."},"path":{"type":"string"},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example src/**/*.java."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 25, capped at 200."}},"required":["name"],"additionalProperties":false}"""),
         tool("read_file", "Read a UTF-8 text file, optionally a 1-based inclusive line range. A whole-file read is limited to 50 KB; larger files require a range. Output is capped at 12,000 characters.", """{"type":"object","properties":{"path":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}"""),
         tool("create_file", "Create a new UTF-8 text file with exactly the content given. Parent directories are created. Fails if the file already exists; use apply_patch to modify an existing file. The path must stay inside the repository.", """{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Exact file content. Include the trailing newline if the file should end with one."}},"required":["path","content"],"additionalProperties":false}"""),
         tool("related_tests", "List the test files that reference types declared in the given paths, using a bounded reference graph. Omit paths to use the files changed in the workspace.", """{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"Repository-relative paths. Omit to use git status."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 10, capped at 50."}},"additionalProperties":false}"""),
@@ -78,6 +79,15 @@ class WorkspaceToolExecutor(
                 arguments.path("regex").asBoolean(false),
                 arguments.path("ignoreCase").asBoolean(true),
                 intArgument(arguments, "offset", 0),
+                intArgument(arguments, "maxResults", SEARCH_MATCH_LIMIT)
+            )
+        )
+        "find_symbol" -> ToolExecutionResult(
+            findSymbol(
+                workspace,
+                requiredText(arguments, "name"),
+                arguments.path("path").asText(""),
+                arguments.path("glob").asText(""),
                 intArgument(arguments, "maxResults", SEARCH_MATCH_LIMIT)
             )
         )
@@ -159,6 +169,84 @@ class WorkspaceToolExecutor(
         }
         return (page.joinToString("\n") + footer).take(TOOL_OUTPUT_LIMIT)
     }
+
+    /**
+     * Finds declaration sites for an identifier with a bounded line scan, so a large file can be
+     * navigated by symbol instead of read from the top. Declarations are returned before other
+     * occurrences, and source files before tests. This is a heuristic, not a compiler: the caller is
+     * told to confirm the line, and no repository code is executed.
+     */
+    private fun findSymbol(workspace: Path, name: String, relative: String, glob: String, maxResults: Int): String {
+        require(SYMBOL_NAME.matches(name)) {
+            "Symbol name must be a single identifier of letters, digits, '_' or '$'"
+        }
+        val directory = resolve(workspace, relative, allowEmpty = true)
+        require(Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) { "Directory '$relative' does not exist" }
+        val matcher = globMatcher(glob)
+        val limit = maxResults.coerceIn(1, SEARCH_MATCH_LIMIT_MAX)
+        val word = Regex("""(^|[^\w$])${Regex.escape(name)}([^\w$]|$)""")
+        val declarations = mutableListOf<SymbolHit>()
+        val references = mutableListOf<SymbolHit>()
+        scan@ for (file in collectFiles(directory, SEARCH_FILE_LIMIT) { matchesGlob(matcher, workspace, it) }) {
+            if (Files.size(file) > SEARCH_FILE_SIZE_LIMIT) continue
+            val lines = try { Files.readAllLines(file) } catch (_: IOException) { continue }
+            val path = workspace.relativize(file).toString().replace('\\', '/')
+            val test = RepositoryFiles.isTestFile(path)
+            for (index in lines.indices) {
+                val line = lines[index]
+                if (!word.containsMatchIn(line)) continue
+                val kind = declarationKind(name, line)
+                val hit = SymbolHit(path, index + 1, kind, line.trim().take(300), test)
+                if (kind == REFERENCE_KIND) {
+                    if (references.size < SEARCH_SCAN_MATCH_LIMIT) references += hit
+                } else {
+                    declarations += hit
+                    if (declarations.size >= limit) break@scan
+                }
+            }
+        }
+        if (declarations.isEmpty() && references.isEmpty()) return "No declaration or occurrence of '$name' found."
+        val ordered = declarations.sortedWith(SYMBOL_HIT_ORDER) + references.sortedWith(SYMBOL_HIT_ORDER)
+        val page = ordered.take(limit)
+        val header = if (declarations.isEmpty()) {
+            "No declaration of '$name' matched the line scan; showing up to $limit occurrence(s) to inspect:"
+        } else {
+            "Declarations of '$name' (bounded line scan, a heuristic; confirm the line before editing):"
+        }
+        val body = page.joinToString("\n") { "  ${it.path}:${it.line}: [${it.kind}] ${it.text}" }
+        val footer = if (ordered.size > page.size) {
+            "\n(showing ${page.size} of ${ordered.size} matches; narrow with path or glob)"
+        } else {
+            ""
+        }
+        return (header + "\n" + body + footer).take(TOOL_OUTPUT_LIMIT)
+    }
+
+    /**
+     * Classifies one line that contains the symbol. Conservative on purpose: a line is a declaration
+     * only when it carries the syntax a declaration needs, so a call site is reported as a reference
+     * rather than pretending to be the definition.
+     */
+    private fun declarationKind(name: String, line: String): String {
+        val symbol = Regex.escape(name)
+        val trimmed = line.trim()
+        return when {
+            Regex("""(^|[^\w$])(class|interface|enum|record|object|trait|struct|typealias)\s+$symbol(\b|<)""")
+                .containsMatchIn(trimmed) -> "type"
+            Regex("""(^|[^\w$])fun\s+(<[^>]*>\s*)?$symbol\s*\(""").containsMatchIn(trimmed) -> "function"
+            Regex(
+                """(^|[^\w$])(public|private|protected|static|final|abstract|synchronized|native|default|""" +
+                    """override|internal|open|sealed|inline|operator|external|strictfp)\b[^=;{}]*\b$symbol\s*\("""
+            ).containsMatchIn(trimmed) -> "method"
+            Regex(
+                """(^|[^\w$])(public|private|protected|static|final|transient|volatile|val|var|const)\b""" +
+                    """[^;=(){}]*\b$symbol\s*(=|;|,|$)"""
+            ).containsMatchIn(trimmed) -> "field"
+            else -> REFERENCE_KIND
+        }
+    }
+
+    private data class SymbolHit(val path: String, val line: Int, val kind: String, val text: String, val test: Boolean)
 
     private fun readFile(workspace: Path, relative: String, startLine: Int?, endLine: Int?): String {
         val file = resolve(workspace, relative)
@@ -414,6 +502,9 @@ class WorkspaceToolExecutor(
         const val SEARCH_MATCH_LIMIT_MAX = 200
         const val SEARCH_SCAN_MATCH_LIMIT = 200
         const val SEARCH_PATTERN_LIMIT = 200
+        const val REFERENCE_KIND = "reference"
+        val SYMBOL_NAME = Regex("""[A-Za-z_$][A-Za-z0-9_$]*""")
+        val SYMBOL_HIT_ORDER = compareBy<SymbolHit>({ it.test }, { it.path }, { it.line })
         const val READ_FILE_SIZE_LIMIT = 50_000L
         const val READ_FILE_MAX_BYTES = 10L * 1024 * 1024
         const val CREATE_FILE_SIZE_LIMIT = 64_000

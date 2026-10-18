@@ -92,10 +92,12 @@ the cost ceiling cannot represent real inference spend.
 **Context:** Task text and repository files can carry prompt injection or hostile code, and the model
 proposes actions that could be destructive if taken literally.
 
-**Decision:** The model may only request `list_files`, `search_code`, `read_file`, `apply_patch`, and
-`run_validation`. The application authorizes every call: path checks keep reads and writes inside the
-workspace, patch size is bounded, and there is no shell, network, credential, or GitHub-write tool.
-The system prompt states the same policy, but policy is enforced in code, not by the prompt.
+**Decision:** The model may only request a tool from a fixed, code-owned allow-list — currently
+`list_files`, `search_code`, `find_symbol`, `read_file`, `create_file`, `related_tests`, `apply_patch`,
+and `run_validation` (the README holds the authoritative list). The application authorizes every call:
+path checks keep reads and writes inside the workspace, patch size is bounded, and there is no shell,
+network, credential, or GitHub-write tool. The system prompt states the same policy, but policy is
+enforced in code, not by the prompt.
 
 **Consequences:** The agent cannot do anything the application did not explicitly allow. New
 capabilities require a new allow-listed tool plus its authorizer and tests — never a generic "run

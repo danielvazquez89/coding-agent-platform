@@ -114,6 +114,23 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   `/q/metrics` through the framework-free `ExecutionMetrics` port, and were observed on a live run. Tags
   stay low-cardinality: no task ids, paths, tool output or prompt text.
 
+### 9. The models could not find the change site
+
+- **Symptom.** Runs E and F burned the whole tool budget exploring a few-hundred-file repository and never
+  proposed a patch. `writeValue` — the method the task is about — sits around line 3169 of
+  `JSONObject.java`, a file larger than the 50 KB whole-file read limit, and nothing told the model that
+  line.
+- **Root cause.** The repository map ranks files and names their types, but not the line of a method
+  declaration, and the system prompt told the model to start with `list_files` over the whole tree and
+  then read files — an expensive way to locate a symbol in a real repository.
+- **Decision.** Add the read-only `find_symbol` tool: a bounded line scan that returns `path:line` for
+  declarations before other occurrences (source before tests), classified as type/function/method/field
+  with everything else marked a reference, so the model can read only the surrounding lines. Change the
+  system prompt to locate first (`find_symbol`/`search_code`), read only that range, then patch. This is a
+  heuristic, labelled as such in the tool description, and it stays inside the existing allow-list, path
+  checks and output caps.
+- **Status.** Shipped. A further step — an explicit, auditable plan before the first patch — remains open.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -134,9 +151,10 @@ unavailable check was reported as a pass, every provider error was surfaced verb
 HTTP 413 and re-read loop were fixed and did not recur, and the generation-error retry visibly recovered
 attempts that previously died. What they also show is the real gap: on a free tier with a small
 per-request cap, both models spend their whole tool budget exploring a repository of a few hundred files
-and never propose a change. The next capability investment pointed at by this evidence is **localization**
-— symbol-level search and a short, explicit plan — not more retries. Hosted OpenAI API models
-(`gpt-4o`, `gpt-4.1`, the o-series) remain untested here: no key is available.
+and never propose a change. The first localization change from that evidence has shipped — the read-only
+`find_symbol` tool plus a locate-first system prompt (finding 9); an explicit, auditable plan step remains
+open. Hosted OpenAI API models (`gpt-4o`, `gpt-4.1`, the o-series) remain untested here: no key is
+available.
 
 ## Repository selection (the gate, in practice)
 
