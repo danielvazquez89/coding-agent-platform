@@ -273,6 +273,105 @@ class WorkspaceToolExecutorTest {
     }
 
     @Test
+    fun `filters file listings by glob and depth`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src/main/java"))
+        Files.createDirectories(root.resolve("src/test"))
+        Files.writeString(root.resolve("src/main/java/App.java"), "class App {}")
+        Files.writeString(root.resolve("src/test/AppTest.java"), "class AppTest {}")
+        Files.writeString(root.resolve("src/README.md"), "readme")
+        val tools = executor()
+
+        val shallow = tools.execute("list_files", mapper.readTree("""{"path":"src","depth":1}"""), root).content
+        assertTrue(shallow.contains("src/README.md"))
+        assertTrue(!shallow.contains("App.java"))
+
+        val globbed = tools.execute("list_files", mapper.readTree("""{"path":"src","glob":"**/*.java"}"""), root).content
+        assertTrue(globbed.contains("src/main/java/App.java"))
+        assertTrue(globbed.contains("src/test/AppTest.java"))
+        assertTrue(!globbed.contains("README.md"))
+
+        val capped = tools.execute("list_files", mapper.readTree("""{"path":"src","maxResults":1}"""), root).content
+        assertTrue(capped.startsWith("(showing first 1 files)"))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("list_files", mapper.readTree("""{"path":"src","glob":"["}"""), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("list_files", mapper.readTree("""{"path":"src","depth":0}"""), root)
+        }
+    }
+
+    @Test
+    fun `reads a line range and reports its bounds`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src"))
+        Files.writeString(root.resolve("src/Lines.kt"), (1..100).joinToString("\n") { "line $it" } + "\n")
+        val tools = executor()
+
+        val ranged = tools.execute(
+            "read_file",
+            mapper.readTree("""{"path":"src/Lines.kt","startLine":48,"endLine":50}"""),
+            root
+        ).content
+        assertTrue(ranged.startsWith("Lines 48-50 of 100 in src/Lines.kt:"))
+        assertEquals("line 48\nline 49\nline 50", ranged.substringAfter('\n'))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("read_file", mapper.readTree("""{"path":"src/Lines.kt","startLine":101}"""), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("read_file", mapper.readTree("""{"path":"src/Lines.kt","startLine":10,"endLine":9}"""), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("read_file", mapper.readTree("""{"path":"src/Lines.kt","startLine":"ten"}"""), root)
+        }
+    }
+
+    @Test
+    fun `searches with a regex, a glob and pagination`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src/main"))
+        Files.createDirectories(root.resolve("src/test"))
+        Files.writeString(root.resolve("src/main/Alpha.kt"), "val first = 1\nval second = 2\n")
+        Files.writeString(root.resolve("src/main/Beta.java"), "int third = 3;\n")
+        Files.writeString(root.resolve("src/test/AlphaTest.kt"), "val tested = 4\n")
+        val tools = executor()
+
+        val regex = tools.execute(
+            "search_code",
+            mapper.readTree("""{"query":"val (first|second)","regex":true,"path":"src"}"""),
+            root
+        ).content
+        assertTrue(regex.contains("src/main/Alpha.kt:1: val first = 1"))
+        assertTrue(regex.contains("src/main/Alpha.kt:2: val second = 2"))
+        assertTrue(!regex.contains("tested"))
+
+        val globbed = tools.execute(
+            "search_code",
+            mapper.readTree("""{"query":"val","glob":"**/*.kt","path":"src"}"""),
+            root
+        ).content
+        assertTrue(globbed.contains("AlphaTest.kt"))
+        assertTrue(!globbed.contains("Beta.java"))
+
+        val paged = tools.execute(
+            "search_code",
+            mapper.readTree("""{"query":"val","path":"src","maxResults":1,"offset":1}"""),
+            root
+        ).content.lines()
+        assertTrue(paged.first().contains("Alpha.kt:2"))
+        assertTrue(paged.last().startsWith("(showing matches 2-2; continue with offset=2)"))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("search_code", mapper.readTree("""{"query":"([","regex":true}"""), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("search_code", mapper.readTree("""{"query":"x","glob":"["}"""), root)
+        }
+    }
+
+    @Test
     fun `enforces file count and search limits while skipping oversized files`() {
         val root = repository()
         repeat(251) { index ->
@@ -290,13 +389,16 @@ class WorkspaceToolExecutorTest {
             mapper.readTree("""{"query":"match","path":"search"}"""),
             root
         ).content.lines()
-        assertEquals(25, matches.size)
-        assertTrue(matches.all { it.endsWith(": MATCH") })
+        assertEquals(26, matches.size)
+        assertTrue(matches.dropLast(1).all { it.endsWith(": MATCH") })
+        assertTrue(matches.last().startsWith("(showing matches 1-25; continue with offset=25)"))
 
         Files.writeString(root.resolve("read-limit.txt"), "x".repeat(20_000))
-        assertEquals(12_000, executor().execute(
+        val truncated = executor().execute(
             "read_file", mapper.readTree("""{"path":"read-limit.txt"}"""), root
-        ).content.length)
+        ).content
+        assertTrue(truncated.length <= 12_000)
+        assertTrue(truncated.endsWith("[truncated at 12000 characters; request a smaller line range]"))
     }
 
     @Test
