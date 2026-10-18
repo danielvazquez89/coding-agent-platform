@@ -97,6 +97,8 @@ class AgentWorkflowTestResource : QuarkusTestResourceLifecycleManager {
         }
         server.start()
         return mapOf(
+            // Tests script the Ollama protocol; never inherit a hosted provider from a developer's .env.
+            "agent.model.provider" to "ollama",
             "agent.model.ollama.base-url" to "http://127.0.0.1:${server.address.port}",
             "agent.execution.allowed-local-root" to AgentWorkflowTestSupport.allowedRepositoryRootPath().toString(),
             "agent.execution.workspace-root" to AgentWorkflowTestSupport.workspaceRootPath().toString(),

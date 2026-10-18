@@ -137,10 +137,13 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   guard: a large change is only reproducible through the draft pull request.
 - **Maven cache must be warm** for the fixture under test, or offline validation fails. The runner has a
   bounded dependency-fetch fallback, but it is not a substitute for a pre-populated `~/.m2/repository`.
-- **Patch format is model-family specific.** `apply_patch` accepts a git unified diff. The OpenAI
-  open-weight `gpt-oss` family emits the Codex `*** Begin Patch` / `*** Update File:` envelope instead,
-  which `git apply` rejects; the tool reports the rejection and the attempt ends honestly. Confirm a
-  candidate model with one small edit before using it for real work.
+- **Patch format differs by model family, and both common formats are accepted.** `apply_patch` takes a
+  git unified diff, or the Codex `*** Begin Patch` / `*** Update File:` envelope that the OpenAI
+  open-weight `gpt-oss` family emits. The envelope is converted to a unified diff first
+  (`CodexPatchNormalizer`); every hunk must match the file on disk exactly, paths and size limits are
+  unchanged, and a hunk that cannot be placed fails honestly instead of guessing. `*** Move to:` is
+  rejected. Keep the normalized result inside the existing checks; do not widen them to make a model's
+  output fit.
 - **Windows/interrupt branches and Kotlin synthetic default-argument branches** on data holders are not
   worth contriving tests for; the coverage gate already accounts for this.
 - The API and review page are **unauthenticated**; keep them on localhost or a trusted network.

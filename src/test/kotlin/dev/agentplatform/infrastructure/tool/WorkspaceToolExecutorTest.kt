@@ -173,6 +173,31 @@ class WorkspaceToolExecutorTest {
     }
 
     @Test
+    fun `applies a Codex envelope patch for the gpt-oss family`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src"))
+        Files.writeString(root.resolve("src/Hello.kt"), "old\n")
+        val envelope = """
+            |```text
+            |*** Begin Patch
+            |*** Update File: src/Hello.kt
+            |@@
+            |-old
+            |+new
+            |*** Add File: src/New.kt
+            |+package sample
+            |*** End Patch
+            |```
+            |""".trimMargin()
+
+        val result = executor().execute("apply_patch", mapper.createObjectNode().put("patch", envelope), root)
+
+        assertTrue(result.content.contains("Patch applied to 2 file(s)"))
+        assertEquals("new\n", Files.readString(root.resolve("src/Hello.kt")))
+        assertEquals("package sample\n", Files.readString(root.resolve("src/New.kt")))
+    }
+
+    @Test
     fun `returns validation outcomes and rejects model supplied extra commands`() {
         val check = ValidationCheck("Maven tests", "mvn test", CheckOutcome.PASSED, 0, "passed", 100)
         val tools = WorkspaceToolExecutor(object : ValidationRunner {

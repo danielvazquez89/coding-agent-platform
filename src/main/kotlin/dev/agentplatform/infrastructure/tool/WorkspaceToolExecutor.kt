@@ -18,11 +18,13 @@ class WorkspaceToolExecutor(
     private val commands: CommandExecutor,
     private val objectMapper: ObjectMapper
 ) {
+    private val codexPatches = CodexPatchNormalizer()
+
     fun definitions(): List<ModelToolDefinition> = listOf(
         tool("list_files", "List repository files, optionally under a relative directory.", """{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}"""),
         tool("search_code", "Search repository text for a literal query, optionally under a relative directory.", """{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"}},"required":["query"],"additionalProperties":false}"""),
         tool("read_file", "Read one small UTF-8 text file by its repository-relative path.", """{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}"""),
-        tool("apply_patch", "Apply a complete git-compatible unified diff to repository files. Include diff --git, --- and +++ file headers and valid hunk ranges; do not include Markdown fences. Patch paths must stay inside the repository.", """{"type":"object","properties":{"patch":{"type":"string","description":"Complete git-compatible unified diff including diff --git, --- and +++ file headers; no Markdown fences."}},"required":["patch"],"additionalProperties":false}"""),
+        tool("apply_patch", "Apply a patch to repository files. Use either a complete git-compatible unified diff (diff --git, --- and +++ headers, valid hunk ranges) or the Codex envelope (*** Begin Patch, *** Update File:/*** Add File:/*** Delete File:, @@ hunks, *** End Patch). Do not include Markdown fences. Patch paths must stay inside the repository.", """{"type":"object","properties":{"patch":{"type":"string","description":"A git-compatible unified diff or a Codex *** Begin Patch envelope; no Markdown fences."}},"required":["patch"],"additionalProperties":false}"""),
         tool("run_validation", "Run the repository's Maven tests in a disposable, resource-limited Docker container.", """{"type":"object","properties":{},"additionalProperties":false}""")
     )
 
@@ -77,7 +79,8 @@ class WorkspaceToolExecutor(
     private fun applyPatch(workspace: Path, patch: String): String {
         require(patch.isNotBlank()) { "Patch must not be blank" }
         require(patch.length <= PATCH_SIZE_LIMIT) { "Patch exceeds the ${PATCH_SIZE_LIMIT / 1024} KB limit" }
-        val normalized = sanitizePatch(patch)
+        val sanitized = sanitizePatch(patch)
+        val normalized = codexPatches.normalize(sanitized, workspace) ?: sanitized
         val paths = normalized.lineSequence().filter { it.startsWith("+++ ") || it.startsWith("--- ") }
             .map { it.substring(4).substringBefore('\t').trim() }
             .filterNot { it == "/dev/null" }
