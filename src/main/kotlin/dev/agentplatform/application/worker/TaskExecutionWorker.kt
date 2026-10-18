@@ -42,9 +42,19 @@ class TaskExecutionWorker @Inject constructor(
     @ConfigProperty(name = "agent.execution.worker.enabled", defaultValue = "true")
     private val workerEnabled: Boolean = true,
     @ConfigProperty(name = "agent.execution.stale-attempt-timeout-seconds", defaultValue = "disabled")
-    private val staleAttemptTimeoutSeconds: String = "disabled"
+    private val staleAttemptTimeoutSeconds: String = "disabled",
+    @ConfigProperty(name = "agent.model.max-history-characters", defaultValue = "16000")
+    private val maxHistoryCharacters: String = "16000"
 ) {
     private val log = Logger.getLogger(TaskExecutionWorker::class.java)
+
+    /**
+     * Characters of conversation history the model may see in one request; `disabled` keeps every tool
+     * result. Providers cap a single request (Groq's free tier rejects anything over its per-minute
+     * token limit with HTTP 413), and the tool loop appends one result per call, so an unbounded
+     * history eventually makes every request impossible. 0 disables trimming.
+     */
+    private val historyBudgetCharacters: Int = resolveHistoryBudget(maxHistoryCharacters)
 
     /**
      * How long an attempt may stay RUNNING without completing before it is treated as orphaned by a
@@ -358,8 +368,9 @@ class TaskExecutionWorker @Inject constructor(
         repeat(maxToolCalls + MAX_PATCH_FAILURE_RETRIES + MAX_REPORT_FORMAT_RETRIES + 4) {
             checkBudget(trace.startedAtNanos, trace)
             val modelCallStartedAt = System.nanoTime()
+            val requestMessages = boundedHistory(messages, historyBudgetCharacters)
             val turn = try {
-                model.chat(messages, definitions)
+                model.chat(requestMessages, definitions)
             } catch (failure: Exception) {
                 trace.recordModelFailure(elapsedMillis(modelCallStartedAt))
                 throw failure
@@ -486,6 +497,61 @@ class TaskExecutionWorker @Inject constructor(
         }
         throw IllegalStateException("The model did not finish within the configured tool-call limit")
     }
+
+    /**
+     * Returns the messages a model request may carry, dropping the oldest tool exchanges when the
+     * conversation has outgrown [budgetCharacters]. The system prompt and the task prompt (which
+     * carries the repository map) are never dropped, and a dropped exchange is replaced by one note so
+     * the model knows a re-read is allowed. Tool results always stay with the assistant call they
+     * answer, because an orphaned `tool` message is rejected by OpenAI-compatible providers.
+     */
+    private fun boundedHistory(messages: List<ModelMessage>, budgetCharacters: Int): List<ModelMessage> {
+        if (budgetCharacters <= 0 || messages.size <= FIXED_MESSAGE_COUNT) return messages
+        var total = messages.sumOf { it.estimatedCharacters() }
+        if (total <= budgetCharacters) return messages
+
+        val head = messages.take(FIXED_MESSAGE_COUNT)
+        val headCharacters = head.sumOf { it.estimatedCharacters() }
+        if (headCharacters >= budgetCharacters) {
+            log.warnf(
+                "The fixed prompt is %d characters, at or above the %d character history budget; " +
+                    "the request may still exceed the provider limit",
+                headCharacters, budgetCharacters
+            )
+        }
+
+        val blocks = exchangeBlocks(messages.drop(FIXED_MESSAGE_COUNT))
+        var retained = blocks
+        var droppedExchanges = 0
+        while (retained.size > 1 && total > budgetCharacters) {
+            val dropped = retained.first()
+            total -= dropped.sumOf { it.estimatedCharacters() }
+            retained = retained.drop(1)
+            droppedExchanges++
+        }
+        if (droppedExchanges == 0) return messages
+        log.warnf(
+            "Task conversation exceeded the %d character history budget; dropped %d older tool exchange(s)",
+            budgetCharacters, droppedExchanges
+        )
+        return head + ModelMessage("user", HISTORY_DROP_NOTE) + retained.flatten()
+    }
+
+    /**
+     * Groups messages so a tool result is never separated from the assistant tool call it answers.
+     * Every block starts with a non-`tool` message.
+     */
+    private fun exchangeBlocks(messages: List<ModelMessage>): List<List<ModelMessage>> {
+        val blocks = mutableListOf<MutableList<ModelMessage>>()
+        messages.forEach { message ->
+            if (message.role == TOOL_ROLE && blocks.isNotEmpty()) blocks.last() += message
+            else blocks += mutableListOf(message)
+        }
+        return blocks
+    }
+
+    private fun ModelMessage.estimatedCharacters(): Int =
+        content.length + toolCalls.sumOf { it.name.length + it.arguments.toString().length }
 
     private fun taskQuery(task: CodingTask): String = buildString {
         append(task.title).append('\n')
@@ -902,6 +968,22 @@ class TaskExecutionWorker @Inject constructor(
         const val MAX_PATCH_FAILURE_RETRIES = 3
         const val MAX_REPORT_FORMAT_RETRIES = 2
         const val DISABLED_SENTINEL = "disabled"
+        const val FIXED_MESSAGE_COUNT = 2
+        const val TOOL_ROLE = "tool"
+        const val HISTORY_DROP_NOTE =
+            "Earlier tool results were dropped from this conversation to stay inside the model's request limit. " +
+                "Read a file again with read_file if you still need its contents."
+
+        fun resolveHistoryBudget(configured: String): Int {
+            val trimmed = configured.trim()
+            if (trimmed.isEmpty() || trimmed.equals(DISABLED_SENTINEL, ignoreCase = true)) return 0
+            val characters = trimmed.toIntOrNull()
+                ?: throw IllegalArgumentException(
+                    "agent.model.max-history-characters must be a whole number of characters or 'disabled'"
+                )
+            require(characters > 0) { "agent.model.max-history-characters must be positive or 'disabled'" }
+            return characters
+        }
 
         fun resolveStaleAfter(configuredSeconds: String, maxDurationSeconds: Long): Duration {
             val trimmed = configuredSeconds.trim()

@@ -151,6 +151,11 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   guard: a large change is only reproducible through the draft pull request.
 - **Maven cache must be warm** for the fixture under test, or offline validation fails. The runner has a
   bounded dependency-fetch fallback, but it is not a substitute for a pre-populated `~/.m2/repository`.
+- **A long task can outgrow the provider's per-request cap.** Pacing protects the rate, not the size of a
+  single request; a hosted free tier answers an oversized request with HTTP 413 instead of throttling it.
+  `TaskExecutionWorker.boundedHistory` drops the oldest tool exchanges beyond `AGENT_MAX_HISTORY_CHARACTERS`
+  (default `16000`, `disabled` to keep everything), always keeping the two fixed prompts and never
+  orphaning a `tool` message from its assistant call. Do not raise the cap above the provider's own limit.
 - **Patch format differs by model family, and both common formats are accepted.** `apply_patch` takes a
   git unified diff, or the Codex `*** Begin Patch` / `*** Update File:` envelope that the OpenAI
   open-weight `gpt-oss` family emits. The envelope is converted to a unified diff first

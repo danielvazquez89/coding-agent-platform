@@ -515,6 +515,108 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `drops the oldest tool results when the conversation exceeds the history budget`() {
+        val criterion = "README lists the release notes"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        Files.writeString(temporary.resolve("First.java"), "A".repeat(6000))
+        Files.writeString(temporary.resolve("Second.java"), "B".repeat(200))
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("read_file", """{"path":"First.java"}""")), "tool_calls", 10, 5),
+            ModelTurn(null, listOf(call("read_file", """{"path":"Second.java"}""")), "tool_calls", 10, 5),
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", 10, 5),
+            ModelTurn(
+                """{"summary":"Updated README","implementation":"Added the release notes.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"README lists them."}]}""",
+                emptyList(), "stop", 10, 5
+            )
+        )
+
+        worker(
+            FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("README.md")),
+            maxHistoryCharacters = "5000"
+        ).execute(task.id)
+
+        val request = provider.messages
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertTrue(
+            request.none { it.role == "tool" && it.content.contains("AAAA") },
+            "the oldest read must be dropped before the request is sent"
+        )
+        assertTrue(
+            request.any { it.role == "tool" && it.content.contains("BBBB") },
+            "the newest read must be kept"
+        )
+        assertTrue(request.any { it.role == "user" && it.content.contains("dropped from this conversation") })
+        val assistantCallIds = request.filter { it.role == "assistant" }.flatMap { it.toolCalls }.map { it.id }.toSet()
+        request.filter { it.role == "tool" }.forEach { result ->
+            assertTrue(
+                assistantCallIds.contains(result.toolCallId),
+                "tool result ${result.toolCallId} must answer a retained assistant tool call"
+            )
+        }
+        val characters = request.sumOf { message ->
+            message.content.length + message.toolCalls.sumOf { it.name.length + it.arguments.toString().length }
+        }
+        assertTrue(characters <= 5000, "the request ($characters characters) must fit the configured budget")
+    }
+
+    @Test
+    fun `keeps every tool result when the history budget is disabled`() {
+        val criterion = "README lists the release notes"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        Files.writeString(temporary.resolve("First.java"), "A".repeat(6000))
+        Files.writeString(temporary.resolve("Second.java"), "B".repeat(6000))
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("read_file", """{"path":"First.java"}""")), "tool_calls", 10, 5),
+            ModelTurn(null, listOf(call("read_file", """{"path":"Second.java"}""")), "tool_calls", 10, 5),
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", 10, 5),
+            ModelTurn(
+                """{"summary":"Updated README","implementation":"Added the release notes.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"README lists them."}]}""",
+                emptyList(), "stop", 10, 5
+            )
+        )
+
+        worker(
+            FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("README.md")),
+            maxHistoryCharacters = "disabled"
+        ).execute(task.id)
+
+        val request = provider.messages
+        assertTrue(request.any { it.role == "tool" && it.content.contains("AAAA") })
+        assertTrue(request.any { it.role == "tool" && it.content.contains("BBBB") })
+        assertTrue(request.none { it.role == "user" && it.content.contains("dropped from this conversation") })
+    }
+
+    @Test
+    fun `rejects a history budget that is neither a number nor disabled`() {
+        assertThrows(IllegalArgumentException::class.java) {
+            worker(
+                FakeState(task()), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary),
+                maxHistoryCharacters = "plenty"
+            )
+        }
+    }
+
+    @Test
     fun `reruns validation when the model patches after a successful validation`() {
         val task = task()
         val attempts = FakeAttempts()
@@ -1045,7 +1147,8 @@ class TaskExecutionWorkerTest {
         maxDurationSeconds: Long = 1800,
         maxEstimatedCostUsd: Double = 1.0,
         workerEnabled: Boolean = true,
-        staleAttemptTimeoutSeconds: String = "disabled"
+        staleAttemptTimeoutSeconds: String = "disabled",
+        maxHistoryCharacters: String = "16000"
     ): TaskExecutionWorker {
         val defaultValidationRunner = object : ValidationRunner {
             override fun validate(workspace: Path) = validation
@@ -1058,7 +1161,7 @@ class TaskExecutionWorkerTest {
             state, attempts, TaskExecutionFinalizer(state, attempts, ExecutionMetrics.NONE), provider, workspaceFactory,
             toolExecutor, publisher, mapper, enabled, publishPullRequests, maxToolCalls,
             inputCostPerMillionUsd, outputCostPerMillionUsd, maxDurationSeconds, maxEstimatedCostUsd, workerEnabled,
-            staleAttemptTimeoutSeconds
+            staleAttemptTimeoutSeconds, maxHistoryCharacters
         )
     }
 
