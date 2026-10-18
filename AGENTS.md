@@ -115,6 +115,10 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   *environment* variables are treated as unset, so `SOME_ENV=""` in Compose is acceptable.
 - Fail closed: if a feature is configured but incomplete (e.g. a control-plane URL with no token),
   the adapter throws in `init` rather than running half-configured.
+- **A property key must start its own line.** `application.properties` is line-based, so a key appended to
+  the end of a comment is inert and the adapter's `@ConfigProperty(defaultValue = ...)` silently applies.
+  `ConfigurationCoverageTest` fails when an injected key has no entry in the file, but it cannot see a key
+  with a different name sharing a comment line — keep keys at column 1.
 - `%test` profile (`application.properties`) disables execution and the scheduler; integration tests
   opt back in per-class.
 
