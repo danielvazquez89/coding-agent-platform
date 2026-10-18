@@ -31,8 +31,6 @@ class TaskExecutionWorker @Inject constructor(
     private val pullRequestsEnabled: Boolean,
     @ConfigProperty(name = "agent.execution.max-tool-calls", defaultValue = "24")
     private val maxToolCalls: Int,
-    @ConfigProperty(name = "agent.model.ollama.model", defaultValue = "qwen3:8b")
-    private val modelName: String,
     @ConfigProperty(name = "agent.model.cost.input-per-million-usd", defaultValue = "0")
     private val inputCostPerMillionUsd: Double,
     @ConfigProperty(name = "agent.model.cost.output-per-million-usd", defaultValue = "0")
@@ -145,7 +143,7 @@ class TaskExecutionWorker @Inject constructor(
         val validation = mutableListOf<ValidationCheck>()
         val executionStartedAt = System.nanoTime()
         val trace = ExecutionTrace(
-            modelName, inputCostPerMillionUsd, outputCostPerMillionUsd,
+            model.modelName, inputCostPerMillionUsd, outputCostPerMillionUsd,
             task.id, attempt.id, executionStartedAt
         )
         try {
@@ -453,7 +451,10 @@ class TaskExecutionWorker @Inject constructor(
             }
             messages += ModelMessage("assistant", turn.content.orEmpty(), turn.toolCalls)
             toolResults.forEach { (call, result) ->
-                messages += ModelMessage("tool", result.content.take(MAX_TOOL_RESULT_CHARS), toolName = call.name)
+                messages += ModelMessage(
+                    "tool", result.content.take(MAX_TOOL_RESULT_CHARS),
+                    toolName = call.name, toolCallId = call.id
+                )
             }
         }
         throw IllegalStateException("The model did not finish within the configured tool-call limit")
@@ -685,8 +686,8 @@ class TaskExecutionWorker @Inject constructor(
     }.take(20_000)
 
     private fun parseReport(text: String): ParsedReport {
-        val json = try { objectMapper.readTree(text) } catch (_: Exception) { null }
-        if (json == null || !json.isObject) return ParsedReport(emptyList(), null, emptyList(), emptyList())
+        val json = extractReportJson(text)
+        if (json == null) return ParsedReport(emptyList(), null, emptyList(), emptyList())
         val implementation = json.path("implementation").textOrNull()
         val questions = json.path("openQuestions").takeIf(JsonNode::isArray)?.mapNotNull { node ->
             val question = node.path("question").textOrNull() ?: return@mapNotNull null
@@ -706,6 +707,54 @@ class TaskExecutionWorker @Inject constructor(
             AcceptanceCheck(criterion, outcome, node.path("evidence").textOrNull())
         }.orEmpty()
         return ParsedReport(questions, implementation, decisions, acceptanceChecks)
+    }
+
+    /**
+     * Models routinely wrap the final report in prose or a Markdown fence even when asked for a
+     * single JSON object. Prefer a bare object, then fall back to the last balanced object in the
+     * text. This only locates the payload; the honesty rules are applied afterwards, so a
+     * mis-located object can never turn an unverified criterion into a pass.
+     */
+    private fun extractReportJson(text: String): JsonNode? {
+        val direct = runCatching { objectMapper.readTree(text) }.getOrNull()
+        if (direct != null && direct.isObject) return direct
+        val candidate = lastJsonObject(text) ?: return null
+        return runCatching { objectMapper.readTree(candidate) }.getOrNull()?.takeIf(JsonNode::isObject)
+    }
+
+    private fun lastJsonObject(text: String): String? {
+        var depth = 0
+        var start = -1
+        var inString = false
+        var escaped = false
+        var last: String? = null
+        text.forEachIndexed { index, char ->
+            if (inString) {
+                when {
+                    escaped -> escaped = false
+                    char == '\\' -> escaped = true
+                    char == '"' -> inString = false
+                }
+                return@forEachIndexed
+            }
+            when (char) {
+                '"' -> if (depth > 0) inString = true
+                '{' -> {
+                    if (depth == 0) start = index
+                    depth++
+                }
+                '}' -> {
+                    if (depth > 0) {
+                        depth--
+                        if (depth == 0 && start >= 0) {
+                            last = text.substring(start, index + 1)
+                            start = -1
+                        }
+                    }
+                }
+            }
+        }
+        return last
     }
 
     private fun acceptanceChecks(task: CodingTask, reported: List<AcceptanceCheck>): List<AcceptanceCheck> {

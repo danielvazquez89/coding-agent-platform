@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode
 
 /** Model-provider boundary; orchestration and repository tools must not depend on a vendor API. */
 interface CodingModelProvider {
+    /** Identifier of the model the active provider calls, reported in execution results. */
+    val modelName: String
+
     fun chat(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): ModelTurn
 }
 
@@ -11,7 +14,9 @@ data class ModelMessage(
     val role: String,
     val content: String,
     val toolCalls: List<ModelToolCall> = emptyList(),
-    val toolName: String? = null
+    val toolName: String? = null,
+    /** Correlates a `tool` result with the assistant tool call it answers, required by OpenAI chat. */
+    val toolCallId: String? = null
 )
 
 data class ModelToolDefinition(

@@ -3,6 +3,8 @@ package dev.agentplatform.infrastructure.ollama
 import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.agentplatform.domain.port.*
+import dev.agentplatform.infrastructure.model.ContentToolCallExtractor
+import dev.agentplatform.infrastructure.model.OllamaModelProvider
 import jakarta.enterprise.context.ApplicationScoped
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import java.io.IOException
@@ -13,6 +15,7 @@ import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
 
+@OllamaModelProvider
 @ApplicationScoped
 class OllamaCodingModelProvider(
     @ConfigProperty(name = "agent.model.ollama.base-url", defaultValue = "http://localhost:11434")
@@ -23,6 +26,8 @@ class OllamaCodingModelProvider(
     private val timeoutSeconds: Long,
     private val objectMapper: ObjectMapper
 ) : CodingModelProvider {
+    override val modelName: String get() = model
+
     private val httpClient by lazy {
         HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(timeoutSeconds))
@@ -83,7 +88,11 @@ class OllamaCodingModelProvider(
             throw ModelProviderException("Ollama returned tool_calls in an invalid format")
         }
         val toolCalls = toolCallsNode.takeIf(JsonNode::isArray)?.map(::parseToolCall).orEmpty()
-        val contentToolCall = if (toolCalls.isEmpty()) parseContentToolCall(content, tools) else null
+        val contentToolCall = if (toolCalls.isEmpty()) {
+            ContentToolCallExtractor.extract(content, tools, objectMapper)
+        } else {
+            null
+        }
 
         return ModelTurn(
             content = content.takeIf { contentToolCall == null },
@@ -156,74 +165,7 @@ class OllamaCodingModelProvider(
         throw ModelProviderException("Ollama returned tool '$toolName' without object arguments")
     }
 
-    private fun parseContentToolCall(content: String?, tools: List<ModelToolDefinition>): ModelToolCall? {
-        if (content == null || tools.isEmpty()) return null
-        if (tools.any { it.name == "apply_patch" }) {
-            val diff = extractFencedGitDiff(content)
-            if (diff != null) {
-                val arguments = objectMapper.createObjectNode().put("patch", diff)
-                return ModelToolCall(UUID.randomUUID().toString(), "apply_patch", arguments)
-            }
-        }
-        val directCandidate = try { objectMapper.readTree(content) } catch (_: IOException) { null }
-        val candidates = sequenceOf(directCandidate).plus(embeddedJsonCandidates(content))
-        for (candidate in candidates) {
-            if (candidate == null || !candidate.isObject) continue
-            val name = candidate.path("name").takeIf(JsonNode::isTextual)?.asText() ?: continue
-            if (tools.none { it.name == name }) continue
-            val arguments = candidate.path("arguments")
-            if (!arguments.isObject) continue
-            return ModelToolCall(UUID.randomUUID().toString(), name, arguments)
-        }
-        return null
-    }
-
-    private fun extractFencedGitDiff(content: String): String? {
-        val match = FENCED_DIFF.find(content) ?: return null
-        val diff = match.groupValues[1].trimEnd()
-        if (!diff.startsWith("diff --git ")) return null
-        if (diff.lineSequence().none { it.startsWith("--- ") } || diff.lineSequence().none { it.startsWith("+++ ") }) return null
-        return diff
-    }
-
-    private fun embeddedJsonCandidates(content: String): Sequence<JsonNode?> = sequence {
-        for (start in content.indices) {
-            if (content[start] != '{') continue
-            var depth = 0
-            var inString = false
-            var escaped = false
-            for (index in start..content.lastIndex) {
-                val character = content[index]
-                if (inString) {
-                    when {
-                        escaped -> escaped = false
-                        character == '\\' -> escaped = true
-                        character == '"' -> inString = false
-                    }
-                    continue
-                }
-                when (character) {
-                    '"' -> inString = true
-                    '{' -> depth++
-                    '}' -> {
-                        depth--
-                        if (depth == 0) {
-                            val candidate = try {
-                                objectMapper.readTree(content.substring(start, index + 1))
-                            } catch (_: IOException) {
-                                null
-                            }
-                            yield(candidate)
-                            break
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     private companion object {
         const val MAX_ERROR_LENGTH = 1000
-        val FENCED_DIFF = Regex("```diff\\s*\\r?\\n(.*?)\\r?\\n```", RegexOption.DOT_MATCHES_ALL)
     }
 }

@@ -223,3 +223,29 @@ working tree is deliberately **not** provided; `COMPLETED` still means "patch pr
 report", not "applied anywhere". The three handoff routes — draft PR (primary), patch export (fallback),
 stored report (audit) — plus the execution flow and a verified Route B walkthrough are documented in
 [README](../README.md) under "From task to change" and "Handoff".
+
+---
+
+## ADR-0012 — Model provider is runtime-selectable; add an OpenAI-compatible adapter
+
+**Status:** Accepted (extends ADR-0004).
+
+**Context:** ADR-0004 kept model choice behind an SPI but shipped a single local backend. Using a
+stronger hosted model, or a local runtime that speaks the OpenAI contract, should not require a
+rebuild or a change to the worker.
+
+**Decision:** Keep `CodingModelProvider` provider-neutral and add
+`OpenAiCompatibleCodingModelProvider` (`infrastructure/openai`) for any server implementing OpenAI's
+`/chat/completions` contract (`messages` / `tools` / `tool_calls`, including the `tool_call_id` that
+links a tool result to its call). Select the active adapter at runtime from `agent.model.provider`
+(`ollama` or `openai-compatible`) through `SelectingCodingModelProvider`. The concrete adapters carry
+CDI qualifiers so the selector is the only bean a caller resolves through the plain interface. Both
+adapters share one content-based tool-request extractor. The reported model name comes from the active
+provider rather than a separate setting.
+
+**Consequences:** Switching between a local and a hosted model is a configuration change, and only the
+selected adapter is exercised. The unused adapter is inert, so an unconfigured endpoint cannot fail a
+run that uses the other provider; the selected adapter fails closed with an explicit reason when its
+endpoint or model is unset, and an unknown `agent.model.provider` value fails the deployment instead of
+silently defaulting. Hosted models add network egress and real spend: leave the adapter unselected for
+local-only operation, and set the per-million-token rates when a hosted model is used.

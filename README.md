@@ -4,7 +4,7 @@
 
 A Kotlin + Quarkus project for a controlled software engineering agent. The intended product takes a GitHub issue, inspects one repository, proposes a patch, runs validation in isolation, and opens a pull request for a person to review.
 
-The project runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks Ollama for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and validates Maven projects in a separate Docker container. The included Compose deployment separates the API/control plane from a resource-limited worker container; the worker has no Docker socket, and validation requests go through an authenticated, workspace-scoped control-plane endpoint. A local review page shows reports, diffs, validation, tool-audit events, and draft-PR links; a completed attempt's diff can also be exported as an applicable patch, and users can answer a `NEEDS_INPUT` question and queue a new attempt. Per-task time and estimated-cost limits are configurable. When explicitly enabled and configured for an allow-listed public GitHub repository, the worker can push a task branch and open a draft pull request after validation. GitHub issue ingestion and private-repository clone authentication are not implemented.
+The project runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks a configured model provider (local Ollama or any OpenAI-compatible endpoint) for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and validates Maven projects in a separate Docker container. The included Compose deployment separates the API/control plane from a resource-limited worker container; the worker has no Docker socket, and validation requests go through an authenticated, workspace-scoped control-plane endpoint. A local review page shows reports, diffs, validation, tool-audit events, and draft-PR links; a completed attempt's diff can also be exported as an applicable patch, and users can answer a `NEEDS_INPUT` question and queue a new attempt. Per-task time and estimated-cost limits are configurable. When explicitly enabled and configured for an allow-listed public GitHub repository, the worker can push a task branch and open a draft pull request after validation. GitHub issue ingestion and private-repository clone authentication are not implemented.
 
 > **Repository guides.** For an agent-oriented operating guide — build/test commands, the layer and
 > port/adapter map, conventions, invariants, and known pitfalls — see [`AGENTS.md`](AGENTS.md). The
@@ -36,7 +36,7 @@ trustworthy, auditable outcome rather than the best possible patch.
 
 | | Aider / OpenHands / SWE-agent | Commercial CLI agents | This project |
 | --- | --- | --- | --- |
-| Model | many, hosted or local | vendor models | any Ollama model behind one SPI, local-first |
+| Model | many, hosted or local | vendor models | any Ollama model or OpenAI-compatible endpoint behind one SPI |
 | Tools | shell, search, editors, plugins | shell, search, MCP, subagents | five allow-listed, path-checked tools, no shell |
 | Isolation | varies; some sandboxing | vendor-managed | disposable workspace plus an offline, capability-dropped validation container |
 | Audit trail | application logs | vendor logs | durable per-tool audit written **before** execution, plus task/attempt/state history |
@@ -77,9 +77,15 @@ policy and verification substrate around the model. What has and has not been me
 
 Create-task fields are `title`, `description`, `acceptanceCriteria` (optional list of up to 30 items, each at most 1000 characters), and `repositoryUrl` (required for execution). A task has a UUID, creation timestamp, and status. Acceptance criteria retain their input order. Transitions are enforced by the service and recorded with sequence number, prior/new status, optional reason, actor, and timestamp. The Quarkus scheduler polls every two seconds; each tick reconciles attempts orphaned by a stopped worker and then claims one queued task. In local development, the API process also runs the worker. In Compose, `control-plane` sets `AGENT_EXECUTION_WORKER_ENABLED=false` and the separate `worker` service enables it; database row locks prevent both processes from claiming the same task. Task creation returns `201` with `QUEUED`; the worker executes asynchronously after persistence. `AGENT_EXECUTION_ENABLED=false` disables execution, and Quarkus scheduler configuration can independently disable scheduled jobs. Every external setting is an environment variable with a default in `src/main/resources/application.properties`; optional values use the `disabled` sentinel.
 
-`CodingModelProvider` defines a provider-independent chat/tool-call contract. `OllamaCodingModelProvider` implements Ollama's `/api/chat` protocol, including structured assistant tool-call history and named tool-result messages, tool schemas, usage counts, timeouts, and bounded error messages. For models that return a JSON tool request in message content instead of Ollama's native `tool_calls`, it normalizes that response only when the requested tool was offered to the model. The adapter is configured with `OLLAMA_BASE_URL` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen3:8b`), and `OLLAMA_TIMEOUT_SECONDS` (default `1200`). It does not download models.
+`CodingModelProvider` defines a provider-independent chat/tool-call contract, and the active implementation is chosen at runtime by `AGENT_MODEL_PROVIDER` (`ollama`, the default, or `openai-compatible`). `OllamaCodingModelProvider` implements Ollama's `/api/chat` protocol, including structured assistant tool-call history and named tool-result messages, tool schemas, usage counts, timeouts, and bounded error messages. For models that return a JSON tool request in message content instead of Ollama's native `tool_calls`, it normalizes that response only when the requested tool was offered to the model. The adapter is configured with `OLLAMA_BASE_URL` (default `http://localhost:11434`), `OLLAMA_MODEL` (default `qwen3:8b`), and `OLLAMA_TIMEOUT_SECONDS` (default `1200`). It does not download models.
 
-The current local default is `qwen3:8b`. If needed, install it with `ollama pull qwen3:8b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL.
+`OpenAiCompatibleCodingModelProvider` targets any server that implements the OpenAI `/chat/completions` contract: OpenAI, OpenRouter, Groq, an Azure-style gateway, or a local runtime such as vLLM or llama.cpp. It sends and receives the standard `messages`/`tools`/`tool_calls` shapes (including the `tool_call_id` that links a tool result to its call) and reuses the same content-based tool-request recovery as the Ollama adapter. Configure `AGENT_OPENAI_BASE_URL` (the base includes the version segment, for example `https://api.openai.com/v1`), `AGENT_OPENAI_MODEL`, an optional `AGENT_OPENAI_API_KEY` (leave unset for a local server that needs no key), and `AGENT_OPENAI_TIMEOUT_SECONDS` (default `1200`). Both endpoint and model use the `disabled` sentinel until configured; selecting this provider without them fails the attempt with an explicit reason rather than making a half-configured call. Only the selected provider is exercised, so an unused adapter cannot fail a run, and the reported model name always comes from the active provider.
+
+Transient provider responses (HTTP 429 and 5xx) are retried with exponential backoff and jitter, honoring a numeric `Retry-After` header when the provider sends one, and controlled by `AGENT_OPENAI_RETRY_MAX_ATTEMPTS` (default `5`), `AGENT_OPENAI_RETRY_INITIAL_BACKOFF_MILLIS` (default `1000`), and `AGENT_OPENAI_RETRY_MAX_BACKOFF_MILLIS` (default `60000`). Non-transient errors such as `400` or `401` are never retried. This matters on hosted free tiers, whose per-minute token budgets are small enough that an unmodified agent loop fails mid-task: on Groq's free tier, four throttled calls in one run were absorbed by 23-32 second waits and the task still completed. The final response is reported as-is, so an exhausted retry budget still surfaces the provider's own error text.
+
+Models also differ in how they mark up changes. `apply_patch` accepts a complete git unified diff, and a rejected patch is returned to the model and recorded honestly rather than guessed at. Models that emit unified diffs work unchanged: with Groq, `qwen/qwen3.8-27b` applied a two-file change on its first attempt and passed Docker validation. OpenAI's open-weight `gpt-oss-120b` and `gpt-oss-20b` instead emit the Codex envelope (`*** Begin Patch`, `*** Update File:`, `*** End Patch`), which `git apply` rejects, so as things stand those models cannot land a change through this tool. That is a per-model property rather than a provider-wide rule, so check a candidate model with one small edit before relying on it.
+
+The current local default is Ollama with `qwen3:8b`. If needed, install it with `ollama pull qwen3:8b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL. Setting `AGENT_MODEL_PROVIDER=openai-compatible` switches to the hosted/OpenAI-compatible adapter instead; see the example in `.env.example`.
 
 The worker's tool allowlist is `list_files`, `search_code`, `read_file`, `apply_patch`, and `run_validation`; it offers no shell, arbitrary command, network, credential, or GitHub-write tool. Paths and patch size are checked by the application. Local repository access is disabled unless `AGENT_ALLOWED_LOCAL_ROOT` is configured; public GitHub HTTPS URLs are also accepted. A task report includes the observed outcome, model-provided narrative (explicitly marked as unverified), changed files, diff (with a truncation flag), validation outcomes, patch failures/recovery, acceptance checks, model token usage, estimated model cost, elapsed time, configured budgets, draft-PR reference/error, and per-tool audit summaries. Before an allowed tool runs, its invocation is committed to a separate audit-event table; after it returns, the event is updated with its outcome and duration. Events remain readable if the process stops before finalizing the attempt report. A `STARTED` event left after a crash means the operation's final outcome is unknown, not proof that it did or did not take effect. Audit records retain tool name, a redacted argument summary, outcome, duration, and a short result summary; they deliberately omit source contents, full patches, and tool outputs.
 
@@ -97,11 +103,11 @@ If branch push or PR creation fails, the task is marked `FAILED` with `pullReque
 
 Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and a read-only Maven cache volume. In Compose, the trusted control-plane container alone receives the Docker socket. The worker calls its authenticated validation endpoint; the control plane rejects workspace paths outside the shared workspace root, and the validator mounts only that attempt's named-volume subdirectory. Test and bounded dependency-fetch commands execute without external network access. Gradle, other build systems, and network-enabled builds are not supported.
 
-The worker container runs non-root with a read-only root filesystem, dropped Linux capabilities, no-new-privileges, a process limit, and CPU/memory limits. It has no Docker socket. The shared workspace and database are reachable by both services; the worker still has the application's database credentials, GitHub credentials when publishing is enabled, and outbound network access needed for GitHub/Ollama. Compose networking does not enforce a strict egress allowlist, and this deployment is not a hostile multi-tenant boundary. Keep it on a trusted host/network, use a narrowly scoped GitHub token, and do not grant production database access. The control-plane container runs as root to access the Docker socket, has Docker-daemon-equivalent privileges, and is bound to localhost by default; treat it as host-root.
+The worker container runs non-root with a read-only root filesystem, dropped Linux capabilities, no-new-privileges, a process limit, and CPU/memory limits. It has no Docker socket. The shared workspace and database are reachable by both services; the worker still has the application's database credentials, GitHub credentials when publishing is enabled, and outbound network access needed for GitHub and the configured model endpoint. Compose networking does not enforce a strict egress allowlist, and this deployment is not a hostile multi-tenant boundary. Keep it on a trusted host/network, use a narrowly scoped GitHub token, and do not grant production database access. The control-plane container runs as root to access the Docker socket, has Docker-daemon-equivalent privileges, and is bound to localhost by default; treat it as host-root.
 
 ### Containerized worker deployment
 
-The local `quarkus:dev` flow remains available. To run the separated worker/control-plane topology, use Docker Compose with a Linux Docker Engine (API 1.45+ for per-attempt volume subdirectory mounts) and an Ollama endpoint reachable from the worker:
+The local `quarkus:dev` flow remains available. To run the separated worker/control-plane topology, use Docker Compose with a Linux Docker Engine (API 1.45+ for per-attempt volume subdirectory mounts) and a model endpoint reachable from the worker:
 
 ```powershell
 Copy-Item .env.example .env
@@ -110,7 +116,7 @@ Copy-Item .env.example .env
 docker compose up --build
 ```
 
-The Compose file creates PostgreSQL, the control plane, and a separate worker. The control plane is available at <http://localhost:8081>; only it mounts `/var/run/docker.sock`. Both services share named workspace and Maven-cache volumes. `AGENT_CONTROL_PLANE_TOKEN` authenticates worker-to-control-plane validation requests. The app defaults it to a `disabled` sentinel so a local run needs no token, and configuring a control-plane URL without a real token fails closed at startup; Compose requires a real value; `AGENT_GITHUB_TOKEN` is configured only in the worker environment (never the API or validation containers) and is used only when publishing is enabled. The worker uses `OLLAMA_BASE_URL` (default `http://host.docker.internal:11434`). If Ollama is on the host, configure it to listen on an address reachable from Docker and use host firewall rules to limit access. Set `AGENT_GITHUB_PULL_REQUESTS_ENABLED=true` and configure an allowlisted repository/token in `.env` only when draft-PR publishing is intended. Do not commit `.env`.
+The Compose file creates PostgreSQL, the control plane, and a separate worker. The control plane is available at <http://localhost:8081>; only it mounts `/var/run/docker.sock`. Both services share named workspace and Maven-cache volumes. `AGENT_CONTROL_PLANE_TOKEN` authenticates worker-to-control-plane validation requests. The app defaults it to a `disabled` sentinel so a local run needs no token, and configuring a control-plane URL without a real token fails closed at startup; Compose requires a real value; `AGENT_GITHUB_TOKEN` is configured only in the worker environment (never the API or validation containers) and is used only when publishing is enabled. The worker uses `AGENT_MODEL_PROVIDER` (default `ollama`) and `OLLAMA_BASE_URL` (default `http://host.docker.internal:11434`); to use a hosted model instead, set `AGENT_MODEL_PROVIDER=openai-compatible` plus `AGENT_OPENAI_BASE_URL`, `AGENT_OPENAI_MODEL`, and `AGENT_OPENAI_API_KEY` (all passed through by `compose.yaml`). If Ollama is on the host, configure it to listen on an address reachable from Docker and use host firewall rules to limit access. Set `AGENT_GITHUB_PULL_REQUESTS_ENABLED=true` and configure an allowlisted repository/token in `.env` only when draft-PR publishing is intended. Do not commit `.env`.
 
 For this deployment, use public GitHub HTTPS repository URLs; local host paths are intentionally unavailable because no host source tree is mounted into the worker. `docker compose down` stops services but retains database and workspace volumes; `docker compose down -v` deletes that persisted data.
 
@@ -343,7 +349,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 │   Entities, value objects, lifecycle policy, ports (SPI) │
 ├──────────────────────────────────────────────────────────┤
 │                   infrastructure                         │
-│   Persistence, Ollama HTTP, Git workspaces, Docker,      │
+│   Persistence, model HTTP, Git workspaces, Docker,       │
 │   process execution, tool execution                      │
 └──────────────────────────────────────────────────────────┘
 ```
@@ -381,6 +387,8 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `infrastructure/persistence/ToolExecutionEventRepository.kt` — Ordered durable tool-event queries.
 - `infrastructure/persistence/TaskStatusTransitionRepository.kt` — Panache repository for ordered status history.
 - `infrastructure/ollama/OllamaCodingModelProvider.kt` — Ollama `/api/chat` HTTP adapter; implements `CodingModelProvider`.
+- `infrastructure/openai/OpenAiCompatibleCodingModelProvider.kt` — OpenAI `/chat/completions` HTTP adapter for hosted or local OpenAI-compatible endpoints; implements `CodingModelProvider`.
+- `infrastructure/model/SelectingCodingModelProvider.kt` — Runtime selection of the active provider from `agent.model.provider`, plus the CDI qualifiers that keep the concrete adapters off the plain `CodingModelProvider` type, and the shared content-based tool-request extractor.
 - `infrastructure/github/GitHubPullRequestPublisher.kt` — allowlisted branch push and GitHub draft-PR creation; implements `PullRequestPublisher`.
 - `infrastructure/workspace/GitRepositoryWorkspaceFactory.kt` — Authorized local/GitHub repository cloning into isolated workspaces; implements `RepositoryWorkspaceFactory`.
 - `infrastructure/tool/WorkspaceToolExecutor.kt` — Path-checked, allowlisted tool execution for the model loop.
@@ -409,6 +417,8 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `application/worker/TaskExecutionWorkerTest.kt` — Worker, model/tool loop, budget, and orphan-reaping tests.
 - `application/worker/TaskExecutionFinalizerTest.kt` — Finalizer state-update and orphan-failure tests.
 - `infrastructure/ollama/OllamaCodingModelProviderTest.kt` — Ollama adapter mock-HTTP tests.
+- `infrastructure/openai/OpenAiCompatibleCodingModelProviderTest.kt` — OpenAI-compatible adapter mock-HTTP tests (tool calls, `tool_call_id` threading, content fallback, auth header, fail-closed configuration).
+- `infrastructure/model/SelectingCodingModelProviderTest.kt` — Provider-selection routing and unknown-provider rejection tests.
 - `infrastructure/ExecutionControlHttpTest.kt` — Worker-to-control-plane HTTP contract and failure tests.
 - `infrastructure/workspace/GitRepositoryWorkspaceFactoryTest.kt` — Workspace cloning, safety, build-output exclusion, and diff-truncation tests.
 - `infrastructure/tool/WorkspaceToolExecutorTest.kt` — Path and patch safety tests.
@@ -417,7 +427,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `infrastructure/process/LocalCommandExecutorTest.kt` — Process execution tests.
 - `infrastructure/process/CommandFixture.kt` — Test helper for command execution.
 
-Task data, status history, attempts, and attempt reports are durable in PostgreSQL. Flyway creates and evolves the schema; Hibernate validates the mapped schema at startup rather than creating tables implicitly. Reports are stored as JSON text and include the generated patch diff (and whether it was truncated), validation details, failure and patch-recovery details, acceptance assessments, model usage, and any draft-PR reference/error. Estimated costs use optional configured per-million-token rates; they default to zero for local Ollama and are estimates, not provider invoices.
+Task data, status history, attempts, and attempt reports are durable in PostgreSQL. Flyway creates and evolves the schema; Hibernate validates the mapped schema at startup rather than creating tables implicitly. Reports are stored as JSON text and include the generated patch diff (and whether it was truncated), validation details, failure and patch-recovery details, acceptance assessments, model usage, and any draft-PR reference/error. Estimated costs use optional configured per-million-token rates; they default to zero for a local model and are estimates, not provider invoices.
 
 ## Open in IntelliJ IDEA
 
@@ -558,7 +568,7 @@ Client → Quarkus API → PostgreSQL (task + attempt)
                            ↓
                     RabbitMQ job message
                            ↓
-                    Worker process → model-provider interface → Ollama / controlled tools
+                    Worker process → model-provider interface → Ollama/OpenAI-compatible / controlled tools
                            ↓
                     PostgreSQL (progress, result, errors)
 ```
@@ -633,7 +643,7 @@ The source brief gives a strong direction, but leaves choices that affect implem
 
 - **Who submits tasks?** Start with the local REST API and one operator. Add authentication/authorization before exposing it beyond localhost or a trusted development network.
 - **Which repository is the first target?** Pick a small, disposable Kotlin/JVM sample repo with deterministic tests. Avoid proprietary or production repositories in the first evaluation set.
-- **Which model/provider?** The first adapter targets local Ollama by user choice, behind a provider interface. Select the local model after checking available RAM/GPU and test tool-call quality on a small benchmark. Revisit hosted providers only with an explicit usage budget.
+- **Which model/provider?** Local Ollama remains the default, and a hosted OpenAI-compatible adapter is available behind the same provider interface, selected with `AGENT_MODEL_PROVIDER`. Select the local model after checking available RAM/GPU and test tool-call quality on a small benchmark; use a hosted model only with an explicit usage budget and the per-million-token rates configured.
 - **How should builds access dependencies?** A fully offline sandbox is safer, but many builds need dependency downloads. Decide on a controlled artifact cache/proxy or an explicit network allowlist before enabling execution.
 - **How should GitHub authenticate?** The current opt-in publisher uses a fine-grained token restricted to an allow-listed repository. Prefer a GitHub App with installation-scoped permissions and short-lived credentials before offering webhook intake or a hosted service.
 - **Which language is in scope?** Start with one Kotlin/JVM repository and its existing build/test commands. Add language support only when the first workflow is measurable.
@@ -643,7 +653,7 @@ These choices can be discussed while implementing the worker; they do not need t
 
 ## Status and handoff for the next coding session
 
-- Ollama is the first model backend. The provider contract and HTTP adapter have mock-HTTP coverage; run the versioned benchmark before making model-quality claims.
+- The model provider is runtime-selectable: local Ollama (default) or any OpenAI-compatible endpoint, both behind one SPI with mock-HTTP coverage. Run the versioned benchmark before making model-quality claims.
 - The scheduled worker, fail-closed local repository-root configuration, tool allowlist, disposable repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, server-side patch export with truncation refusal, answer-and-requeue flow, local review page, durable per-tool audit events, cumulative task time/cost guardrails, bounded reconciliation of attempts orphaned by a crashed worker, container-separated worker/control-plane deployment, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. GitHub issue intake, private-repository clone authentication, strict egress controls, least-privilege worker database roles, and durable recovery from partial publication are not implemented. The Compose topology still needs execution and containment testing on the deployment host.
 - Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces a 95% line / 85% branch coverage gate for measured application code (see `pom.xml` for why a literal 100% is not required); the HTML report is generated under `target/site/jacoco`.
 - Local development expects PostgreSQL 18 with databases `coding_agent_platform` and `coding_agent_platform_test`, a limited login `coding_agent_app`, and the app role password in the ignored project `.env` (the app never uses administrator credentials).
@@ -653,5 +663,6 @@ These choices can be discussed while implementing the worker; they do not need t
 - Kotlin 2.4.10
 - Quarkus 3.40.1
 - REST with Jackson
+- Model providers: local Ollama (`/api/chat`) or any OpenAI-compatible endpoint (`/chat/completions`), selected at runtime
 - Maven wrapper (Maven 3.9.16)
 - Java bytecode target 21

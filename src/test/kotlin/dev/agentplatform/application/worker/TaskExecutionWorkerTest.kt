@@ -82,6 +82,7 @@ class TaskExecutionWorkerTest {
         assertEquals(42, report.modelUsage.promptTokens)
         assertEquals(18, report.modelUsage.completionTokens)
         assertEquals(0.000156, report.modelUsage.estimatedCostUsd)
+        assertEquals("qwen3:8b", report.modelUsage.model)
         assertEquals("Testing", report.decisions.single().topic)
         assertEquals(false, report.openQuestions.single().blocking)
         assertTrue(provider.messages.any { it.role == "tool" && it.content.contains("project context") })
@@ -90,6 +91,10 @@ class TaskExecutionWorkerTest {
         assertEquals("tool", provider.messages.last().role)
         assertEquals("apply_patch", provider.messages.last().toolName)
         assertTrue(provider.messages.last().content.contains("Patch applied"))
+        assertEquals(
+            provider.messages.filter { it.role == "assistant" && it.toolCalls.isNotEmpty() }.last().toolCalls.single().id,
+            provider.messages.last().toolCallId
+        )
         assertEquals(CheckOutcome.PASSED, report.validation.single().outcome)
         assertEquals(
             listOf("list_files", "search_code", "read_file", "apply_patch", "run_validation"),
@@ -108,6 +113,43 @@ class TaskExecutionWorkerTest {
         assertEquals("updated project context\n", Files.readString(temporary.resolve("README.md")))
         assertTrue(publisher.calls.isEmpty())
         assertTrue(workspace.closed)
+    }
+
+    @Test
+    fun `recovers a final report wrapped in prose and a markdown fence`() {
+        val criterion = "README includes the updated project context"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val state = FakeState(task)
+        val attempts = FakeAttempts()
+        val workspace = FakeWorkspace(temporary, listOf("README.md"))
+        Files.writeString(temporary.resolve("README.md"), "project context\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-project context",
+            "+updated project context"
+        ).joinToString("\n", postfix = "\n")
+        val reportJson =
+            """{"implementation":"Applied the change.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"README now reads updated project context."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn("Here is the report:\n```json\n$reportJson\n```\nDone.", emptyList(), "stop", 1, 1)
+        )
+        val worker = worker(state, attempts, provider, workspace)
+
+        assertTrue(worker.processNext())
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        val report = attempts.finishedReport!!
+        assertEquals(AcceptanceOutcome.PASSED, report.acceptanceChecks.single().outcome)
+        assertEquals("README now reads updated project context.", report.acceptanceChecks.single().evidence)
     }
 
     @Test
@@ -648,6 +690,7 @@ class TaskExecutionWorkerTest {
         val timeTask = task()
         val timeAttempts = FakeAttempts()
         val slowProvider = object : CodingModelProvider {
+            override val modelName: String = "qwen3:8b"
             override fun chat(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): ModelTurn {
                 Thread.sleep(1100)
                 return ModelTurn("No changes.", emptyList(), "stop", 1, 1)
@@ -657,7 +700,7 @@ class TaskExecutionWorkerTest {
             FakeState(timeTask), timeAttempts, TaskExecutionFinalizer(FakeState(timeTask), timeAttempts),
             slowProvider, object : RepositoryWorkspaceFactory {
                 override fun open(repositoryUrl: String) = FakeWorkspace(temporary)
-            }, tools(), FakePullRequestPublisher(), mapper, true, false, 5, "qwen3:8b", 0.0, 0.0,
+            }, tools(), FakePullRequestPublisher(), mapper, true, false, 5, 0.0, 0.0,
             maxDurationSeconds = 1
         )
         timeWorker.execute(timeTask.id)
@@ -687,7 +730,7 @@ class TaskExecutionWorkerTest {
             ScriptedProvider(), object : RepositoryWorkspaceFactory {
                 override fun open(repositoryUrl: String): RepositoryWorkspace =
                     throw IllegalArgumentException("invalid repository")
-            }, tools(), FakePullRequestPublisher(), mapper, true, false, 2, "qwen3:8b", 0.0, 0.0
+            }, tools(), FakePullRequestPublisher(), mapper, true, false, 2, 0.0, 0.0
         )
         badWorkspaceWorker.execute(badWorkspaceTask.id)
         assertEquals(TaskStatus.FAILED, badWorkspaceTask.status)
@@ -707,7 +750,6 @@ class TaskExecutionWorkerTest {
                 true,
                 false,
                 0,
-                "qwen3:8b",
                 0.0,
                 0.0
             )
@@ -773,7 +815,6 @@ class TaskExecutionWorkerTest {
             true,
             false,
             5,
-            "qwen3:8b",
             0.0,
             0.0
         ).poll()
@@ -930,7 +971,7 @@ class TaskExecutionWorkerTest {
         }
         return TaskExecutionWorker(
             state, attempts, TaskExecutionFinalizer(state, attempts), provider, workspaceFactory,
-            toolExecutor, publisher, mapper, enabled, publishPullRequests, maxToolCalls, "qwen3:8b",
+            toolExecutor, publisher, mapper, enabled, publishPullRequests, maxToolCalls,
             inputCostPerMillionUsd, outputCostPerMillionUsd, maxDurationSeconds, maxEstimatedCostUsd, workerEnabled,
             staleAttemptTimeoutSeconds
         )
@@ -957,6 +998,7 @@ class TaskExecutionWorkerTest {
 
     private inner class ScriptedProvider(vararg turns: ModelTurn, private val failure: Exception? = null) :
         CodingModelProvider {
+        override val modelName: String = "qwen3:8b"
         private val results = turns.toMutableList()
         var calls = 0
         val messages = mutableListOf<ModelMessage>()

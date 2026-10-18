@@ -9,8 +9,9 @@ fast path to **building, changing, testing, and verifying** code without breakin
 
 A Kotlin + Quarkus service that runs a bounded, asynchronous coding-agent workflow: a task is
 persisted in PostgreSQL, a scheduled worker opens a disposable Git workspace, runs an allow-listed
-model/tool loop against Ollama, applies a patch, validates Maven tests in an isolated Docker
-container, and stores an honest attempt report. Optional draft-PR publishing targets allow-listed
+model/tool loop against a configured model provider (local Ollama or an OpenAI-compatible endpoint),
+applies a patch, validates Maven tests in an isolated Docker container, and stores an honest attempt
+report. Optional draft-PR publishing targets allow-listed
 public GitHub repositories. See README for the product surface.
 
 ## Golden rules (do not break these)
@@ -59,12 +60,12 @@ $env:DB_PASSWORD = (Get-Content .env | ConvertFrom-StringData).DB_PASSWORD
 api             REST resources, DTOs, input validation            (inbound adapters)
 application     use-case services, worker loop, finalizer          (orchestration)
 domain          entities, value objects, lifecycle, ports (SPI)    (no framework deps)
-infrastructure  persistence, Ollama, Git, Docker, process, tools   (outbound adapters)
+infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outbound adapters)
 ```
 
 | Port (in `domain/port`) | Adapter (in `infrastructure`) | Adapter test |
 | --- | --- | --- |
-| `CodingModelProvider` | `ollama/OllamaCodingModelProvider` | `ollama/OllamaCodingModelProviderTest` |
+| `CodingModelProvider` | `model/SelectingCodingModelProvider` → `ollama/OllamaCodingModelProvider` or `openai/OpenAiCompatibleCodingModelProvider` (by `agent.model.provider`) | `ollama/OllamaCodingModelProviderTest`, `openai/OpenAiCompatibleCodingModelProviderTest`, `model/SelectingCodingModelProviderTest` |
 | `RepositoryWorkspaceFactory`, `RepositoryWorkspace` | `workspace/GitRepositoryWorkspaceFactory` | `workspace/GitRepositoryWorkspaceFactoryTest` |
 | `CommandExecutor` | `process/LocalCommandExecutor` | `process/LocalCommandExecutorTest` |
 | `ValidationRunner` | `docker/DockerValidationRunner` (or `ExecutionControlHttp` via the gateway) | `docker/DockerValidationRunnerTest`, `ExecutionControlHttpTest` |
@@ -136,6 +137,10 @@ infrastructure  persistence, Ollama, Git, Docker, process, tools   (outbound ada
   guard: a large change is only reproducible through the draft pull request.
 - **Maven cache must be warm** for the fixture under test, or offline validation fails. The runner has a
   bounded dependency-fetch fallback, but it is not a substitute for a pre-populated `~/.m2/repository`.
+- **Patch format is model-family specific.** `apply_patch` accepts a git unified diff. The OpenAI
+  open-weight `gpt-oss` family emits the Codex `*** Begin Patch` / `*** Update File:` envelope instead,
+  which `git apply` rejects; the tool reports the rejection and the attempt ends honestly. Confirm a
+  candidate model with one small edit before using it for real work.
 - **Windows/interrupt branches and Kotlin synthetic default-argument branches** on data holders are not
   worth contriving tests for; the coverage gate already accounts for this.
 - The API and review page are **unauthenticated**; keep them on localhost or a trusted network.
