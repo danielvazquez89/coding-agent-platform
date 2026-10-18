@@ -1,11 +1,8 @@
 package dev.agentplatform.infrastructure.retrieval
 
 import org.eclipse.microprofile.config.ConfigProvider
-import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.Path
-import java.nio.file.SimpleFileVisitor
-import java.nio.file.attribute.BasicFileAttributes
 import kotlin.math.ln
 
 /**
@@ -31,7 +28,7 @@ class RepositoryMapBuilder(
     fun build(workspace: Path, query: String): String {
         if (!enabled || maxTokens <= 0 || maxEntries <= 0) return ""
         if (!Files.isDirectory(workspace)) return ""
-        val files = collect(workspace)
+        val files = RepositoryFiles.walk(workspace, maxIndexedFiles, maxFileBytes, maxIndexedBytes)
         if (files.isEmpty()) return ""
         val documents = index(workspace, files)
         if (documents.isEmpty()) return ""
@@ -51,31 +48,6 @@ class RepositoryMapBuilder(
         }
     }
 
-    private fun collect(workspace: Path): List<Path> {
-        val files = mutableListOf<Path>()
-        var bytes = 0L
-        Files.walkFileTree(workspace, object : SimpleFileVisitor<Path>() {
-            override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult =
-                if (dir.fileName?.toString() in IGNORED_DIRECTORIES || Files.isSymbolicLink(dir)) {
-                    FileVisitResult.SKIP_SUBTREE
-                } else {
-                    FileVisitResult.CONTINUE
-                }
-
-            override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                if (files.size >= maxIndexedFiles || bytes >= maxIndexedBytes) return FileVisitResult.TERMINATE
-                if (!attrs.isRegularFile || Files.isSymbolicLink(file) || attrs.size() > maxFileBytes) {
-                    return FileVisitResult.CONTINUE
-                }
-                if (looksBinary(file)) return FileVisitResult.CONTINUE
-                files.add(file)
-                bytes += attrs.size()
-                return FileVisitResult.CONTINUE
-            }
-        })
-        return files.sortedBy { it.toString() }
-    }
-
     private fun index(workspace: Path, files: List<Path>): List<Document> = files.mapNotNull { file ->
         val text = try {
             Files.readString(file)
@@ -85,7 +57,7 @@ class RepositoryMapBuilder(
         val tokens = tokenize(text)
         if (tokens.isEmpty()) return@mapNotNull null
         Document(
-            path = workspace.relativize(file).toString().replace('\\', '/'),
+            path = RepositoryFiles.relative(workspace, file),
             frequencies = tokens.groupingBy { it }.eachCount(),
             length = tokens.size,
             symbols = symbols(text),
@@ -153,15 +125,6 @@ class RepositoryMapBuilder(
             "${entry.document.path} - ${entry.document.symbols.joinToString(", ")}"
         }
 
-    private fun looksBinary(file: Path): Boolean {
-        if (Files.size(file) == 0L) return false
-        return Files.newInputStream(file).use { input ->
-            val buffer = ByteArray(minOf(8192L, Files.size(file)).toInt())
-            val read = input.read(buffer)
-            read > 0 && buffer.copyOf(read).any { it == 0.toByte() }
-        }
-    }
-
     private data class Document(
         val path: String,
         val frequencies: Map<String, Int>,
@@ -190,10 +153,6 @@ class RepositoryMapBuilder(
             """\b(?:enum\s+class|class|interface|object|record|fun|typealias|void)\s+([A-Za-z_][A-Za-z0-9_]*)"""
         )
         private val REFERENCED = Regex("""\b[A-Z][A-Za-z0-9_]*\b""")
-
-        private val IGNORED_DIRECTORIES = setOf(
-            ".git", "target", "build", "out", "dist", ".gradle", ".idea", "node_modules", ".venv", "vendor"
-        )
 
         private val STOPWORDS = setOf(
             "the", "and", "for", "with", "that", "this", "from", "into", "then", "than", "there", "their",
@@ -264,6 +223,6 @@ class RepositoryMapBuilder(
         private fun symbols(text: String): List<String> =
             SYMBOL.findAll(text).map { it.groupValues[1] }.distinct().take(SYMBOL_LIMIT).toList()
 
-        private fun stem(path: String): String = path.substringAfterLast('/').substringBeforeLast('.')
+        private fun stem(path: String): String = RepositoryFiles.stem(path)
     }
 }

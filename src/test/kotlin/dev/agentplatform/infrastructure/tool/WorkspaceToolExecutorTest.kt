@@ -37,7 +37,10 @@ class WorkspaceToolExecutorTest {
     fun `offers only the bounded workspace tools`() {
         val tools = executor().definitions()
         assertEquals(
-            listOf("list_files", "search_code", "read_file", "create_file", "apply_patch", "run_validation"),
+            listOf(
+                "list_files", "search_code", "read_file", "create_file", "related_tests", "apply_patch",
+                "run_validation"
+            ),
             tools.map { it.name }
         )
         assertTrue(tools.all { it.parameters.path("additionalProperties").asBoolean() == false })
@@ -326,6 +329,12 @@ class WorkspaceToolExecutorTest {
         assertThrows(IllegalArgumentException::class.java) {
             tools.execute("read_file", mapper.readTree("""{"path":"src/Lines.kt","startLine":"ten"}"""), root)
         }
+        val wholeFile = tools.execute(
+            "read_file",
+            mapper.readTree("""{"path":"src/Lines.kt","startLine":null}"""),
+            root
+        ).content
+        assertTrue(wholeFile.startsWith("line 1\nline 2"))
     }
 
     @Test
@@ -368,6 +377,33 @@ class WorkspaceToolExecutorTest {
         }
         assertThrows(IllegalArgumentException::class.java) {
             tools.execute("search_code", mapper.readTree("""{"query":"x","glob":"["}"""), root)
+        }
+
+        val caseSensitive = tools.execute(
+            "search_code",
+            mapper.readTree("""{"query":"VAL","ignoreCase":false,"path":"src"}"""),
+            root
+        ).content
+        assertTrue(caseSensitive.startsWith("No matches found"))
+
+        val past = tools.execute(
+            "search_code",
+            mapper.readTree("""{"query":"val","offset":50}"""),
+            root
+        ).content
+        assertTrue(past.startsWith("No matches at offset 50"))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("search_code", mapper.readTree("""{"query":"val","path":"src/main/Alpha.kt"}"""), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("search_code", mapper.readTree("""{"query":"val","offset":-1}"""), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("search_code", mapper.readTree("""{"query":"val","offset":1000}"""), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("search_code", mapper.createObjectNode().put("query", "v".repeat(201)), root)
         }
     }
 
@@ -452,6 +488,86 @@ class WorkspaceToolExecutorTest {
             tools.execute("apply_patch", mapper.createObjectNode().put("patch", patch), root)
         }
         assertTrue(failure.message.orEmpty().contains("Patch application failed: write failed"))
+    }
+
+    @Test
+    fun `finds tests that reference the changed files`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src/main"))
+        Files.createDirectories(root.resolve("src/test"))
+        Files.writeString(root.resolve("src/main/FooService.kt"), "class FooService { fun run() = 1 }\n")
+        Files.writeString(
+            root.resolve("src/test/FooServiceTest.kt"),
+            "class FooServiceTest { private val service = FooService() }\n"
+        )
+        val git = LocalCommandExecutor()
+        check(git.run(listOf("git", "add", "--all"), root, timeout = Duration.ofSeconds(20)).exitCode == 0)
+        check(
+            git.run(
+                listOf("git", "commit", "-m", "add service and test"),
+                root,
+                timeout = Duration.ofSeconds(20)
+            ).exitCode == 0
+        )
+        Files.writeString(root.resolve("src/main/FooService.kt"), "class FooService { fun run() = 2 }\n")
+        val tools = executor()
+
+        val changed = tools.execute("related_tests", mapper.createObjectNode(), root)
+        assertTrue(changed.content.contains("Tests that reference the changed types"))
+        assertTrue(changed.content.contains("src/test/FooServiceTest.kt - references FooService"))
+
+        val explicit = tools.execute(
+            "related_tests",
+            mapper.readTree("""{"paths":["src/main/FooService.kt"],"maxResults":1}"""),
+            root
+        )
+        assertTrue(explicit.content.contains("src/test/FooServiceTest.kt"))
+
+        val none = tools.execute(
+            "related_tests",
+            mapper.readTree("""{"paths":["src/main/Absent.kt"]}"""),
+            root
+        )
+        assertTrue(none.content.startsWith("No test file references"))
+
+        Files.writeString(root.resolve("src/main/Controller.kt"), "class Controller(private val s: FooService)\n")
+        Files.writeString(root.resolve("src/test/ControllerTest.kt"), "class ControllerTest { lateinit var c: Controller }\n")
+        val transitive = tools.execute(
+            "related_tests",
+            mapper.readTree("""{"paths":["src/main/FooService.kt"]}"""),
+            root
+        ).content
+        assertTrue(transitive.contains("src/test/FooServiceTest.kt - references FooService"))
+        assertTrue(transitive.contains("src/test/ControllerTest.kt - references Controller (hop 2)"))
+
+        val many = tools.execute(
+            "related_tests",
+            mapper.readTree("""{"paths":["a.kt","b.kt","c.kt","d.kt","e.kt","f.kt"]}"""),
+            root
+        ).content
+        assertTrue(many.startsWith("No test file references the types in 6 changed file(s): "))
+        assertTrue(many.trimEnd().endsWith(", ..."))
+
+        val clean = repository()
+        assertThrows(IllegalArgumentException::class.java) {
+            executor().execute("related_tests", mapper.readTree("""{"paths":[""]}"""), clean)
+        }
+
+        // Explicit JSON null takes the default branch rather than a validation error.
+        assertTrue(
+            tools.execute("related_tests", mapper.readTree("""{"paths":null,"maxResults":null}"""), root)
+                .content.contains("FooServiceTest.kt")
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("related_tests", mapper.readTree("""{"maxResults":"many"}"""), root)
+        }
+
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("related_tests", mapper.readTree("""{"paths":"src/main/FooService.kt"}"""), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("related_tests", mapper.readTree("""{"paths":[1]}"""), root)
+        }
     }
 
     private fun executor() = WorkspaceToolExecutor(object : ValidationRunner {

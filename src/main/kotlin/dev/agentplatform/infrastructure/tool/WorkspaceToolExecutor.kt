@@ -6,7 +6,9 @@ import dev.agentplatform.domain.port.CommandExecutor
 import dev.agentplatform.domain.port.ModelToolDefinition
 import dev.agentplatform.domain.port.ToolExecutionResult
 import dev.agentplatform.domain.port.ValidationRunner
+import dev.agentplatform.infrastructure.retrieval.RepositoryFiles
 import dev.agentplatform.infrastructure.retrieval.RepositoryMapBuilder
+import dev.agentplatform.infrastructure.retrieval.TestImpactAnalyzer
 import jakarta.enterprise.context.ApplicationScoped
 import java.io.IOException
 import java.nio.file.*
@@ -21,6 +23,7 @@ class WorkspaceToolExecutor(
 ) {
     private val codexPatches = CodexPatchNormalizer()
     private val repositoryMapBuilder: RepositoryMapBuilder by lazy { RepositoryMapBuilder.fromConfig() }
+    private val testImpact = TestImpactAnalyzer()
 
     /**
      * Ranks repository files for the task prompt. Configuration is read lazily so the bean needs no
@@ -33,6 +36,7 @@ class WorkspaceToolExecutor(
         tool("search_code", "Search repository text line by line. The query is a literal unless regex is true. Results are paginated with offset and maxResults.", """{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example **/*.kt."},"regex":{"type":"boolean","description":"Treat the query as a Java regular expression. Invalid expressions are rejected."},"ignoreCase":{"type":"boolean","description":"Defaults to true."},"offset":{"type":"integer","minimum":0,"description":"Number of matches to skip. Defaults to 0."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 25, capped at 200."}},"required":["query"],"additionalProperties":false}"""),
         tool("read_file", "Read a UTF-8 text file, optionally a 1-based inclusive line range. A whole-file read is limited to 50 KB; larger files require a range. Output is capped at 12,000 characters.", """{"type":"object","properties":{"path":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}"""),
         tool("create_file", "Create a new UTF-8 text file with exactly the content given. Parent directories are created. Fails if the file already exists; use apply_patch to modify an existing file. The path must stay inside the repository.", """{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Exact file content. Include the trailing newline if the file should end with one."}},"required":["path","content"],"additionalProperties":false}"""),
+        tool("related_tests", "List the test files that reference types declared in the given paths, using a bounded reference graph. Omit paths to use the files changed in the workspace.", """{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"Repository-relative paths. Omit to use git status."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 10, capped at 50."}},"additionalProperties":false}"""),
         tool("apply_patch", "Apply a patch to repository files. Use either a complete git-compatible unified diff (diff --git, --- and +++ headers, valid hunk ranges) or the Codex envelope (*** Begin Patch, *** Update File:/*** Add File:/*** Delete File:, @@ hunks, *** End Patch). Do not include Markdown fences. Patch paths must stay inside the repository.", """{"type":"object","properties":{"patch":{"type":"string","description":"A git-compatible unified diff or a Codex *** Begin Patch envelope; no Markdown fences."}},"required":["patch"],"additionalProperties":false}"""),
         tool("run_validation", "Run the repository's Maven tests in a disposable, resource-limited Docker container.", """{"type":"object","properties":{},"additionalProperties":false}""")
     )
@@ -69,6 +73,13 @@ class WorkspaceToolExecutor(
         )
         "create_file" -> ToolExecutionResult(
             createFile(workspace, requiredText(arguments, "path"), textArgument(arguments, "content"))
+        )
+        "related_tests" -> ToolExecutionResult(
+            relatedTests(
+                workspace,
+                stringListArgument(arguments, "paths"),
+                intArgument(arguments, "maxResults", RELATED_TEST_LIMIT)
+            )
         )
         "apply_patch" -> ToolExecutionResult(applyPatch(workspace, requiredText(arguments, "patch")))
         "run_validation" -> validationRunner.validate(workspace).let { check ->
@@ -183,6 +194,47 @@ class WorkspaceToolExecutor(
         Files.createDirectories(file.parent)
         Files.writeString(file, content)
         return "Created $relative (${content.length} characters)."
+    }
+
+    private fun relatedTests(workspace: Path, paths: List<String>, maxResults: Int): String {
+        val changed = paths.map(String::trim).filter(String::isNotEmpty).ifEmpty { changedFiles(workspace) }
+        require(changed.isNotEmpty()) { "No changed files found; pass paths explicitly" }
+        val selected = testImpact.select(workspace, changed, maxResults.coerceIn(1, RELATED_TEST_LIMIT_MAX))
+        if (selected.isEmpty()) {
+            val shown = changed.take(5).joinToString(", ") + if (changed.size > 5) ", ..." else ""
+            return "No test file references the types in ${changed.size} changed file(s): $shown"
+        }
+        return buildString {
+            appendLine("Tests that reference the changed types (${selected.size}):")
+            selected.forEach { test ->
+                val via = if (test.depth == 1) test.via else "${test.via} (hop ${test.depth})"
+                appendLine("  ${test.path} - references $via")
+            }
+            append("Read them before finishing; run_validation still runs the supported suite.")
+        }
+    }
+
+    private fun changedFiles(workspace: Path): List<String> {
+        val tracked = commands.run(
+            listOf("git", "diff", "--name-only", "--diff-filter=ACDMRT"),
+            workspace,
+            timeout = Duration.ofSeconds(20),
+            maxOutputChars = 20_000
+        )
+        val untracked = commands.run(
+            listOf("git", "ls-files", "--others", "--exclude-standard"),
+            workspace,
+            timeout = Duration.ofSeconds(20),
+            maxOutputChars = 20_000
+        )
+        require(tracked.exitCode == 0 && untracked.exitCode == 0) { "Could not list changed repository files" }
+        return (tracked.output.lineSequence() + untracked.output.lineSequence())
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .filterNot(RepositoryFiles::isBuildOutput)
+            .distinct()
+            .sorted()
+            .toList()
     }
 
     private fun applyPatch(workspace: Path, patch: String): String {
@@ -318,6 +370,16 @@ class WorkspaceToolExecutor(
         return node.asInt()
     }
 
+    private fun stringListArgument(arguments: JsonNode, name: String): List<String> {
+        val node = arguments.path(name)
+        if (node.isMissingNode || node.isNull) return emptyList()
+        require(node.isArray) { "Tool argument '$name' must be an array of strings" }
+        return node.map { element ->
+            require(element.isTextual) { "Tool argument '$name' must contain only strings" }
+            element.asText()
+        }
+    }
+
     private fun tool(name: String, description: String, schema: String) =
         ModelToolDefinition(name, description, objectMapper.readTree(schema))
 
@@ -334,6 +396,8 @@ class WorkspaceToolExecutor(
         const val READ_FILE_SIZE_LIMIT = 50_000L
         const val READ_FILE_MAX_BYTES = 10L * 1024 * 1024
         const val CREATE_FILE_SIZE_LIMIT = 64_000
+        const val RELATED_TEST_LIMIT = 10
+        const val RELATED_TEST_LIMIT_MAX = 50
         const val PATCH_SIZE_LIMIT = 64_000
         const val PATCH_FILE_LIMIT = 10
         val IGNORED_DIRECTORIES = setOf(".git", "target", "build", ".gradle", "node_modules", ".idea")
