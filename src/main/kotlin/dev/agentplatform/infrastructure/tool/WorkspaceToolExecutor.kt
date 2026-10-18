@@ -6,6 +6,7 @@ import dev.agentplatform.domain.port.CommandExecutor
 import dev.agentplatform.domain.port.ModelToolDefinition
 import dev.agentplatform.domain.port.ToolExecutionResult
 import dev.agentplatform.domain.port.ValidationRunner
+import dev.agentplatform.infrastructure.retrieval.RepositoryMapBuilder
 import jakarta.enterprise.context.ApplicationScoped
 import java.io.IOException
 import java.nio.file.*
@@ -19,6 +20,13 @@ class WorkspaceToolExecutor(
     private val objectMapper: ObjectMapper
 ) {
     private val codexPatches = CodexPatchNormalizer()
+    private val repositoryMapBuilder: RepositoryMapBuilder by lazy { RepositoryMapBuilder.fromConfig() }
+
+    /**
+     * Ranks repository files for the task prompt. Configuration is read lazily so the bean needs no
+     * extra constructor parameter; failures are surfaced to the caller, which decides whether to continue.
+     */
+    fun repositoryMap(workspace: Path, query: String): String = repositoryMapBuilder.build(workspace, query)
 
     fun definitions(): List<ModelToolDefinition> = listOf(
         tool("list_files", "List repository files, optionally under a relative directory, filtered by a glob and a depth.", """{"type":"object","properties":{"path":{"type":"string"},"depth":{"type":"integer","minimum":1,"description":"Maximum directory levels below path. Omit for the whole tree."},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example **/*.kt or src/**/*.java."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 250, capped at 1000."}},"additionalProperties":false}"""),

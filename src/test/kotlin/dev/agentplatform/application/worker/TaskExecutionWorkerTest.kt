@@ -944,6 +944,31 @@ class TaskExecutionWorkerTest {
         }
     }
 
+    @Test
+    fun `prepends a ranked repository map to the task prompt`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(
+            temporary.resolve("Greeting.java"),
+            "public class Greeting { public String message() { return \"hi\"; } }\n"
+        )
+        val provider = ScriptedProvider(
+            ModelTurn(
+                """{"summary":"No change","implementation":"The repository map was supplied."}""",
+                emptyList(),
+                "stop",
+                null,
+                null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        val prompt = provider.messages.first { it.role == "user" }.content
+        assertTrue(prompt.contains("Repository map (ranked from the task text"))
+        assertTrue(prompt.contains("Greeting.java"))
+    }
+
     private fun worker(
         state: FakeState,
         attempts: FakeAttempts,

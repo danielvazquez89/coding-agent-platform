@@ -157,9 +157,10 @@ POST /api/tasks ──► QUEUED (persisted in PostgreSQL)
                         │  (allow-listed local root, or a public GitHub HTTPS URL)
                         ▼
       bounded model/tool loop ─────────────────────────────────────────────────┐
+        prompt: ranked repository map (BM25 + PageRank, token-budgeted)        │
         model proposes ─► application authorizes ─► audit ─► execute           │
-        tools: list_files · search_code · read_file · apply_patch ·            │
-               run_validation (Docker, offline `mvn -B -o test`)               │
+        tools: list_files · search_code · read_file · create_file ·            │
+               apply_patch · run_validation (Docker, offline `mvn -B -o test`) │
         limits: tool calls · elapsed time · estimated cost                     │
         ▲──────────────────────────────────────────────────────────────────────┘
                         ▼
@@ -172,6 +173,8 @@ POST /api/tasks ──► QUEUED (persisted in PostgreSQL)
 ```
 
 `COMPLETED` means "a patch was produced with an honest report", not "applied" or "approved".
+
+Before the first model turn the worker seeds the prompt with a bounded repository map so the model does not have to discover a whole tree one listing at a time. Candidate files are ranked lexically: BM25 over identifier tokens (camelCase and snake_case are split) measures how well a file matches the task title, description and acceptance criteria, while PageRank over "file A names the type declared in file B" edges lifts structurally central files the task text never names. Entries carry up to six declared symbols, and a greedy packer fits them into a token budget estimated as characters divided by four. Every walk is capped by file count, per-file bytes and total bytes; build output, dependencies and binary files are skipped. The map is labelled in the prompt as a heuristic, not an index of truth, and the model is told to confirm content with `read_file` before changing it. Set `AGENT_REPO_MAP_ENABLED=false` (or `agent.context.repo-map.enabled=false`) to omit it, and tune `AGENT_REPO_MAP_MAX_TOKENS`, `AGENT_REPO_MAP_MAX_ENTRIES`, `AGENT_REPO_MAP_MAX_INDEXED_FILES` and `AGENT_REPO_MAP_MAX_FILE_BYTES` to change its bounds. If building the map fails, the task continues without it rather than failing.
 
 ### Handoff: what to do with a completed change
 

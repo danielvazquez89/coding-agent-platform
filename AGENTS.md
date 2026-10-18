@@ -76,6 +76,10 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
 - Worker entry point: `application/worker/TaskExecutionWorker` (scheduled, claims one queued task with a
   DB lock; also reaps attempts orphaned by a stopped worker). Terminal updates:
   `application/worker/TaskExecutionFinalizer`.
+- Prompt context: `infrastructure/retrieval/RepositoryMapBuilder` ranks files with BM25 over identifier
+  tokens plus PageRank over type references, and packs the top entries into a token budget. It is a
+  heuristic, labelled as such in the prompt, bounded by file count/bytes, and fail-soft: a failure to
+  build it must never fail a task.
 - Tool policy and path/patch checks: `infrastructure/tool/WorkspaceToolExecutor` (`list_files`,
   `search_code`, `read_file`, `create_file`, `apply_patch`, `run_validation`).
 - Patch export policy (task/attempt `COMPLETED`, all validation passed, one matching passing evidenced
