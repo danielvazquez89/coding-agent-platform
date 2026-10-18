@@ -34,9 +34,12 @@ class WorkspaceToolExecutorTest {
     }
 
     @Test
-    fun `offers only the five bounded workspace tools`() {
+    fun `offers only the bounded workspace tools`() {
         val tools = executor().definitions()
-        assertEquals(listOf("list_files", "search_code", "read_file", "apply_patch", "run_validation"), tools.map { it.name })
+        assertEquals(
+            listOf("list_files", "search_code", "read_file", "create_file", "apply_patch", "run_validation"),
+            tools.map { it.name }
+        )
         assertTrue(tools.all { it.parameters.path("additionalProperties").asBoolean() == false })
     }
 
@@ -81,6 +84,52 @@ class WorkspaceToolExecutorTest {
         assertThrows(IllegalArgumentException::class.java) { tools.execute("search_code", mapper.readTree("""{"query":"x","path":"../"}"""), root) }
         assertThrows(IllegalArgumentException::class.java) { tools.execute("search_code", mapper.readTree("{}"), root) }
         assertThrows(IllegalArgumentException::class.java) { tools.execute("read_file", mapper.readTree("""{"path":" "}"""), root) }
+    }
+
+    @Test
+    fun `creates a new file but never overwrites an existing one`() {
+        val root = repository()
+        val tools = executor()
+
+        val created = tools.execute(
+            "create_file",
+            mapper.createObjectNode().put("path", "src/main/New.kt").put("content", "package sample\n"),
+            root
+        )
+        assertTrue(created.content.contains("Created src/main/New.kt"))
+        assertEquals("package sample\n", Files.readString(root.resolve("src/main/New.kt")))
+
+        val empty = tools.execute(
+            "create_file",
+            mapper.createObjectNode().put("path", "empty.txt").put("content", ""),
+            root
+        )
+        assertTrue(empty.content.contains("Created empty.txt"))
+        assertEquals(0L, Files.size(root.resolve("empty.txt")))
+
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("create_file", mapper.createObjectNode().put("path", "README.md").put("content", "clobbered"), root)
+        }
+        assertEquals("initial\n", Files.readString(root.resolve("README.md")))
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("create_file", mapper.createObjectNode().put("path", "../outside.txt").put("content", "x"), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("create_file", mapper.createObjectNode().put("path", "binary.dat").put("content", "a\u0000b"), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute(
+                "create_file",
+                mapper.createObjectNode().put("path", "huge.txt").put("content", "x".repeat(64_001)),
+                root
+            )
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("create_file", mapper.createObjectNode().put("path", "missing-content.txt"), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("create_file", mapper.createObjectNode().put("content", "orphan"), root)
+        }
     }
 
     @Test

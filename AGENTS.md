@@ -77,7 +77,7 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   DB lock; also reaps attempts orphaned by a stopped worker). Terminal updates:
   `application/worker/TaskExecutionFinalizer`.
 - Tool policy and path/patch checks: `infrastructure/tool/WorkspaceToolExecutor` (`list_files`,
-  `search_code`, `read_file`, `apply_patch`, `run_validation`).
+  `search_code`, `read_file`, `create_file`, `apply_patch`, `run_validation`).
 - Patch export policy (task/attempt `COMPLETED`, all validation passed, one matching passing evidenced
   acceptance check per criterion, and the stored diff not truncated):
   `application/service/TaskAttemptService.exportablePatch`, served by `api/TaskResource` at

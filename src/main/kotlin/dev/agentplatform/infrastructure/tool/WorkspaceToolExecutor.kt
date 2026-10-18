@@ -24,6 +24,7 @@ class WorkspaceToolExecutor(
         tool("list_files", "List repository files, optionally under a relative directory.", """{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}"""),
         tool("search_code", "Search repository text for a literal query, optionally under a relative directory.", """{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"}},"required":["query"],"additionalProperties":false}"""),
         tool("read_file", "Read one small UTF-8 text file by its repository-relative path.", """{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}"""),
+        tool("create_file", "Create a new UTF-8 text file with exactly the content given. Parent directories are created. Fails if the file already exists; use apply_patch to modify an existing file. The path must stay inside the repository.", """{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Exact file content. Include the trailing newline if the file should end with one."}},"required":["path","content"],"additionalProperties":false}"""),
         tool("apply_patch", "Apply a patch to repository files. Use either a complete git-compatible unified diff (diff --git, --- and +++ headers, valid hunk ranges) or the Codex envelope (*** Begin Patch, *** Update File:/*** Add File:/*** Delete File:, @@ hunks, *** End Patch). Do not include Markdown fences. Patch paths must stay inside the repository.", """{"type":"object","properties":{"patch":{"type":"string","description":"A git-compatible unified diff or a Codex *** Begin Patch envelope; no Markdown fences."}},"required":["patch"],"additionalProperties":false}"""),
         tool("run_validation", "Run the repository's Maven tests in a disposable, resource-limited Docker container.", """{"type":"object","properties":{},"additionalProperties":false}""")
     )
@@ -32,6 +33,9 @@ class WorkspaceToolExecutor(
         "list_files" -> ToolExecutionResult(listFiles(workspace, arguments.path("path").asText("")))
         "search_code" -> ToolExecutionResult(searchCode(workspace, requiredText(arguments, "query"), arguments.path("path").asText("")))
         "read_file" -> ToolExecutionResult(readFile(workspace, requiredText(arguments, "path")))
+        "create_file" -> ToolExecutionResult(
+            createFile(workspace, requiredText(arguments, "path"), textArgument(arguments, "content"))
+        )
         "apply_patch" -> ToolExecutionResult(applyPatch(workspace, requiredText(arguments, "patch")))
         "run_validation" -> validationRunner.validate(workspace).let { check ->
             ToolExecutionResult("${check.name}: ${check.outcome}. ${check.details.orEmpty()}".take(TOOL_OUTPUT_LIMIT), check)
@@ -74,6 +78,20 @@ class WorkspaceToolExecutor(
         val content = Files.readString(file)
         require('\u0000' !in content) { "Binary files cannot be read as text" }
         return content.take(TOOL_OUTPUT_LIMIT)
+    }
+
+    private fun createFile(workspace: Path, relative: String, content: String): String {
+        require(content.length <= CREATE_FILE_SIZE_LIMIT) {
+            "File content exceeds the ${CREATE_FILE_SIZE_LIMIT / 1024} KB limit"
+        }
+        require('\u0000' !in content) { "Binary content cannot be created through create_file" }
+        val file = resolve(workspace, relative)
+        require(!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
+            "File '$relative' already exists; use apply_patch to change it"
+        }
+        Files.createDirectories(file.parent)
+        Files.writeString(file, content)
+        return "Created $relative (${content.length} characters)."
     }
 
     private fun applyPatch(workspace: Path, patch: String): String {
@@ -157,11 +175,14 @@ class WorkspaceToolExecutor(
     }
 
     private fun requiredText(arguments: JsonNode, name: String): String {
-        val value = arguments.path(name).takeIf(JsonNode::isTextual)?.asText()
-            ?: throw IllegalArgumentException("Tool argument '$name' must be text")
+        val value = textArgument(arguments, name)
         require(value.isNotBlank()) { "Tool argument '$name' must not be blank" }
         return value
     }
+
+    private fun textArgument(arguments: JsonNode, name: String): String =
+        arguments.path(name).takeIf(JsonNode::isTextual)?.asText()
+            ?: throw IllegalArgumentException("Tool argument '$name' must be text")
 
     private fun tool(name: String, description: String, schema: String) =
         ModelToolDefinition(name, description, objectMapper.readTree(schema))
@@ -173,6 +194,7 @@ class WorkspaceToolExecutor(
         const val SEARCH_FILE_SIZE_LIMIT = 256_000L
         const val SEARCH_MATCH_LIMIT = 25
         const val READ_FILE_SIZE_LIMIT = 50_000L
+        const val CREATE_FILE_SIZE_LIMIT = 64_000
         const val PATCH_SIZE_LIMIT = 64_000
         const val PATCH_FILE_LIMIT = 10
         val IGNORED_DIRECTORIES = setOf(".git", "target", "build", ".gradle", "node_modules", ".idea")
