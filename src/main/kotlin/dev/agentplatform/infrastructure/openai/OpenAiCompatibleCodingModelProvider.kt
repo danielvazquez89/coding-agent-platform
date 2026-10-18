@@ -9,6 +9,7 @@ import dev.agentplatform.domain.port.ModelToolCall
 import dev.agentplatform.domain.port.ModelToolDefinition
 import dev.agentplatform.domain.port.ModelTurn
 import dev.agentplatform.infrastructure.model.ContentToolCallExtractor
+import dev.agentplatform.infrastructure.model.ModelRateLimiter
 import dev.agentplatform.infrastructure.model.OpenAiCompatibleModelProvider
 import jakarta.enterprise.context.ApplicationScoped
 import org.eclipse.microprofile.config.inject.ConfigProperty
@@ -47,7 +48,8 @@ class OpenAiCompatibleCodingModelProvider(
     private val retryInitialBackoffMillis: Long,
     @ConfigProperty(name = "agent.model.openai.retry.max-backoff-millis", defaultValue = "60000")
     private val retryMaxBackoffMillis: Long,
-    private val objectMapper: ObjectMapper
+    private val objectMapper: ObjectMapper,
+    private val rateLimiter: ModelRateLimiter
 ) : CodingModelProvider {
     private val logger = Logger.getLogger(OpenAiCompatibleCodingModelProvider::class.java)
     private val httpClient by lazy {
@@ -92,7 +94,9 @@ class OpenAiCompatibleCodingModelProvider(
             throw ModelProviderException("OpenAI-compatible base URL must be an absolute HTTP or HTTPS URL")
         }
 
-        val response = sendWithRetries(endpoint, serializeRequest(messages, tools))
+        val payload = serializeRequest(messages, tools)
+        rateLimiter.acquire(ModelRateLimiter.estimateTokens(payload.length))
+        val response = sendWithRetries(endpoint, payload)
 
         if (!isSuccessfulStatusCode(response.statusCode())) {
             val detail = response.body().take(MAX_ERROR_LENGTH)

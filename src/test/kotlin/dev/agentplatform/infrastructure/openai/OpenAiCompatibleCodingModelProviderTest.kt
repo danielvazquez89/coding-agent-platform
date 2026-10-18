@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.sun.net.httpserver.Headers
 import com.sun.net.httpserver.HttpServer
 import dev.agentplatform.domain.port.*
+import dev.agentplatform.infrastructure.model.ModelRateLimiter
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import java.net.InetSocketAddress
@@ -55,6 +56,21 @@ class OpenAiCompatibleCodingModelProviderTest {
         assertNull(turn.finishReason)
         assertNull(turn.promptTokens)
         assertNull(turn.completionTokens)
+    }
+
+    @Test
+    fun `records every request against the shared rate budget`() {
+        val limiter = ModelRateLimiter("50", "disabled", 1_000)
+        val server = startServer(200, """{"choices":[{"message":{"content":"ok"}}]}""")
+        try {
+            val provider = provider("http://127.0.0.1:${server.address.port}", rateLimiter = limiter)
+            provider.chat(listOf(ModelMessage("user", "one")), emptyList())
+            provider.chat(listOf(ModelMessage("user", "two")), emptyList())
+        } finally {
+            server.stop(0)
+        }
+
+        assertEquals(2, limiter.reservations())
     }
 
     @Test
@@ -420,7 +436,8 @@ class OpenAiCompatibleCodingModelProviderTest {
         timeoutSeconds: Long = 5,
         retryMaxAttempts: Int = 3,
         retryInitialBackoffMillis: Long = 1,
-        retryMaxBackoffMillis: Long = 5
+        retryMaxBackoffMillis: Long = 5,
+        rateLimiter: ModelRateLimiter = ModelRateLimiter("disabled", "disabled", 60_000)
     ) = OpenAiCompatibleCodingModelProvider(
         baseUrl,
         model,
@@ -429,7 +446,8 @@ class OpenAiCompatibleCodingModelProviderTest {
         retryMaxAttempts,
         retryInitialBackoffMillis,
         retryMaxBackoffMillis,
-        mapper
+        mapper,
+        rateLimiter
     )
 
     private fun readFileTool() = ModelToolDefinition(

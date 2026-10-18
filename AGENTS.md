@@ -66,6 +66,7 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
 | Port (in `domain/port`) | Adapter (in `infrastructure`) | Adapter test |
 | --- | --- | --- |
 | `CodingModelProvider` | `model/SelectingCodingModelProvider` → `ollama/OllamaCodingModelProvider` or `openai/OpenAiCompatibleCodingModelProvider` (by `agent.model.provider`) | `ollama/OllamaCodingModelProviderTest`, `openai/OpenAiCompatibleCodingModelProviderTest`, `model/SelectingCodingModelProviderTest` |
+| (pacing policy) | `model/ModelRateLimiter` → `model/RateLimitBudget` (one shared sliding minute; consulted by the OpenAI-compatible adapter only) | `model/RateLimitBudgetTest` |
 | `RepositoryWorkspaceFactory`, `RepositoryWorkspace` | `workspace/GitRepositoryWorkspaceFactory` | `workspace/GitRepositoryWorkspaceFactoryTest` |
 | `CommandExecutor` | `process/LocalCommandExecutor` | `process/LocalCommandExecutorTest` |
 | `ValidationRunner` | `docker/DockerValidationRunner` (or `ExecutionControlHttp` via the gateway) | `docker/DockerValidationRunnerTest`, `ExecutionControlHttpTest` |

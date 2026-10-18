@@ -50,7 +50,10 @@ class SelectingCodingModelProviderTest {
 
     private fun selector(baseUrl: String, provider: String) = SelectingCodingModelProvider(
         OllamaCodingModelProvider(baseUrl, "ollama-model", 5, mapper),
-        OpenAiCompatibleCodingModelProvider(baseUrl, "openai-model", "disabled", 5, 5, 1000, 60000, mapper),
+        OpenAiCompatibleCodingModelProvider(
+            baseUrl, "openai-model", "disabled", 5, 5, 1000, 60000, mapper,
+            ModelRateLimiter("disabled", "disabled", 60_000)
+        ),
         provider
     )
 
