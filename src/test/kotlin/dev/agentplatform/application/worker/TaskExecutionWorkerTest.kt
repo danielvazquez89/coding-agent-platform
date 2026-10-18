@@ -1166,6 +1166,8 @@ class TaskExecutionWorkerTest {
         val prompt = provider.messages.first { it.role == "user" }.content
         assertTrue(prompt.contains("Repository map (ranked from the task text"))
         assertTrue(prompt.contains("Greeting.java"))
+        val system = provider.messages.first { it.role == "system" }.content
+        assertTrue(system.contains("Always read a line with read_file before you change it"))
     }
 
     private fun worker(

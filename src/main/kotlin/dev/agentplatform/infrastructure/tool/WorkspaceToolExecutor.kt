@@ -176,10 +176,14 @@ class WorkspaceToolExecutor(
      * occurrences, and source files before tests. This is a heuristic, not a compiler: the caller is
      * told to confirm the line, and no repository code is executed.
      */
-    private fun findSymbol(workspace: Path, name: String, relative: String, glob: String, maxResults: Int): String {
-        require(SYMBOL_NAME.matches(name)) {
-            "Symbol name must be a single identifier of letters, digits, '_' or '$'"
-        }
+    private fun findSymbol(workspace: Path, rawName: String, relative: String, glob: String, maxResults: Int): String {
+        require(rawName.isNotBlank()) { "Symbol name must not be blank" }
+        require(rawName.length <= 200) { "Symbol name must be at most 200 characters" }
+        // A model sometimes passes a whole declaration ("static final Writer writeValue") or a qualified
+        // name. Search its last identifier token anyway and echo it, so an imprecise call still locates
+        // the symbol instead of burning a tool call on a format rule.
+        val name = SYMBOL_TOKEN.findAll(rawName).lastOrNull()?.value
+            ?: throw IllegalArgumentException("Symbol name '$rawName' contains no identifier; pass one such as 'writeValue'")
         val directory = resolve(workspace, relative, allowEmpty = true)
         require(Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) { "Directory '$relative' does not exist" }
         val matcher = globMatcher(glob)
@@ -219,7 +223,11 @@ class WorkspaceToolExecutor(
         } else {
             ""
         }
-        return (header + "\n" + body + footer).take(TOOL_OUTPUT_LIMIT)
+        // The declaration line is trimmed and only a hint: a patch must reproduce the file's exact
+        // content, so point the model at read_file before it edits.
+        val next = "\nNext: read the lines around a declaration with read_file (startLine/endLine) and copy " +
+            "them exactly, including leading whitespace, when you write the patch."
+        return (header + "\n" + body + footer + next).take(TOOL_OUTPUT_LIMIT)
     }
 
     /**
@@ -503,7 +511,7 @@ class WorkspaceToolExecutor(
         const val SEARCH_SCAN_MATCH_LIMIT = 200
         const val SEARCH_PATTERN_LIMIT = 200
         const val REFERENCE_KIND = "reference"
-        val SYMBOL_NAME = Regex("""[A-Za-z_$][A-Za-z0-9_$]*""")
+        val SYMBOL_TOKEN = Regex("""[A-Za-z_$][A-Za-z0-9_$]*""")
         val SYMBOL_HIT_ORDER = compareBy<SymbolHit>({ it.test }, { it.path }, { it.line })
         const val READ_FILE_SIZE_LIMIT = 50_000L
         const val READ_FILE_MAX_BYTES = 10L * 1024 * 1024

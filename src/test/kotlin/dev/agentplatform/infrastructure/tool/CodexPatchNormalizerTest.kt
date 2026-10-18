@@ -129,7 +129,27 @@ class CodexPatchNormalizerTest {
         }
 
         assertTrue(failure.message.orEmpty().contains("does not match the current content"))
+        assertTrue(failure.message.orEmpty().contains("No line whose text is 'expected' exists"))
         assertEquals("actual\n", Files.readString(workspace.resolve("Hello.kt")))
+    }
+
+    @Test
+    fun `returns the actual indented lines for a whitespace-only mismatch`() {
+        Files.writeString(workspace.resolve("Indented.kt"), "fun main() {\n    val x = 1\n}\n")
+
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            normalizer.normalize(
+                "*** Begin Patch\n*** Update File: Indented.kt\n@@\n-val x = 1\n+val x = 2\n*** End Patch",
+                workspace
+            )
+        }
+
+        val message = failure.message.orEmpty()
+        assertTrue(message.contains("does not match the current content"), message)
+        assertTrue(message.contains("The file has this at line 2:"), message)
+        assertTrue(message.contains("|    val x = 1"), message)
+        assertTrue(message.contains("including leading whitespace"), message)
+        assertEquals("fun main() {\n    val x = 1\n}\n", Files.readString(workspace.resolve("Indented.kt")))
     }
 
     @Test

@@ -135,12 +135,21 @@ class WorkspaceToolExecutorTest {
         val bounded = tools.execute("find_symbol", mapper.readTree("""{"name":"writeValue","maxResults":1}"""), root).content
         assertEquals(1, bounded.lines().count { it.trimStart().startsWith("src/") })
 
+        assertTrue(method.contains("Next: read the lines around a declaration with read_file"), method)
+        // A declaration phrase is accepted: the last identifier token is the symbol.
+        val phrase = tools.execute(
+            "find_symbol",
+            mapper.readTree("""{"name":"public static String writeValue"}"""),
+            root
+        ).content
+        assertTrue(phrase.contains("Declarations of 'writeValue'"), phrase)
+
         assertEquals(
             "No declaration or occurrence of 'absentSymbol' found.",
             tools.execute("find_symbol", mapper.readTree("""{"name":"absentSymbol"}"""), root).content
         )
         assertThrows(IllegalArgumentException::class.java) {
-            tools.execute("find_symbol", mapper.readTree("""{"name":"not a symbol"}"""), root)
+            tools.execute("find_symbol", mapper.readTree("""{"name":"..."}"""), root)
         }
         assertThrows(IllegalArgumentException::class.java) {
             tools.execute("find_symbol", mapper.readTree("""{"name":"writeValue","path":"../"}"""), root)

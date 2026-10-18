@@ -127,10 +127,7 @@ class CodexPatchNormalizer {
                     "otherwise its position is ambiguous"
             }
             val index = locate(existing, oldLines, searchFrom)
-                ?: throw IllegalArgumentException(
-                    "Codex patch hunk for '${section.path}' does not match the current content. " +
-                        "Expected ${oldLines.size} line(s) starting with: ${oldLines.first().trim().take(120)}"
-                )
+                ?: throw IllegalArgumentException(mismatchMessage(section.path, existing, oldLines))
             placed += PlacedHunk(index, oldLines, newLines, hunk.lines)
             searchFrom = index + oldLines.size
         }
@@ -168,6 +165,28 @@ class CodexPatchNormalizer {
             index++
         }
         return null
+    }
+
+    /**
+     * The message for a hunk that cannot be placed. A model that wrote the right change with the wrong
+     * leading whitespace gets the actual file content back, so it can correct the hunk instead of
+     * re-reading the file; the patch still fails and nothing is applied.
+     */
+    private fun mismatchMessage(path: String, existing: List<String>, oldLines: List<String>): String {
+        val first = oldLines.first().trim().take(120)
+        val header = "Codex patch hunk for '$path' does not match the current content. " +
+            "Expected ${oldLines.size} line(s) starting with: $first."
+        val anchor = existing.indexOfFirst { it.trim() == oldLines.first().trim() }
+        val detail = if (anchor >= 0) {
+            val end = minOf(existing.size, anchor + oldLines.size)
+            val actual = existing.subList(anchor, end).joinToString("\n") { "  |$it" }
+            "\nThe file has this at line ${anchor + 1}:\n$actual\n" +
+                "Copy those lines exactly, including leading whitespace, into the hunk."
+        } else {
+            "\nNo line whose text is '$first' exists in the file; use read_file to check the current " +
+                "content and rebuild the hunk."
+        }
+        return header + detail
     }
 
     private fun readLines(workspace: Path, relative: String): List<String> {

@@ -131,6 +131,22 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   checks and output caps.
 - **Status.** Shipped. A further step — an explicit, auditable plan before the first patch — remains open.
 
+### 10. The first patch was written from a declaration line, not from the file
+
+- **Symptom.** With `find_symbol` in place (run G) the model went straight to the right method and
+  proposed its first `apply_patch` — but the patch was rejected: the hunk's context had lost the file's
+  leading whitespace, and the model had never called `read_file`. It then explored instead of correcting
+  the hunk, and the run ended on Groq's **daily** token cap (TPD 200000), which pacing cannot help with.
+- **Root cause.** `find_symbol` returns a trimmed declaration line as a hint, and nothing in the flow made
+  "read the exact lines" a step the model actually took before writing the patch.
+- **Decision.** Three small changes, no relaxation of the matching rule: `find_symbol` ends with an
+  explicit next step and accepts a declaration phrase by searching its last identifier token (a model
+  passed `static final Writer writeValue` three times and each failed on a format rule); the system prompt
+  says to read a line with `read_file` before changing it; and a hunk that cannot be placed now returns
+  the actual indented lines at the nearest match, so the model can fix the indentation in one step. The
+  patch still fails and nothing is applied.
+- **Status.** Shipped and unit-tested. Re-running the real task needs the daily quota to reset.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -145,16 +161,18 @@ recorded rather than glossed over, because the failures are informative.
 | D `a3c7b4ef` | `openai/gpt-oss-120b` | 8 model calls, repeated `output_parse_failed` and a 429, no patch — Groq's decoder kept rejecting this model's output |
 | E `e3be1cd1` | `qwen/qwen3.8-27b` | read `JSONObject.java`, proposed `apply_patch` with an unsupported `*** Find File:` directive (rejected honestly, as designed), then HTTP 413: `7250 > 7000` input tokens per minute |
 | F `3766f0a7` | `qwen/qwen3.8-27b`, 12000-char window | 16 model calls, 25 tool calls (11 `search_code`, 7 `read_file`, 5 `list_files`, 2 `related_tests`), no patch, tool-call limit reached |
+| G `1941c804` | `qwen/qwen3.8-27b`, after `find_symbol` | 18 tool calls (13 `find_symbol`, 4 `search_code`, 1 `apply_patch`): located the method and proposed its **first** patch, which was rejected because the context lost the file's indentation and the model had not read the file; the run then ended on Groq's daily token cap (TPD 200000) |
 
 What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
 unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
 HTTP 413 and re-read loop were fixed and did not recur, and the generation-error retry visibly recovered
-attempts that previously died. What they also show is the real gap: on a free tier with a small
-per-request cap, both models spend their whole tool budget exploring a repository of a few hundred files
-and never propose a change. The first localization change from that evidence has shipped — the read-only
-`find_symbol` tool plus a locate-first system prompt (finding 9); an explicit, auditable plan step remains
-open. Hosted OpenAI API models (`gpt-4o`, `gpt-4.1`, the o-series) remain untested here: no key is
-available.
+attempts that previously died. Run G shows the localization change moving the needle in the intended
+direction: the model that previously explored without ever patching now reaches the method and proposes a
+change. The remaining gap on the free tier is exactness — the patch must reproduce the file's
+indentation — and the tier's daily token cap, which no amount of pacing can recover. The read-before-patch
+guidance, the tolerant `find_symbol` argument and the actionable hunk diagnostic (finding 10) target that
+gap; the run then needs the daily quota to reset. An explicit, auditable plan step remains open. Hosted
+OpenAI API models (`gpt-4o`, `gpt-4.1`, the o-series) remain untested here: no key is available.
 
 ## Repository selection (the gate, in practice)
 
