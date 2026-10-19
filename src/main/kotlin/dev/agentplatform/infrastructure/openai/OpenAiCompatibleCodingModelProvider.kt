@@ -12,6 +12,7 @@ import dev.agentplatform.domain.port.ModelTurn
 import dev.agentplatform.infrastructure.model.ContentToolCallExtractor
 import dev.agentplatform.infrastructure.model.ModelRateLimiter
 import dev.agentplatform.infrastructure.model.OpenAiCompatibleModelProvider
+import dev.agentplatform.infrastructure.model.ProviderRetryBackoff
 import jakarta.enterprise.context.ApplicationScoped
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.jboss.logging.Logger
@@ -22,7 +23,6 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.UUID
-import java.util.concurrent.ThreadLocalRandom
 
 /**
  * Talks to any server that implements the OpenAI `/chat/completions` contract: OpenAI itself,
@@ -230,20 +230,11 @@ class OpenAiCompatibleCodingModelProvider(
             val bounded = retryAfterSeconds.coerceAtMost(Long.MAX_VALUE / 1000L)
             return (bounded * 1000L).coerceAtMost(retryMaxBackoffMillis)
         }
-        val exponent = (attempt - 1).coerceAtMost(MAX_BACKOFF_EXPONENT)
-        val ceiling = (retryInitialBackoffMillis shl exponent).coerceAtMost(retryMaxBackoffMillis)
-        val floor = ceiling / 2
-        return floor + ThreadLocalRandom.current().nextLong(ceiling - floor + 1)
+        return ProviderRetryBackoff.delayMillis(attempt, retryInitialBackoffMillis, retryMaxBackoffMillis)
     }
 
-    private fun sleepBeforeRetry(delayMillis: Long) {
-        try {
-            Thread.sleep(delayMillis)
-        } catch (exception: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw ModelProviderException("OpenAI-compatible retry wait was interrupted", exception)
-        }
-    }
+    private fun sleepBeforeRetry(delayMillis: Long) =
+        ProviderRetryBackoff.sleep(delayMillis, "OpenAI-compatible")
 
     internal fun isSuccessfulStatusCode(statusCode: Int): Boolean = statusCode in 200..299
 
@@ -336,7 +327,6 @@ class OpenAiCompatibleCodingModelProvider(
         const val DISABLED_SENTINEL = "disabled"
         const val TOO_MANY_REQUESTS = 429
         const val BAD_REQUEST = 400
-        const val MAX_BACKOFF_EXPONENT = 6
         val UNPARSEABLE_GENERATION_CODES = setOf("output_parse_failed", "tool_use_failed")
     }
 }

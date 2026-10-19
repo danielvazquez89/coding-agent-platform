@@ -10,6 +10,7 @@ import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import java.net.InetSocketAddress
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 class OllamaCodingModelProviderTest {
@@ -247,7 +248,7 @@ class OllamaCodingModelProviderTest {
         val server = startServer(200, """{"message":{"content":""}}""")
         try {
             val endpoint = "http://127.0.0.1:${server.address.port}"
-            val turn = OllamaCodingModelProvider(endpoint, "qwen2.5-coder:7b", 5, nullForEmptyInputMapper, ExecutionMetrics.NONE)
+            val turn = OllamaCodingModelProvider(endpoint, "qwen2.5-coder:7b", 5, 1, 1, 1, nullForEmptyInputMapper, ExecutionMetrics.NONE)
                 .chat(listOf(ModelMessage("user", "Read the README")), listOf(readFileTool()))
             assertEquals("", turn.content)
             assertTrue(turn.toolCalls.isEmpty())
@@ -263,6 +264,11 @@ class OllamaCodingModelProviderTest {
         assertThrows(IllegalArgumentException::class.java) { provider(" ") }
         assertThrows(IllegalArgumentException::class.java) { provider("http://localhost", model = " ") }
         assertThrows(IllegalArgumentException::class.java) { provider("http://localhost", timeoutSeconds = 0) }
+        assertThrows(IllegalArgumentException::class.java) { provider("http://localhost", retryMaxAttempts = 0) }
+        assertThrows(IllegalArgumentException::class.java) { provider("http://localhost", retryInitialBackoffMillis = 0) }
+        assertThrows(IllegalArgumentException::class.java) {
+            provider("http://localhost", retryInitialBackoffMillis = 100, retryMaxBackoffMillis = 50)
+        }
         assertThrows(ModelProviderException::class.java) {
             provider("not a url").chat(listOf(ModelMessage("user", "hello")), emptyList())
         }
@@ -438,12 +444,92 @@ class OllamaCodingModelProviderTest {
         assertEquals(1.0, registry.counter("agent.model.requests", "provider", "ollama", "outcome", "failure").count())
     }
 
+    @Test
+    fun `recovers from a malformed tool call the server could not parse`() {
+        val registry = SimpleMeterRegistry()
+        withSequenceServer(
+            listOf(
+                500 to """{"error":"error parsing tool call: raw='{\"regex\":continue}', err=invalid character 'c' looking for beginning of value"}""",
+                200 to """{"message":{"content":"recovered"}}"""
+            ),
+            metrics = MicrometerExecutionMetrics(registry)
+        ) { provider, requests ->
+            val turn = provider.chat(listOf(ModelMessage("user", "hello")), emptyList())
+            assertEquals("recovered", turn.content)
+            assertEquals(2, requests.get())
+            assertEquals(
+                1.0,
+                registry.counter(
+                    "agent.model.retries", "provider", "ollama", "reason", "tool_call_parse_failed"
+                ).count()
+            )
+        }
+    }
+
+    @Test
+    fun `stops retrying once attempts are exhausted and reports the provider error`() =
+        withSequenceServer(
+            listOf(500 to """{"error":"error parsing tool call: raw='{\"lineStart\":3180,'"}""")
+        ) { provider, requests ->
+            val exception = assertThrows(ModelProviderException::class.java) {
+                provider.chat(listOf(ModelMessage("user", "hello")), emptyList())
+            }
+            assertTrue(exception.message!!.contains("Ollama returned HTTP 500"))
+            assertTrue(exception.message!!.contains("error parsing tool call"))
+            assertEquals(3, requests.get())
+        }
+
+    @Test
+    fun `retries a rate limited request and a server fault`() = withSequenceServer(
+        listOf(
+            429 to """{"error":"throttled"}""",
+            502 to "bad gateway",
+            200 to """{"message":{"content":"recovered"}}"""
+        )
+    ) { provider, requests ->
+        assertEquals("recovered", provider.chat(listOf(ModelMessage("user", "hello")), emptyList()).content)
+        assertEquals(3, requests.get())
+    }
+
+    @Test
+    fun `does not retry a non-transient client error`() =
+        withSequenceServer(listOf(400 to """{"error":"bad request"}""")) { provider, requests ->
+            val exception = assertThrows(ModelProviderException::class.java) {
+                provider.chat(listOf(ModelMessage("user", "hello")), emptyList())
+            }
+            assertTrue(exception.message!!.contains("Ollama returned HTTP 400"))
+            assertEquals(1, requests.get())
+        }
+
+    @Test
+    fun `classifies only rate limits and server errors as retryable`() {
+        val provider = provider("http://localhost:11434")
+        assertTrue(provider.isRetryableStatusCode(429))
+        assertTrue(provider.isRetryableStatusCode(500))
+        assertTrue(provider.isRetryableStatusCode(503))
+        assertFalse(provider.isRetryableStatusCode(400))
+        assertFalse(provider.isRetryableStatusCode(404))
+        assertFalse(provider.isRetryableStatusCode(200))
+    }
+
     private fun provider(
         baseUrl: String,
         model: String = "qwen2.5-coder:7b",
         timeoutSeconds: Long = 5,
+        retryMaxAttempts: Int = 3,
+        retryInitialBackoffMillis: Long = 1,
+        retryMaxBackoffMillis: Long = 5,
         metrics: ExecutionMetrics = ExecutionMetrics.NONE
-    ) = OllamaCodingModelProvider(baseUrl, model, timeoutSeconds, mapper, metrics)
+    ) = OllamaCodingModelProvider(
+        baseUrl,
+        model,
+        timeoutSeconds,
+        retryMaxAttempts,
+        retryInitialBackoffMillis,
+        retryMaxBackoffMillis,
+        mapper,
+        metrics
+    )
 
     private fun readFileTool() = ModelToolDefinition(
         "read_file",
@@ -480,5 +566,29 @@ class OllamaCodingModelProviderTest {
         }
         server.start()
         return server
+    }
+
+    /** Serves the given responses in order (repeating the last one) so a retry can be observed. */
+    private fun withSequenceServer(
+        responses: List<Pair<Int, String>>,
+        metrics: ExecutionMetrics = ExecutionMetrics.NONE,
+        test: (OllamaCodingModelProvider, AtomicInteger) -> Unit
+    ) {
+        val requests = AtomicInteger()
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        server.createContext("/api/chat") { exchange ->
+            exchange.requestBody.bufferedReader().use { it.readText() }
+            val index = requests.getAndIncrement()
+            val (status, body) = responses[index.coerceAtMost(responses.size - 1)]
+            val bytes = body.toByteArray()
+            exchange.sendResponseHeaders(status, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        server.start()
+        try {
+            test(provider("http://127.0.0.1:${server.address.port}", metrics = metrics), requests)
+        } finally {
+            server.stop(0)
+        }
     }
 }

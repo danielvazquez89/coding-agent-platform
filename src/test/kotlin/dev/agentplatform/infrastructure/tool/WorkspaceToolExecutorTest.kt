@@ -190,7 +190,13 @@ class WorkspaceToolExecutorTest {
         assertThrows(IllegalArgumentException::class.java) { tools.execute("read_file", mapper.readTree("{}"), root) }
         assertThrows(IllegalArgumentException::class.java) { tools.execute("read_file", mapper.readTree("""{"path":"../outside"}"""), root) }
         assertThrows(IllegalArgumentException::class.java) { tools.execute("read_file", mapper.readTree("""{"path":"missing.txt"}"""), root) }
-        assertThrows(IllegalArgumentException::class.java) { tools.execute("read_file", mapper.readTree("""{"path":"large.txt"}"""), root) }
+        // The refusal names the file's size in lines so the model can pick a valid range instead of
+        // repeating the same whole-file call.
+        val oversized = assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("read_file", mapper.readTree("""{"path":"large.txt"}"""), root)
+        }
+        assertTrue(oversized.message!!.contains("'large.txt' has 1 lines"))
+        assertTrue(oversized.message!!.contains("startLine and endLine"))
         assertThrows(IllegalArgumentException::class.java) { tools.execute("read_file", mapper.readTree("""{"path":"binary.dat"}"""), root) }
         assertThrows(IllegalArgumentException::class.java) { tools.execute("search_code", mapper.readTree("""{"query":" "}"""), root) }
         assertThrows(IllegalArgumentException::class.java) { tools.execute("search_code", mapper.readTree("""{"query":"x","path":"../"}"""), root) }

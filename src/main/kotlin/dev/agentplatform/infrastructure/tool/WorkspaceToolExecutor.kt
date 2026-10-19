@@ -257,15 +257,17 @@ class WorkspaceToolExecutor(
         require(Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) { "File '$relative' does not exist" }
         val size = Files.size(file)
         require(size <= READ_FILE_MAX_BYTES) { "File exceeds the ${READ_FILE_MAX_BYTES / (1024 * 1024)} MB read limit" }
-        require(startLine != null || endLine != null || size <= READ_FILE_SIZE_LIMIT) {
-            "File exceeds the ${READ_FILE_SIZE_LIMIT / 1024} KB whole-file read limit; pass startLine and endLine"
-        }
-        requireUtf8Text(file, relative)
         val total = try {
             Files.lines(file).use { it.count().toInt() }
         } catch (_: IOException) {
             throw IllegalArgumentException("File '$relative' is not readable UTF-8 text")
         }
+        // Name the file's size in lines so a model that ignored the hint can still pick a valid range.
+        require(startLine != null || endLine != null || size <= READ_FILE_SIZE_LIMIT) {
+            "File '$relative' has $total lines and exceeds the ${READ_FILE_SIZE_LIMIT / 1024} KB whole-file read " +
+                "limit; call read_file again with startLine and endLine for the region you need"
+        }
+        requireUtf8Text(file, relative)
         val start = (startLine ?: 1).coerceAtLeast(1)
         require(start <= total) { "startLine $start is past the end of '$relative' ($total lines)" }
         val end = (endLine ?: total).coerceAtMost(total)

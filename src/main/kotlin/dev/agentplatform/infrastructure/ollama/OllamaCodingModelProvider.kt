@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import dev.agentplatform.domain.port.*
 import dev.agentplatform.infrastructure.model.ContentToolCallExtractor
 import dev.agentplatform.infrastructure.model.OllamaModelProvider
+import dev.agentplatform.infrastructure.model.ProviderRetryBackoff
 import jakarta.enterprise.context.ApplicationScoped
 import org.eclipse.microprofile.config.inject.ConfigProperty
+import org.jboss.logging.Logger
 import java.io.IOException
 import java.net.URI
 import java.net.http.HttpClient
@@ -24,10 +26,18 @@ class OllamaCodingModelProvider(
     private val model: String,
     @ConfigProperty(name = "agent.model.ollama.timeout-seconds", defaultValue = "1200")
     private val timeoutSeconds: Long,
+    @ConfigProperty(name = "agent.model.ollama.retry.max-attempts", defaultValue = "5")
+    private val retryMaxAttempts: Int,
+    @ConfigProperty(name = "agent.model.ollama.retry.initial-backoff-millis", defaultValue = "1000")
+    private val retryInitialBackoffMillis: Long,
+    @ConfigProperty(name = "agent.model.ollama.retry.max-backoff-millis", defaultValue = "60000")
+    private val retryMaxBackoffMillis: Long,
     private val objectMapper: ObjectMapper,
     private val metrics: ExecutionMetrics
 ) : CodingModelProvider {
     override val modelName: String get() = model
+
+    private val logger = Logger.getLogger(OllamaCodingModelProvider::class.java)
 
     private val httpClient by lazy {
         HttpClient.newBuilder()
@@ -39,6 +49,11 @@ class OllamaCodingModelProvider(
         require(baseUrl.isNotBlank()) { "Ollama base URL must not be blank" }
         require(model.isNotBlank()) { "Ollama model name must not be blank" }
         require(timeoutSeconds > 0) { "Ollama timeout must be greater than zero" }
+        require(retryMaxAttempts >= 1) { "Ollama retry attempts must be at least one" }
+        require(retryInitialBackoffMillis > 0) { "Ollama retry backoff must be greater than zero" }
+        require(retryMaxBackoffMillis >= retryInitialBackoffMillis) {
+            "Ollama maximum retry backoff must not be smaller than the initial backoff"
+        }
     }
 
     override fun chat(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): ModelTurn = try {
@@ -67,14 +82,7 @@ class OllamaCodingModelProvider(
             .POST(HttpRequest.BodyPublishers.ofString(serializeRequest(messages, tools)))
             .build()
 
-        val response = try {
-            httpClient.send(request, HttpResponse.BodyHandlers.ofString())
-        } catch (exception: InterruptedException) {
-            Thread.currentThread().interrupt()
-            throw ModelProviderException("Ollama request was interrupted", exception)
-        } catch (exception: IOException) {
-            throw ModelProviderException("Could not reach the Ollama server at $baseUrl", exception)
-        }
+        val response = sendWithRetries(request)
 
         if (!isSuccessfulStatusCode(response.statusCode())) {
             val detail = response.body().take(MAX_ERROR_LENGTH)
@@ -112,6 +120,51 @@ class OllamaCodingModelProvider(
     }
 
     internal fun isSuccessfulStatusCode(statusCode: Int): Boolean = statusCode in 200..299
+
+    /**
+     * Sends the chat request, retrying transient responses (HTTP 429 and 5xx) with bounded exponential
+     * backoff and jitter. Ollama answers a 500 when the model's own tool-call JSON could not be decoded
+     * (`error parsing tool call`), which is a generation failure rather than a bad request: a fresh
+     * sample usually decodes. Local models emit that class of malformed call often enough that failing
+     * the whole attempt on the first one is not honest about the model's real ability. Non-transient
+     * responses and the final attempt are returned as-is so the caller keeps the provider's own detail.
+     */
+    private fun sendWithRetries(request: HttpRequest): HttpResponse<String> {
+        var attempt = 1
+        while (true) {
+            val response = try {
+                httpClient.send(request, HttpResponse.BodyHandlers.ofString())
+            } catch (exception: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw ModelProviderException("Ollama request was interrupted", exception)
+            } catch (exception: IOException) {
+                throw ModelProviderException("Could not reach the Ollama server at $baseUrl", exception)
+            }
+            if (!isRetryableStatusCode(response.statusCode()) || attempt >= retryMaxAttempts) {
+                return response
+            }
+            val reason = retryReason(response)
+            metrics.modelRetry(PROVIDER_NAME, reason)
+            val delayMillis =
+                ProviderRetryBackoff.delayMillis(attempt, retryInitialBackoffMillis, retryMaxBackoffMillis)
+            logger.warn(
+                "Ollama provider returned HTTP ${response.statusCode()} ($reason); " +
+                    "retrying in ${delayMillis}ms (attempt ${attempt + 1} of $retryMaxAttempts)"
+            )
+            ProviderRetryBackoff.sleep(delayMillis, "Ollama")
+            attempt++
+        }
+    }
+
+    /** Classifies a retry: a malformed model tool call is distinct from throttling or a server fault. */
+    private fun retryReason(response: HttpResponse<String>): String = when {
+        response.statusCode() == TOO_MANY_REQUESTS -> "rate_limited"
+        response.body().contains(TOOL_CALL_PARSE_FAILURE, ignoreCase = true) -> "tool_call_parse_failed"
+        else -> "server_error"
+    }
+
+    internal fun isRetryableStatusCode(statusCode: Int): Boolean =
+        statusCode == TOO_MANY_REQUESTS || statusCode in 500..599
 
     private fun serializeRequest(messages: List<ModelMessage>, tools: List<ModelToolDefinition>): String {
         val request = objectMapper.createObjectNode()
@@ -176,5 +229,7 @@ class OllamaCodingModelProvider(
     private companion object {
         const val PROVIDER_NAME = "ollama"
         const val MAX_ERROR_LENGTH = 1000
+        const val TOO_MANY_REQUESTS = 429
+        const val TOOL_CALL_PARSE_FAILURE = "error parsing tool call"
     }
 }
