@@ -67,6 +67,15 @@ class WorkspaceToolExecutorTest {
         assertTrue(search.contains("Sample.kt:2: val greeting"))
         assertEquals("No matches found.", tools.execute("search_code", mapper.readTree("""{"query":"absent"}"""), root).content)
         assertTrue(tools.execute("search_code", mapper.readTree("""{"query":"sample"}"""), root).content.isNotBlank())
+        // `search_code` scans a directory; a file path is rejected with a message that says so, and the
+        // new find_symbol tool is the way to scan one file.
+        val filePath = assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("search_code", mapper.readTree("""{"query":"greeting","path":"src/main/Sample.kt"}"""), root)
+        }
+        assertTrue(filePath.message.orEmpty().contains("is a file"), filePath.message.orEmpty())
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("search_code", mapper.readTree("""{"query":"x","path":"missing"}"""), root)
+        }
         assertTrue(tools.execute("read_file", mapper.readTree("""{"path":"src/main/Sample.kt"}"""), root).content.contains("hello agent"))
         assertEquals("No files found.", tools.execute("list_files", mapper.readTree("""{"path":"empty"}"""), root).content)
         assertThrows(IllegalArgumentException::class.java) {
@@ -136,6 +145,17 @@ class WorkspaceToolExecutorTest {
         assertEquals(1, bounded.lines().count { it.trimStart().startsWith("src/") })
 
         assertTrue(method.contains("Next: read the lines around a declaration with read_file"), method)
+        // A file path scans just that file, which is how a model scopes the search it already suspects.
+        val scoped = tools.execute(
+            "find_symbol",
+            mapper.readTree("""{"name":"writeValue","path":"src/main/java/dev/example/Writer.java"}"""),
+            root
+        ).content
+        assertTrue(scoped.contains("Writer.java:6: [method]"), scoped)
+        assertFalse(scoped.contains("WriterTest.java"), scoped)
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("find_symbol", mapper.readTree("""{"name":"writeValue","path":"missing"}"""), root)
+        }
         // A declaration phrase is accepted: the last identifier token is the symbol.
         val phrase = tools.execute(
             "find_symbol",
