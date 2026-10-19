@@ -67,12 +67,13 @@ class WorkspaceToolExecutorTest {
         assertTrue(search.contains("Sample.kt:2: val greeting"))
         assertEquals("No matches found.", tools.execute("search_code", mapper.readTree("""{"query":"absent"}"""), root).content)
         assertTrue(tools.execute("search_code", mapper.readTree("""{"query":"sample"}"""), root).content.isNotBlank())
-        // `search_code` scans a directory; a file path is rejected with a message that says so, and the
-        // new find_symbol tool is the way to scan one file.
-        val filePath = assertThrows(IllegalArgumentException::class.java) {
-            tools.execute("search_code", mapper.readTree("""{"query":"greeting","path":"src/main/Sample.kt"}"""), root)
-        }
-        assertTrue(filePath.message.orEmpty().contains("is a file"), filePath.message.orEmpty())
+        // A file path scopes the scan to that one file, which is how a model naturally searches.
+        val fileScoped = tools.execute(
+            "search_code",
+            mapper.readTree("""{"query":"greeting","path":"src/main/Sample.kt"}"""),
+            root
+        ).content
+        assertTrue(fileScoped.contains("Sample.kt:2:"), fileScoped)
         assertThrows(IllegalArgumentException::class.java) {
             tools.execute("search_code", mapper.readTree("""{"query":"x","path":"missing"}"""), root)
         }
@@ -504,8 +505,16 @@ class WorkspaceToolExecutorTest {
         ).content
         assertTrue(past.startsWith("No matches at offset 50"))
 
+        // A file path scopes the scan to that one file, which is how a model naturally searches.
+        val fileScoped = tools.execute(
+            "search_code",
+            mapper.readTree("""{"query":"val","path":"src/main/Alpha.kt"}"""),
+            root
+        ).content
+        assertTrue(fileScoped.contains("Alpha.kt:1: val first = 1"), fileScoped)
+        assertFalse(fileScoped.contains("AlphaTest.kt"), fileScoped)
         assertThrows(IllegalArgumentException::class.java) {
-            tools.execute("search_code", mapper.readTree("""{"query":"val","path":"src/main/Alpha.kt"}"""), root)
+            tools.execute("search_code", mapper.readTree("""{"query":"val","path":"missing"}"""), root)
         }
         assertThrows(IllegalArgumentException::class.java) {
             tools.execute("search_code", mapper.readTree("""{"query":"val","offset":-1}"""), root)

@@ -37,7 +37,7 @@ class WorkspaceToolExecutor(
 
     fun definitions(): List<ModelToolDefinition> = listOf(
         tool("list_files", "List repository files, optionally under a relative directory, filtered by a glob and a depth.", """{"type":"object","properties":{"path":{"type":"string"},"depth":{"type":"integer","minimum":1,"description":"Maximum directory levels below path. Omit for the whole tree."},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example **/*.kt or src/**/*.java."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 250, capped at 1000."}},"additionalProperties":false}"""),
-        tool("search_code", "Search repository text line by line. The query is a literal unless regex is true. The path is a directory; use glob to narrow to files. Results are paginated with offset and maxResults.", """{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example **/*.kt."},"regex":{"type":"boolean","description":"Treat the query as a Java regular expression. Invalid expressions are rejected."},"ignoreCase":{"type":"boolean","description":"Defaults to true."},"offset":{"type":"integer","minimum":0,"description":"Number of matches to skip. Defaults to 0."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 25, capped at 200."}},"required":["query"],"additionalProperties":false}"""),
+        tool("search_code", "Search repository text line by line. The query is a literal unless regex is true. The path may be a file or a directory. Results are paginated with offset and maxResults.", """{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example **/*.kt."},"regex":{"type":"boolean","description":"Treat the query as a Java regular expression. Invalid expressions are rejected."},"ignoreCase":{"type":"boolean","description":"Defaults to true."},"offset":{"type":"integer","minimum":0,"description":"Number of matches to skip. Defaults to 0."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 25, capped at 200."}},"required":["query"],"additionalProperties":false}"""),
         tool("find_symbol", "Locate where a class, interface, enum, record, method, function or field is declared. Use this first when the task names an identifier or when the repository map points at a file: it returns path:line for declarations before other occurrences, so you can read only the surrounding lines. The path may be a file or a directory. A bounded line scan, not a compiler; confirm the line before editing.", """{"type":"object","properties":{"name":{"type":"string","description":"A single identifier, for example writeValue or JSONObject."},"path":{"type":"string"},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example src/**/*.java."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 25, capped at 200."}},"required":["name"],"additionalProperties":false}"""),
         tool("read_file", "Read a UTF-8 text file, optionally a 1-based inclusive line range. A whole-file read is limited to 50 KB; larger files require a range. Output is capped at 12,000 characters.", """{"type":"object","properties":{"path":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}"""),
         tool("create_file", "Create a new UTF-8 text file with exactly the content given. Parent directories are created. Fails if the file already exists; use apply_patch to modify an existing file. The path must stay inside the repository.", """{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Exact file content. Include the trailing newline if the file should end with one."}},"required":["path","content"],"additionalProperties":false}"""),
@@ -142,19 +142,13 @@ class WorkspaceToolExecutor(
         require(query.length <= SEARCH_PATTERN_LIMIT) { "Search query exceeds the $SEARCH_PATTERN_LIMIT character limit" }
         require(offset >= 0) { "Tool argument 'offset' must not be negative" }
         require(offset <= SEARCH_SCAN_MATCH_LIMIT) { "Tool argument 'offset' must not exceed $SEARCH_SCAN_MATCH_LIMIT" }
-        val directory = resolve(workspace, relative, allowEmpty = true)
-        require(!Files.isRegularFile(directory, LinkOption.NOFOLLOW_LINKS)) {
-            "Path '$relative' is a file; search_code scans a directory. Pass the directory, or use " +
-                "find_symbol to scan one file."
-        }
-        require(Files.isDirectory(directory, LinkOption.NOFOLLOW_LINKS)) { "Directory '$relative' does not exist" }
         val pattern = compileSearchPattern(query, regex, ignoreCase)
         val matcher = globMatcher(glob)
         val limit = maxResults.coerceIn(1, SEARCH_MATCH_LIMIT_MAX)
         val scanLimit = minOf(SEARCH_SCAN_MATCH_LIMIT, offset + limit)
         val matches = mutableListOf<String>()
         var capped = false
-        scan@ for (file in collectFiles(directory, SEARCH_FILE_LIMIT) { matchesGlob(matcher, workspace, it) }) {
+        scan@ for (file in scanTargets(workspace, relative, SEARCH_FILE_LIMIT) { matchesGlob(matcher, workspace, it) }) {
             if (Files.size(file) > SEARCH_FILE_SIZE_LIMIT) continue
             val lines = try { Files.readAllLines(file) } catch (_: IOException) { continue }
             val path = workspace.relativize(file).toString().replace('\\', '/')
@@ -188,23 +182,12 @@ class WorkspaceToolExecutor(
         // the symbol instead of burning a tool call on a format rule.
         val name = SYMBOL_TOKEN.findAll(rawName).lastOrNull()?.value
             ?: throw IllegalArgumentException("Symbol name '$rawName' contains no identifier; pass one such as 'writeValue'")
-        val target = resolve(workspace, relative, allowEmpty = true)
         val matcher = globMatcher(glob)
         val limit = maxResults.coerceIn(1, SEARCH_MATCH_LIMIT_MAX)
         val word = Regex("""(^|[^\w$])${Regex.escape(name)}([^\w$]|$)""")
         val declarations = mutableListOf<SymbolHit>()
         val references = mutableListOf<SymbolHit>()
-        // A model naturally scopes the search to the one file it suspects, so accept a file as well as
-        // a directory; anything that is neither fails honestly.
-        val files = if (Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
-            if (matchesGlob(matcher, workspace, target)) listOf(target) else emptyList()
-        } else {
-            require(Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
-                "Path '$relative' is not a file or directory in the repository"
-            }
-            collectFiles(target, SEARCH_FILE_LIMIT) { matchesGlob(matcher, workspace, it) }
-        }
-        scan@ for (file in files) {
+        scan@ for (file in scanTargets(workspace, relative, SEARCH_FILE_LIMIT) { matchesGlob(matcher, workspace, it) }) {
             if (Files.size(file) > SEARCH_FILE_SIZE_LIMIT) continue
             val lines = try { Files.readAllLines(file) } catch (_: IOException) { continue }
             val path = workspace.relativize(file).toString().replace('\\', '/')
@@ -432,6 +415,28 @@ class WorkspaceToolExecutor(
             }
         })
         return files.sortedBy { it.toString() }
+    }
+
+    /**
+     * The files a read-only scan visits for a `path` argument. A model naturally scopes a search to the
+     * single file it already suspects — live runs show it passing a file path to both `search_code` and
+     * `find_symbol` — so a file path scans exactly that file and a directory path walks the tree;
+     * anything else fails honestly instead of scanning the wrong thing.
+     */
+    private fun scanTargets(
+        workspace: Path,
+        relative: String,
+        limit: Int,
+        accept: ((Path) -> Boolean)? = null
+    ): List<Path> {
+        val target = resolve(workspace, relative, allowEmpty = true)
+        if (Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS)) {
+            return if (accept == null || accept(target)) listOf(target) else emptyList()
+        }
+        require(Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
+            "Path '$relative' is not a file or directory in the repository"
+        }
+        return collectFiles(target, limit, accept = accept)
     }
 
     private fun globMatcher(glob: String): ((String) -> Boolean)? {

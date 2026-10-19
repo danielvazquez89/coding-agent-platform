@@ -152,15 +152,18 @@ a committed document; the day-to-day roadmap and open questions live in the unco
 - **Symptom.** In run H the model's very first call — and the best one it made — was
   `find_symbol(name=writeValue, path=src/main/java/org/json/JSONObject.java)`: it had already narrowed to
   the file and asked "is it declared here?". The call **failed**, because the new tool required a
-  directory, while later calls that scanned a directory succeeded.
-- **Root cause.** `find_symbol` copied `search_code`'s directory-only `path` check. `search_code` has a
-  `glob` for narrowing to files, but a model treating `path` as "where to look" naturally passes the file
-  it suspects.
-- **Decision.** `find_symbol` accepts a file or a directory path and scans exactly that file when given
-  one; `search_code` keeps its documented directory contract, but a file path now fails with a message
-  that says the path is a file and points at `find_symbol`, instead of the misleading "Directory ... does
-  not exist" (the file does exist).
-- **Status.** Shipped and unit-tested.
+  directory, while later calls that scanned a directory succeeded. Run I then showed the same instinct
+  pointed at the real search: the model passed a **file** to `search_code` six times in one run, every one
+  rejected, while its file-scoped `find_symbol` calls succeeded.
+- **Root cause.** Both tools treated `path` as a directory. `search_code` has a `glob` for narrowing to
+  files, but a model treating `path` as "where to look" consistently passes the file it suspects.
+- **Decision.** Both `search_code` and `find_symbol` accept a file **or** a directory path through one
+  shared, bounded `scanTargets` helper: a file scans exactly that file, a directory walks the tree, and
+  anything else fails honestly. This replaces `search_code`'s previous directory-only contract (one
+  existing test asserted the old rejection and was updated); the earlier fallback of an improved error
+  message was not enough — the model kept repeating the call.
+- **Status.** Shipped and unit-tested; the file-scoped `find_symbol` call is confirmed working live in
+  run I.
 
 ## Where this stands after the real-repository runs
 
@@ -178,21 +181,23 @@ recorded rather than glossed over, because the failures are informative.
 | F `3766f0a7` | `qwen/qwen3.8-27b`, 12000-char window | 16 model calls, 25 tool calls (11 `search_code`, 7 `read_file`, 5 `list_files`, 2 `related_tests`), no patch, tool-call limit reached |
 | G `1941c804` | `qwen/qwen3.8-27b`, after `find_symbol` | 18 tool calls (13 `find_symbol`, 4 `search_code`, 1 `apply_patch`): located the method and proposed its **first** patch, which was rejected because the context lost the file's indentation and the model had not read the file; the run then ended on Groq's daily token cap (TPD 200000) |
 | H `235379b4` | `openai/gpt-oss-120b`, after `find_symbol` | 22 tool calls (7 `search_code`, 6 `list_files`, 4 `read_file`, 2 `find_symbol`), no patch: its first, best call scoped `find_symbol` to the suspect file and was rejected (finding 11); the 12000-character window then dropped up to 16 tool exchanges at a time and the model re-explored until the **daily** token cap (197282/200000) ended the run |
+| I `7c883e11` | `openai/gpt-oss-20b`, after finding 11 | 17 tool calls (8 `search_code`, 6 `read_file`, 2 `find_symbol`), no patch: file-scoped `find_symbol` succeeded, but six `search_code` calls passed a file and were rejected (finding 11), then the run ended on a per-minute cap (TPM 7104+3570 > 8000) |
 
 What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
 unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
 HTTP 413 and re-read loop were fixed and did not recur, and the generation-error retry visibly recovered
 attempts that previously died. Run G shows the localization change moving the needle in the intended
 direction: the model that previously explored without ever patching now reaches the method and proposes a
-change. Run H shows the tool-ergonomics bug that first call exposed: the model scoped `find_symbol` to the
-single file it suspected and the directory-only check rejected it (finding 11). The remaining gap on the
-free tier is exactness — the patch must reproduce the file's indentation — and the tier's **daily** token
-cap: every Groq free-tier bucket is 200,000 tokens per day, which a half-hour run of real tool results
-exhausts, so pacing cannot recover it and a run cannot be repeated until the quota resets. The
-read-before-patch guidance, the tolerant `find_symbol` argument, the single-file scope and the actionable
-hunk diagnostic (findings 10 and 11) target the correctness gap; the quota is an external limit worth
-stating plainly. An explicit, auditable plan step remains open. Hosted OpenAI API models (`gpt-4o`,
-`gpt-4.1`, the o-series) remain untested here: no key is available.
+change. Runs H and I show the tool-ergonomics bug that first call exposed: a model scopes `search_code`
+and `find_symbol` to the single file it suspects, and a directory-only `path` rejected that (finding 11).
+The remaining gap on the free tier is exactness — the patch must reproduce the file's indentation — and
+the tier's hard caps: every Groq free-tier bucket is 200,000 tokens per day and as little as 8,000 tokens
+per minute, which a half-hour run of real tool results exhausts, so pacing cannot recover it and a run
+cannot be repeated until the quota resets. The read-before-patch guidance, the tolerant `find_symbol`
+argument, the file-scoped `path` for both search tools and the actionable hunk diagnostic (findings 10 and
+11) target the correctness gap; the quota is an external limit worth stating plainly. An explicit,
+auditable plan step remains open. Hosted OpenAI API models (`gpt-4o`, `gpt-4.1`, the o-series) remain
+untested here: no key is available.
 
 ## Repository selection (the gate, in practice)
 
