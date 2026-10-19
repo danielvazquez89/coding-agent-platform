@@ -165,6 +165,78 @@ a committed document; the day-to-day roadmap and open questions live in the unco
 - **Status.** Shipped and unit-tested; the file-scoped `find_symbol` call is confirmed working live in
   run I.
 
+### 12. A local model's malformed tool call arrives as HTTP 500, and the local adapter never retried
+
+- **Symptom.** The first local runs of the real JSON-java task died after one or two tool calls with
+  `ModelProviderException: Ollama returned HTTP 500: {"error":"error parsing tool call: raw='{...}', err=...}`.
+  Ollama could not decode the model's own tool-call JSON, so it never returned a turn.
+- **Evidence.** Task `b6d2afff-bda8-4372-8237-bbca86154a7b` ended on
+  `raw='{"ignoreCase":true,...,"query":"MyEnumField","regex":continue}', err=invalid character 'c' looking for beginning of value` —
+  the model wrote `continue` where a JSON value belonged. Task
+  `54b010f4-fdae-4027-8e08-a84b50d90165` ended the same way after 19 tool calls with a truncated arguments
+  object, `raw='{"lineEnd":3200,"lineStart":3180,"', err=unexpected end of JSON input`.
+- **Root cause.** The hosted adapter already retries exactly this class of failure (a valid request the
+  provider could not match to the model's output — finding 7), but `OllamaCodingModelProvider` had no
+  retry at all, so the first bad sample failed the attempt even though a fresh sample usually decodes.
+- **Decision.** Retry HTTP 429 and 5xx in the local adapter with bounded exponential backoff and jitter,
+  reporting the reason as a low-cardinality tag (`rate_limited`, `tool_call_parse_failed`, `server_error`).
+  The wait policy is shared with the hosted adapter through `ProviderRetryBackoff`, so both providers back
+  off the same way; each adapter still owns what is retryable. The retry loop was then exercised live
+  (runs K and L) and no further provider error ended a run.
+
+### 13. The whole-file read refusal did not stop a local model from repeating it
+
+- **Symptom.** In task `54b010f4-fdae-4027-8e08-a84b50d90165` the model called
+  `read_file(path=src/main/java/org/json/JSONObject.java)` **ten times** and got the same refusal each
+  time: `File exceeds the 48 KB whole-file read limit; pass startLine and endLine`. It never supplied a
+  range; two of its attempts also mis-named the parameters (`lineStart`/`lineEnd`).
+- **Root cause.** The refusal said what to do but not how large the file was, so the model had no way to
+  choose a range and repeated the call it had already made.
+- **Decision.** The refusal now names the file's size in lines: `File '...' has 3684 lines and exceeds the
+  48 KB whole-file read limit; call read_file again with startLine and endLine for the region you need`.
+  In the next run (K) the model switched to a ranged read on its first attempt and the refusal never
+  repeated. That is one observation, not a controlled comparison; the tool contract is unchanged and a
+  range is still required for a large file.
+
+### 14. A local model pastes a glob into the `path` argument
+
+- **Symptom.** In run K the model called `search_code(..., path="**/*.java")` twice and got only
+  `Repository-relative path is invalid` back. Every scanning tool takes a concrete `path` plus a separate
+  `glob`, so the pattern was in the wrong argument and the message did not say so.
+- **Decision.** The refusal names the `glob` argument whenever the path looks like a pattern (contains
+  `*`, `?` or `[`), on both the invalid-path and the not-a-file-or-directory path, so the same correction
+  is offered on every platform. The message stays a refusal: the pattern is not silently reinterpreted as
+  a glob, because guessing which argument a model meant would widen the tool contract.
+
+### 15. What a local 20B on a 6 GB GPU actually does with the real issue
+
+- **Setup.** Windows, RTX 2060 (6 GB VRAM, 4.8 GB free), 16 GB RAM, Ollama with `gpt-oss:20b`
+  (12.8 GB, mixture-of-experts with 3.6B active parameters). Provider `ollama`, **no** rate limit, a
+  `48000`-character tool-history budget, a `1200`-token repository map and a two-hour task limit — every
+  platform limit that could be relaxed for a fair local test was relaxed. The external quota that blocks
+  the hosted runs does not exist here.
+- **Runs K (`bcd59f58-8467-432a-ab66-e32f1bfe98db`) and L (`878bdb97-56e0-43fe-b8d6-679612405de6`).**
+  K: 25 tool calls (13 `search_code`, 4 `list_files`, 4 `read_file`, 1 `run_validation`, 2 rejected
+  `search_code`), no patch, ended on the 24-tool-call limit. L: 15 tool calls, no patch, ended
+  `NEEDS_INPUT`.
+- **What worked.** `run_validation` ran JSON-java's full suite in the isolated Docker container and
+  reported `824 tests, 0 failures` (`durationMillis` 97717) — the validation path is real, local and
+  quota-free. The model localized nothing (it never called `find_symbol`, despite the system prompt), read
+  1,488 characters of a 3,684-line file, and then searched the same ground repeatedly: nine `search_code`
+  calls returned 17 characters (no matches).
+- **What the platform refused to fake.** Run L ended with the model answering the report request with
+  prose — *"I'm sorry, but I can't produce the requested report without knowing the acceptance criteria"* —
+  instead of the JSON report, even though the criteria are in the task prompt. The attempt is recorded
+  `NEEDS_INPUT` with all three criteria `UNVERIFIED`, `changedFiles=[]` and `patchDiff=null`; the narrative
+  is stored under "Model-provided narrative (not independently verified)". The bounded report re-ask
+  (finding 3) did its job; it did not invent a summary.
+- **Conclusion so far.** At this size the model is a fluent tool-caller that cannot yet drive a
+  3,684-line file to a correct patch: it does not follow the locate-first instruction reliably and does
+  not converge inside a 24-call budget. The local constraint is capability, not throughput — generation
+  is fast enough (run L: 20 model calls, 51,497 prompt tokens and 2,039 completion tokens in 324 s on a
+  6 GB card) and there is no quota. The next local experiment is a code-specialized 14B
+  (`qwen2.5-coder:14b`) to see whether the gap is the model family or the size class.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -182,6 +254,10 @@ recorded rather than glossed over, because the failures are informative.
 | G `1941c804` | `qwen/qwen3.8-27b`, after `find_symbol` | 18 tool calls (13 `find_symbol`, 4 `search_code`, 1 `apply_patch`): located the method and proposed its **first** patch, which was rejected because the context lost the file's indentation and the model had not read the file; the run then ended on Groq's daily token cap (TPD 200000) |
 | H `235379b4` | `openai/gpt-oss-120b`, after `find_symbol` | 22 tool calls (7 `search_code`, 6 `list_files`, 4 `read_file`, 2 `find_symbol`), no patch: its first, best call scoped `find_symbol` to the suspect file and was rejected (finding 11); the 12000-character window then dropped up to 16 tool exchanges at a time and the model re-explored until the **daily** token cap (197282/200000) ended the run |
 | I `7c883e11` | `openai/gpt-oss-20b`, after finding 11 | 17 tool calls (8 `search_code`, 6 `read_file`, 2 `find_symbol`), no patch: file-scoped `find_symbol` succeeded, but six `search_code` calls passed a file and were rejected (finding 11), then the run ended on a per-minute cap (TPM 7104+3570 > 8000) |
+| J `b6d2afff` | local `gpt-oss:20b` (Ollama) | 2 tool calls, no patch: Ollama answered HTTP 500 `error parsing tool call` because the model wrote `"regex":continue` (finding 12) |
+| J2 `54b010f4` | local `gpt-oss:20b` (Ollama) | 19 tool calls, no patch: 10 identical whole-file read refusals, then HTTP 500 on a truncated tool-call arguments object (findings 12 and 13) |
+| K `bcd59f58` | local `gpt-oss:20b`, after the retry | 25 tool calls, no patch: the retry removed the fatal provider error, the first whole-file refusal produced a ranged read, two `search_code` calls pasted a glob into `path` (finding 14), then the 24-tool-call limit ended the run (finding 15) |
+| L `878bdb97` | local `gpt-oss:20b`, after the glob hint | 15 tool calls, no patch, `NEEDS_INPUT`: `run_validation` passed JSON-java's full 824-test suite in Docker, the model never called `find_symbol`, then answered the report request with prose asking for the acceptance criteria instead of the JSON report (finding 15) |
 
 What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
 unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
@@ -198,6 +274,14 @@ argument, the file-scoped `path` for both search tools and the actionable hunk d
 11) target the correctness gap; the quota is an external limit worth stating plainly. An explicit,
 auditable plan step remains open. Hosted OpenAI API models (`gpt-4o`, `gpt-4.1`, the o-series) remain
 untested here: no key is available.
+
+Runs J–L moved the experiment off the hosted quota entirely. A local `gpt-oss:20b` on a 6 GB card removes
+the external limit — no per-minute or per-day cap, a two-hour wall clock — and the two fixes those runs
+produced (the local retry for a malformed tool call, and refusals that carry the line count and the
+`glob` argument) both came from a live failure rather than a guess. What remains for a local run is the
+model: it can read, search and run a real 824-test suite through the platform, but it does not reliably
+follow the locate-first instruction, so it never reaches a patch (finding 15). That is a capability
+statement about the model size, not about the loop, and it is recorded as such.
 
 ## Repository selection (the gate, in practice)
 
