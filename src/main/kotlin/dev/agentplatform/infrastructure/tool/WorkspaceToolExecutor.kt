@@ -436,7 +436,7 @@ class WorkspaceToolExecutor(
             return if (accept == null || accept(target)) listOf(target) else emptyList()
         }
         require(Files.isDirectory(target, LinkOption.NOFOLLOW_LINKS)) {
-            "Path '$relative' is not a file or directory in the repository"
+            "Path '$relative' is not a file or directory in the repository${globHint(relative)}"
         }
         return collectFiles(target, limit, accept = accept)
     }
@@ -463,6 +463,18 @@ class WorkspaceToolExecutor(
         }
     }
 
+    /**
+     * A path-shaped glob (for example `*.java` or a `**` pattern) is a common model mistake: the pattern
+     * belongs in the tool's `glob` argument, which exists on every scanning tool. Naming that here turns a
+     * dead end into a correction the model can act on in one step.
+     */
+    private fun globHint(relative: String): String =
+        if (relative.any { it == '*' || it == '?' || it == '[' }) {
+            "; put the pattern in the 'glob' argument and use 'path' for a file or directory"
+        } else {
+            "; 'path' must be a file or directory inside the repository"
+        }
+
     private fun resolve(workspace: Path, relative: String, allowEmpty: Boolean = false): Path {
         val root = workspace.toAbsolutePath().normalize()
         if (relative.isBlank()) {
@@ -470,7 +482,8 @@ class WorkspaceToolExecutor(
             return root
         }
         val path = try { Path.of(relative) } catch (_: RuntimeException) {
-            throw IllegalArgumentException("Repository-relative path is invalid")
+            // A model often pastes a pattern such as **/*.java into `path`; name the argument that takes it.
+            throw IllegalArgumentException("Repository-relative path is invalid${globHint(relative)}")
         }
         require(!path.isAbsolute && path.none { it.toString() == ".." }) { "Path must stay inside the repository" }
         val target = root.resolve(path).normalize()

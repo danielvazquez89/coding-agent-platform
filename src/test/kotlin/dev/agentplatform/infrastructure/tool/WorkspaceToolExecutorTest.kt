@@ -592,6 +592,36 @@ class WorkspaceToolExecutorTest {
     }
 
     @Test
+    fun `turns a pattern pasted into the path argument into a glob instruction`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src"))
+        Files.writeString(root.resolve("src/Alpha.java"), "class Alpha {}\n")
+        val tools = executor()
+
+        listOf(
+            """{"query":"class","path":"**/*.java"}""",
+            """{"name":"Alpha","path":"src/*.java"}"""
+        ).forEachIndexed { index, arguments ->
+            val tool = if (index == 0) "search_code" else "find_symbol"
+            val failure = assertThrows(IllegalArgumentException::class.java) {
+                tools.execute(tool, mapper.readTree(arguments), root)
+            }
+            assertTrue(
+                failure.message!!.contains("'glob' argument"),
+                "$tool did not point at the glob argument: ${failure.message}"
+            )
+        }
+
+        // The glob argument itself still works, so the correction the model is offered is real.
+        val matched = tools.execute(
+            "search_code",
+            mapper.readTree("""{"query":"class","glob":"**/*.java"}"""),
+            root
+        ).content
+        assertTrue(matched.contains("src/Alpha.java"))
+    }
+
+    @Test
     fun `reports patch application failure after a successful dry run`() {
         val root = repository()
         val commands = object : CommandExecutor {
