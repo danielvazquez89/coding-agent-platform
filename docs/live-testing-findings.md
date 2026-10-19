@@ -234,8 +234,46 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   3,684-line file to a correct patch: it does not follow the locate-first instruction reliably and does
   not converge inside a 24-call budget. The local constraint is capability, not throughput — generation
   is fast enough (run L: 20 model calls, 51,497 prompt tokens and 2,039 completion tokens in 324 s on a
-  6 GB card) and there is no quota. The next local experiment is a code-specialized 14B
-  (`qwen2.5-coder:14b`) to see whether the gap is the model family or the size class.
+  6 GB card) and there is no quota. The follow-up local experiment — a code-specialized 14B,
+  `qwen2.5-coder:14b` (finding 16) — separated the model family from the size class.
+
+### 16. The local limit is the model's family, not its size
+
+- **Setup.** Same machine and card as finding 15, same platform and prompt, same two-hour limit and
+  `48000`-character history budget. Only the model changes: `qwen2.5-coder:14b` (a 9 GB,
+  code-specialized dense 14B) instead of the general-purpose `gpt-oss:20b` mixture-of-experts. At
+  Ollama's default 4,096-token context it does not fit the 6 GB card, so it runs **57% CPU / 43% GPU**
+  (`ollama ps`) — a smaller parameter count than the MoE, yet slower per call because most layers are
+  on the host.
+- **Run M (`5affe250-67a8-4407-9572-b9f8cfe1d3b6`, attempt `00c4401b-84e6-4ecb-a62b-ebe7bc35d1bf`).**
+  Six tool calls and the model produced the change the issue asks for:
+  1. `find_symbol(name=writeValue, path=src/main/java/org/json/JSONObject.java)` — the file-scoped
+     call a model instinctively makes (finding 11), on its **first** turn;
+  2. `read_file` (626 characters), 3. `find_symbol` again, 4. `read_file` (1,138 characters) — it read
+     only the region it needed, never the 3,684-line whole file;
+  5. `apply_patch`, 636 characters, applied cleanly;
+  6. `run_validation` — JSON-java's full suite in the isolated Docker container.
+- **The patch is the intended production change**, not an approximation:
+  `writer.write(quote(((Enum<?>)value).name()));` → `...toString()));` in `writeValue`
+  (`@@ -3183,7 +3183,7 @@`).
+- **Validation, reported honestly.** `824 tests, 4 failures, 6 skipped` (~79 s): every failure is in
+  `EnumTest` (`enumToString`, `jsonObjectFromEnum`, `verifyEnumConsistency`, `wrap`) — the assertions
+  that still encode `name()`, and that the task required be updated. The model changed the production
+  code but not the test file, so it did not converge on a green suite and did not claim to.
+- **Outcome.** `NEEDS_INPUT` (`Acceptance criteria could not be verified`), all three criteria
+  `UNVERIFIED`, `changedFiles=[src/main/java/org/json/JSONObject.java]`, the stored diff intact
+  (`patchDiffTruncated=false`) and therefore **refused for export** because no criterion passed. After
+  validation returned, both remaining model turns proposed no tool call — the model reported rather
+  than iterating on the failure.
+- **Cost of being local.** 8 model calls, 19,456 prompt / 1,180 completion tokens, 503.6 s in model
+  generation, 596.4 s attempt wall clock. No quota, no rate limit, no provider error, no retry, no
+  history truncation.
+- **Conclusion.** The gap in runs J–L was the model **family**, not the size class. On the same card
+  and the same platform, a code-specialized 14B follows the locate-first prompt, scopes `find_symbol`
+  to the file, and reaches the correct patch where a general-purpose 20B MoE never did — in six tool
+  calls against fifteen to twenty-five. The local model's remaining gap is task-level completeness
+  (updating the test a correct source change breaks), not localization. The safe default is unchanged:
+  the unverified change is stored and refused, never reported as complete.
 
 ## Where this stands after the real-repository runs
 
@@ -258,6 +296,7 @@ recorded rather than glossed over, because the failures are informative.
 | J2 `54b010f4` | local `gpt-oss:20b` (Ollama) | 19 tool calls, no patch: 10 identical whole-file read refusals, then HTTP 500 on a truncated tool-call arguments object (findings 12 and 13) |
 | K `bcd59f58` | local `gpt-oss:20b`, after the retry | 25 tool calls, no patch: the retry removed the fatal provider error, the first whole-file refusal produced a ranged read, two `search_code` calls pasted a glob into `path` (finding 14), then the 24-tool-call limit ended the run (finding 15) |
 | L `878bdb97` | local `gpt-oss:20b`, after the glob hint | 15 tool calls, no patch, `NEEDS_INPUT`: `run_validation` passed JSON-java's full 824-test suite in Docker, the model never called `find_symbol`, then answered the report request with prose asking for the acceptance criteria instead of the JSON report (finding 15) |
+| M `5affe250` | local `qwen2.5-coder:14b` (Ollama) | 6 tool calls, `NEEDS_INPUT`: file-scoped `find_symbol` on the first turn, then the **correct** production change (`name()` → `toString()`, 636-char patch), then Docker validation reported `824 tests, 4 failures` in `EnumTest` honestly; the model changed the source but not the tests it breaks, so no criterion passed and the diff is refused for export (finding 16) |
 
 What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
 unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
@@ -279,9 +318,13 @@ Runs J–L moved the experiment off the hosted quota entirely. A local `gpt-oss:
 the external limit — no per-minute or per-day cap, a two-hour wall clock — and the two fixes those runs
 produced (the local retry for a malformed tool call, and refusals that carry the line count and the
 `glob` argument) both came from a live failure rather than a guess. What remains for a local run is the
-model: it can read, search and run a real 824-test suite through the platform, but it does not reliably
-follow the locate-first instruction, so it never reaches a patch (finding 15). That is a capability
-statement about the model size, not about the loop, and it is recorded as such.
+model. `gpt-oss:20b` can read, search and run a real 824-test suite through the platform, but it does not
+reliably follow the locate-first instruction, so it never reaches a patch (finding 15). Run M separates
+the two variables that were still confounded: swapping **only** the model — same card, same platform,
+same prompt — for a code-specialized 14B, `qwen2.5-coder:14b`, produced the correct one-line production
+change and an honest 824-test result in a single six-call run (finding 16). The local limit is the
+model's family more than its size class, and in every local run the loop held: it refused to report a
+failing or unverified result as a pass.
 
 ## Repository selection (the gate, in practice)
 

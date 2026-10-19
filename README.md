@@ -9,6 +9,9 @@ The project runs a bounded, asynchronous coding-agent workflow: it accepts tasks
 > **Repository guides.** For an agent-oriented operating guide — build/test commands, the layer and
 > port/adapter map, conventions, invariants, and known pitfalls — see [`AGENTS.md`](AGENTS.md). The
 > architectural decision log is [`docs/architecture-decisions.md`](docs/architecture-decisions.md).
+> Live evidence from real models and repositories is recorded per finding in
+> [`docs/live-testing-findings.md`](docs/live-testing-findings.md), and evaluated against the
+> specifications for a purely local deployment in [`docs/local-deployment.md`](docs/local-deployment.md).
 
 ## Product goals
 
