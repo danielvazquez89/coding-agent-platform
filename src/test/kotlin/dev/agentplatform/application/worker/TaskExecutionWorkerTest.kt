@@ -836,6 +836,61 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `records a deliberate refusal as rejected instead of a tool failure`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("read_file", """{"path":"../outside.txt"}""")),
+                "tool_calls",
+                null,
+                null
+            ),
+            ModelTurn(
+                """{"summary":"Refused","implementation":"The path was refused.","acceptanceChecks":[]}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        val refusal = attempts.finishedReport!!.toolExecutions.single { it.toolName == "read_file" }
+        assertEquals(ToolExecutionOutcome.REJECTED, refusal.outcome)
+        assertTrue(refusal.resultSummary.startsWith("Rejected: "), refusal.resultSummary)
+        assertTrue(refusal.resultSummary.contains("Path must stay inside the repository"), refusal.resultSummary)
+        // The model receives the actionable message, not an opaque "tool failed" line.
+        val modelFacing = provider.messages.joinToString("\n") { it.content }
+        assertTrue(modelFacing.contains("Rejected: Path must stay inside the repository"), modelFacing)
+        assertFalse(modelFacing.contains("Tool failed safely"))
+    }
+
+    @Test
+    fun `records the requested read range in the tool audit`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), (1..10).joinToString("\n") { "line $it" })
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("read_file", """{"path":"README.md","startLine":2,"endLine":5}""")),
+                "tool_calls",
+                null,
+                null
+            ),
+            ModelTurn(
+                """{"summary":"Read","implementation":"Read the requested lines.","acceptanceChecks":[]}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        val read = attempts.finishedReport!!.toolExecutions.single { it.toolName == "read_file" }
+        assertEquals("path=README.md, lines=2-5", read.argumentsSummary)
+    }
+
+    @Test
     fun `estimated cost and elapsed time limits stop execution and are reported`() {
         val costTask = task()
         val costAttempts = FakeAttempts()

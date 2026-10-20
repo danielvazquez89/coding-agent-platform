@@ -464,12 +464,10 @@ class TaskExecutionWorker @Inject constructor(
                 } catch (failure: Exception) {
                     if (failure is AuditPersistenceException) throw failure
                     log.warnf(failure, "Task %s tool %s threw exception", task.id, call.name)
+                    val message = (failure.message ?: failure.javaClass.simpleName).take(3000)
                     ToolExecutionResult(
-                        "Tool failed safely: ${
-                            (failure.message ?: failure.javaClass.simpleName).take(
-                                3000
-                            )
-                        }"
+                        if (failure is IllegalArgumentException) "Rejected: $message"
+                        else "Tool failed safely: $message"
                     )
                 }
                 result.validation?.let {
@@ -671,11 +669,20 @@ class TaskExecutionWorker @Inject constructor(
             tools.execute(name, arguments, root)
         } catch (failure: Exception) {
             if (failure is AuditPersistenceException) throw failure
+            // `IllegalArgumentException` is the tools' deliberate refusal of an invalid or disallowed
+            // request (an unreadable path, a whole-file read of a large file, a patch hunk that does not
+            // match). It is not a tool failure: the model asked for something the application will not
+            // do, and the message tells it how to proceed, so the audit says so instead of blaming the
+            // tool. The executor already tags the same calls `rejected` in the metrics.
+            val refused = failure is IllegalArgumentException
+            val outcome = if (refused) ToolExecutionOutcome.REJECTED else ToolExecutionOutcome.FAILED
+            val summary = if (refused) {
+                "Rejected: ${failure.message ?: failure.javaClass.simpleName}"
+            } else {
+                "Failed with ${failure.javaClass.simpleName}"
+            }
             try {
-                finishToolAudit(
-                    trace, pending, ToolExecutionOutcome.FAILED,
-                    "Failed with ${failure.javaClass.simpleName}", elapsedMillis(startedAt)
-                )
+                finishToolAudit(trace, pending, outcome, summary, elapsedMillis(startedAt))
             } catch (auditFailure: Exception) {
                 throw AuditPersistenceException("Could not persist tool execution audit event", auditFailure)
             }
@@ -729,9 +736,26 @@ class TaskExecutionWorker @Inject constructor(
     }
 
     private fun summarizeToolArguments(name: String, arguments: JsonNode): String = when (name) {
-        "list_files", "read_file" -> "path=${arguments.path("path").asText("").take(300)}"
+        "list_files" -> buildString {
+            append("path=").append(arguments.path("path").asText("").take(300))
+            arguments.path("depth").takeIf { it.isNumber }?.let { append(", depth=").append(it.asInt()) }
+            arguments.path("glob").asText("").takeIf(String::isNotBlank)
+                ?.let { append(", glob=").append(it.take(120)) }
+        }
+        "read_file" -> buildString {
+            append("path=").append(arguments.path("path").asText("").take(300))
+            val start = arguments.path("startLine").takeIf { it.isNumber }?.asInt()
+            val end = arguments.path("endLine").takeIf { it.isNumber }?.asInt()
+            if (start != null || end != null) {
+                // The range is why a read can succeed or be refused; without it the audit cannot tell a
+                // ranged read from a whole-file attempt.
+                append(", lines=").append(start ?: 1).append('-').append(end ?: "end")
+            }
+        }
         "search_code" -> "path=${arguments.path("path").asText("").take(300)}, queryLength=${arguments.path("query").asText("").length}"
         "find_symbol" -> "name=${arguments.path("name").asText("").take(120)}, path=${arguments.path("path").asText("").take(200)}"
+        "create_file" -> "path=${arguments.path("path").asText("").take(300)}, contentCharacters=${arguments.path("content").asText("").length}"
+        "related_tests" -> "paths=${arguments.path("paths").size()}"
         "apply_patch" -> "patchCharacters=${arguments.path("patch").asText("").length}"
         "run_validation" -> "no arguments"
         else -> "argumentNames=${arguments.fieldNames().asSequence().take(20).joinToString()}"
