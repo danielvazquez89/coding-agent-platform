@@ -450,6 +450,35 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   to the whole block and let the model reach the test. The next bottleneck is a malformed patch whose
   refusal was opaque; `46d6a14` is the direct fix to test.
 
+### 23. The block-end hint produces the right patch; the model stops after a failed validation
+
+- **Setup.** The jar carried `450d2a1` (block-end hint) and `46d6a14` (corrupt-patch hint) with the
+  8,192-token window. Run U (`8975f3c9`, attempt `e717bb44`) was created through the new
+  `POST /api/tasks/{id}/retry` endpoint from run T, so `retryOf=37aca9ff...`; the retry endpoint returned
+  `201` with the linked task, as tested.
+- **Calls 1-2 reproduce run T.** `find_symbol(writeValue)` returned 602 characters and reported the
+  block end at 3203; `read_file 3169-3203` returned 1,761 characters, the whole method including the
+  enum branch at 3185.
+- **Call 3 was a 28-character patch** and was rejected with "Patch must change between 1 and 10 files".
+  That message is application-level and specific, and the model could act on it.
+- **Call 4 applied a 595-character patch.** The stored diff changes `JSONObject.java:3186` from
+  `writer.write(quote(((Enum<?>)value).name()));` to `writer.write(quote(value.toString()));`. This is
+  the **first local run to apply a correct source patch**; the block-end read is what made the enum
+  branch visible.
+- **Call 5 ran validation, which failed**: `EnumTest` still asserted the old name. The model then
+  returned a report (zero tool calls) whose narrative said the tests were not updated. The attempt
+  ended `NEEDS_INPUT` with `changedFiles=1`, validation `FAILED`, and every criterion `UNVERIFIED`.
+  Nothing was reported as a pass, and no pull request was opened.
+- **The loop accepted the report two steps early.** The failing validation and its test names were in
+  the tool conversation, and the model had 19 of its 24 calls left. The loop had no rule that a failed
+  validation is not a final answer, so the model's accurate statement that the tests were stale ended
+  the run.
+- **What this argues for.** `9943192` (the validation-failure nudge) validates a patched tree before
+  accepting a final answer and, when the check fails, tells the model to read the failing test, fix it
+  with `apply_patch`, and rerun validation, at most twice; a report or a question is not accepted while
+  validation fails. It also stores only the final validation run in the report, so a successful retry
+  can export its patch; the earlier failure remains in the tool audit. Run V tests that live.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -479,6 +508,7 @@ recorded rather than glossed over, because the failures are informative.
 | R `f5ad2e79` | local `qwen2.5-coder:14b`, Ollama context **4096** | 10 tool calls, operator-stopped and reaped `FAILED` with an outcome-unknown report: the first refusal quoted the numbered lines at `EnumTest.java:100` and the model immediately read 94-104, then sent the **same 1,582-character patch** twice more (calls 7, 8) and a 1,643-character variant twice (calls 9, 10), all rejected at the same line. `ollama ps` showed 4,096 tokens, smaller than this conversation, so truncation confounds the result (finding 20) |
 | S `8ec6f803` | local `qwen2.5-coder:14b`, Ollama context **8192** | 9 tool calls, operator-stopped and reaped `FAILED`: `find_symbol` scoped to `JSONObject.java`, then four reads of 3165-3175 and five 630-character patches aimed at 3170 (the enum branch is 3185). Call 3 was rejected by git; calls 5, 7 and 9 were refused in **6 ms** by the new duplicate guard. The larger window did not change the narrow read (finding 21) |
 | T `37aca9ff` | local `qwen2.5-coder:14b`, context **8192**, with the block-end hint | 6 tool calls, operator-stopped and reaped `FAILED`: `find_symbol` reported the block end (602 characters) and the model read **3169-3203**, the whole method including the enum branch, then `EnumTest` 38-72. Its first two-file patch (2,575 characters) was rejected for an `index 1234567..89abcde` line **inside a hunk** (`corrupt patch at <stdin>:34`); after a 13.5-minute turn it resent the identical patch and the duplicate guard refused it in 5 ms (finding 22) |
+| U `8975f3c9` | local `qwen2.5-coder:14b`, context **8192**, block-end + corrupt-patch hints; created by `POST /api/tasks/{T}/retry` | 5 tool calls, `NEEDS_INPUT`: after `find_symbol` (602 characters) and reading **3169-3203**, a 28-character patch was rejected ("Patch must change between 1 and 10 files") and a **595-character patch applied**: `JSONObject.java:3186` `name()` → `toString()`. Validation **failed** because `EnumTest` still asserted the old name; the model then reported that the tests were not updated. `changedFiles=1`, all criteria UNVERIFIED, no false pass (finding 23) |
 
 What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
 unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
