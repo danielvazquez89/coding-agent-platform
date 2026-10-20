@@ -31,13 +31,14 @@ class TaskResourceTest {
     lateinit var attemptService: TaskAttemptService
 
     @Test
-    fun `review page is served with task and resume controls`() {
+    fun `review page is served with task, resume and retry controls`() {
         given()
             .`when`().get("/")
             .then()
             .statusCode(200)
             .body(containsString("Coding Agent Review"))
             .body(containsString("Answer and resume"))
+            .body(containsString("Retry as a new task"))
     }
 
     @Test

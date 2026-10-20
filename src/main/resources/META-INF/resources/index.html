@@ -189,6 +189,28 @@
             }
           });
           detailsElement.append(form);
+        } else if (task.status === "FAILED" || task.status === "CANCELLED") {
+          const form = document.createElement("form");
+          form.className = "panel";
+          const note = document.createElement("p");
+          note.textContent = "This task is terminal. A retry clones it into a new queued task linked to this one; its attempt history is not resumed.";
+          const submit = document.createElement("button");
+          submit.type = "submit";
+          submit.textContent = "Retry as a new task";
+          form.append(note, submit);
+          form.addEventListener("submit", async event => {
+            event.preventDefault();
+            submit.disabled = true;
+            try {
+              const retried = await api(`/api/tasks/${id}/retry`, { method: "POST" });
+              messageElement.textContent = `Retry queued as task ${retried.id}.`;
+              await loadTasks(retried.id);
+            } catch (error) {
+              messageElement.textContent = error.message;
+              submit.disabled = false;
+            }
+          });
+          detailsElement.append(form);
         }
       } catch (error) {
         messageElement.textContent = error.message;
