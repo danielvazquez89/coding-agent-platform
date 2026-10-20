@@ -469,7 +469,9 @@ class WorkspaceToolExecutor(
         )
         if (check.exitCode != 0 || check.timedOut) {
             throw IllegalArgumentException(
-                "Patch did not apply cleanly: ${check.output.take(2000)}${patchContextHint(workspace, check.output)}"
+                "Patch did not apply cleanly: ${check.output.take(2000)}" +
+                    patchContextHint(workspace, check.output) +
+                    corruptPatchHint(normalized, check.output)
             )
         }
         val applied = commands.run(
@@ -506,6 +508,30 @@ class WorkspaceToolExecutor(
         return buildString {
             append("\nActual lines in ").append(path).append(" around line ").append(reportedLine).append(":\n")
             if (reportedLine > lines.size) append("(the file has ").append(lines.size).append(" lines)\n")
+            for (number in start..end) {
+                append(number).append(": ").append(lines[number - 1].take(PATCH_CONTEXT_LINE_CHARS)).append('\n')
+            }
+        }.take(PATCH_CONTEXT_HINT_LIMIT)
+    }
+
+    /**
+     * `git apply` reports a malformed patch only by its stdin line (`corrupt patch at <stdin>:34`),
+     * which a model cannot map to the patch it just wrote. Quote the offending patch line and the
+     * rule it broke: a live 14B put an `index 1234567..89abcde 100644` line inside a hunk, where
+     * every line must start with a space, '+', '-' or '\'.
+     */
+    private fun corruptPatchHint(patch: String, gitOutput: String): String {
+        val lineNumber = CORRUPT_PATCH_LINE.find(gitOutput)?.groupValues?.get(1)?.toIntOrNull() ?: return ""
+        val lines = patch.lineSequence().toList()
+        if (lineNumber <= 0 || lineNumber > lines.size) return ""
+        val start = (lineNumber - PATCH_CONTEXT_LINES).coerceAtLeast(1)
+        val end = (lineNumber + PATCH_CONTEXT_LINES).coerceAtMost(lines.size)
+        return buildString {
+            append("\nPatch line ").append(lineNumber).append(" is not a valid hunk line: `")
+            append(lines[lineNumber - 1].take(PATCH_CONTEXT_LINE_CHARS)).append("`\n")
+            append("A hunk line must start with a space, '+' or '-'; a header line such as `index ...` ")
+            append("belongs above the `---`/`+++` pair, and a working-tree patch does not need it. ")
+            append("Remove that line and resend.\n")
             for (number in start..end) {
                 append(number).append(": ").append(lines[number - 1].take(PATCH_CONTEXT_LINE_CHARS)).append('\n')
             }
@@ -683,6 +709,7 @@ class WorkspaceToolExecutor(
         const val PATCH_CONTEXT_LINE_CHARS = 200
         const val PATCH_CONTEXT_FILE_LIMIT = 2_000_000L
         val GIT_APPLY_FAILURE = Regex("""patch failed:\s*(.+):(\d+)""")
+        val CORRUPT_PATCH_LINE = Regex("""corrupt patch at <stdin>:(\d+)""")
         const val RELATED_TEST_LIMIT = 10
         const val RELATED_TEST_LIMIT_MAX = 50
         const val PATCH_SIZE_LIMIT = 64_000

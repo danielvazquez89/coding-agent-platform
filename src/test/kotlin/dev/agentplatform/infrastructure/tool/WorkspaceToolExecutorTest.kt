@@ -392,6 +392,30 @@ class WorkspaceToolExecutorTest {
     }
 
     @Test
+    fun `names the patch line that is not a valid hunk line`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src"))
+        Files.writeString(root.resolve("src/Hello.kt"), "hello\n")
+        val patch = """
+            diff --git a/src/Hello.kt b/src/Hello.kt
+            --- a/src/Hello.kt
+            +++ b/src/Hello.kt
+            @@ -1 +1 @@
+            -hello
+            index 1234567..89abcde 100644
+            +world
+        """.trimIndent() + "\n"
+
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            executor().execute("apply_patch", mapper.createObjectNode().put("patch", patch), root)
+        }
+
+        assertTrue(failure.message!!.contains("Patch line 6 is not a valid hunk line"), failure.message)
+        assertTrue(failure.message!!.contains("index 1234567..89abcde 100644"), failure.message)
+        assertTrue(failure.message!!.contains("A hunk line must start with a space, '+' or '-'"), failure.message)
+    }
+
+    @Test
     fun `applies model-style patches with wrong hunk counts and markdown fences`() {
         val root = repository()
         Files.createDirectories(root.resolve("src/main/java/dev/example"))
