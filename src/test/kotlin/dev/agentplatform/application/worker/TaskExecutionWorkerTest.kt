@@ -1228,7 +1228,8 @@ class TaskExecutionWorkerTest {
         assertTrue(prompt.contains("Repository map (ranked from the task text"))
         assertTrue(prompt.contains("Greeting.java"))
         val system = provider.messages.first { it.role == "system" }.content
-        assertTrue(system.contains("Always read a line with read_file before you change it"))
+        assertTrue(system.contains("read the enclosing declaration or block with read_file before you change it"))
+        assertTrue(system.contains("a four-line window around a method's opening often stops before it"))
     }
 
     @Test
