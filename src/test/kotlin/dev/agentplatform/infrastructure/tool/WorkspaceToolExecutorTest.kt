@@ -379,6 +379,25 @@ class WorkspaceToolExecutorTest {
     }
 
     @Test
+    fun `keeps the end of a validation report when the details plus the header exceed the tool limit`() {
+        val details = "Starting Maven\n" + "x".repeat(12_000) +
+            "\nTests run: 824, Failures: 4\nBUILD FAILURE\n"
+        val check = ValidationCheck("Maven tests", "mvn test", CheckOutcome.FAILED, 1, details, 100)
+        val tools = WorkspaceToolExecutor(object : ValidationRunner {
+            override fun validate(workspace: Path) = check
+        }, LocalCommandExecutor(), mapper, MicrometerExecutionMetrics(registry))
+
+        val result = tools.execute("run_validation", mapper.createObjectNode(), temporary)
+
+        assertEquals(check, result.validation)
+        assertTrue(result.content.length <= 12_000, "content was ${result.content.length} characters")
+        assertTrue(result.content.startsWith("Maven tests: FAILED."), result.content.take(40))
+        assertTrue(result.content.contains("Tests run: 824, Failures: 4"))
+        assertTrue(result.content.contains("BUILD FAILURE"))
+        assertTrue(result.content.contains("characters omitted"))
+    }
+
+    @Test
     fun `rejects symbolic links when the host permits creating them`() {
         val root = repository()
         val external = Files.writeString(temporary.resolve("outside.txt"), "outside")

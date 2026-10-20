@@ -151,7 +151,7 @@ open class DockerValidationRunner @Inject constructor(
             command = commandName,
             outcome = outcome,
             exitCode = exitCode,
-            details = details.take(MAX_VALIDATION_OUTPUT),
+            details = boundedValidationDetails(details),
             durationMillis = Duration.ofNanos(System.nanoTime() - startedAt).toMillis()
         )
     }
@@ -159,7 +159,10 @@ open class DockerValidationRunner @Inject constructor(
     private fun runOfflineTests(id: String, network: String, workspacePath: String, cachePath: String) = commands.run(
         offlineMavenCommand(id, network, workspacePath, cachePath),
         timeout = Duration.ofSeconds(validationTimeoutSeconds),
-        maxOutputChars = MAX_VALIDATION_OUTPUT
+        // Capture more than the report keeps: Maven prints the failing tests and the build verdict at
+        // the end, and a capture cut at the display limit would throw the verdict away before the
+        // start-and-end trim below can keep it.
+        maxOutputChars = MAX_VALIDATION_CAPTURE
     )
 
     private fun offlineMavenCommand(id: String, network: String, workspacePath: String, cachePath: String): List<String> {
@@ -246,8 +249,25 @@ open class DockerValidationRunner @Inject constructor(
     }
 
     private fun appendOutput(target: StringBuilder, value: String) {
-        if (target.length >= MAX_VALIDATION_OUTPUT) return
-        target.append(value.take(MAX_VALIDATION_OUTPUT - target.length))
+        // Every command output is already bounded by its maxOutputChars, so the combined buffer stays
+        // small. Do not stop at the display limit here: that would discard later dependency-retry
+        // output, which is the run whose verdict matters most.
+        target.append(value)
+    }
+
+    /**
+     * Maven prints each failing test as it runs and the final `Tests run` / `BUILD FAILURE` verdict at
+     * the end. A head-only cut can drop the one line the model needs to decide what to fix, so keep the
+     * start and the end and say how much is missing. The command capture is deliberately larger than
+     * this display limit, so the verdict is available to keep.
+     */
+    private fun boundedValidationDetails(output: String): String {
+        if (output.length <= MAX_VALIDATION_OUTPUT) return output
+        val head = MAX_VALIDATION_OUTPUT * 3 / 5
+        val tail = MAX_VALIDATION_OUTPUT / 3
+        val omitted = output.length - head - tail
+        val marker = "\n\n... [$omitted characters omitted; keeping the start and the end] ...\n\n"
+        return output.take(head) + marker + output.takeLast(tail)
     }
 
     internal companion object {
@@ -257,6 +277,7 @@ open class DockerValidationRunner @Inject constructor(
             value.isNotBlank() && !value.equals(DISABLED_CONFIGURATION_VALUE, ignoreCase = true)
 
         const val MAX_VALIDATION_OUTPUT = 12_000
+        const val MAX_VALIDATION_CAPTURE = 48_000
         const val MAX_DEPENDENCY_ROUNDS = 3
         const val MAX_ARTIFACTS_PER_ROUND = 8
         private val ARTIFACT_TOKEN = Regex("""[A-Za-z0-9_.-]+""")

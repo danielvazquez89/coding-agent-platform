@@ -111,7 +111,8 @@ class WorkspaceToolExecutor(
         )
         "apply_patch" -> ToolExecutionResult(applyPatch(workspace, requiredText(arguments, "patch")))
         "run_validation" -> validationRunner.validate(workspace).let { check ->
-            ToolExecutionResult("${check.name}: ${check.outcome}. ${check.details.orEmpty()}".take(TOOL_OUTPUT_LIMIT), check)
+            val content = "${check.name}: ${check.outcome}. ${check.details.orEmpty()}"
+            ToolExecutionResult(boundedValidationContent(content), check)
         }
         else -> throw IllegalArgumentException("Tool '$name' is not allowed")
     }
@@ -293,6 +294,21 @@ class WorkspaceToolExecutor(
     private fun truncate(text: String, hint: String): String =
         if (text.length <= TOOL_OUTPUT_LIMIT) text
         else text.take(TOOL_OUTPUT_LIMIT - hint.length - 1).trimEnd() + "\n" + hint
+
+    /**
+     * A validation verdict is at the end of its output. When the stored details plus the header exceed
+     * the tool limit (for example from a control-plane runner that does not bound them), keep the start
+     * and the end instead of dropping the line that says whether the suite passed.
+     */
+    private fun boundedValidationContent(text: String): String {
+        if (text.length <= TOOL_OUTPUT_LIMIT) return text
+        val head = TOOL_OUTPUT_LIMIT * 3 / 5
+        val tail = TOOL_OUTPUT_LIMIT / 3
+        val omitted = text.length - head - tail
+        return text.take(head) +
+            "\n\n... [$omitted characters omitted; keeping the start and the end] ...\n\n" +
+            text.takeLast(tail)
+    }
 
     private fun createFile(workspace: Path, relative: String, content: String): String {
         require(content.length <= CREATE_FILE_SIZE_LIMIT) {

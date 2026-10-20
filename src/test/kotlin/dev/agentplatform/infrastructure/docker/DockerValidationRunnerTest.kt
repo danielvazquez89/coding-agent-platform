@@ -352,11 +352,16 @@ class DockerValidationRunnerTest {
         assertEquals(2, validationCalls.get())
         assertEquals(1, dependencyCalls.get())
 
-        val oversizedOutput = "x".repeat(20_000)
+        val oversizedOutput = "Maven started\n" + "x".repeat(20_000) +
+            "\nTests run: 824, Failures: 4\nBUILD FAILURE\n"
         val bounded = runner(fakeCommands(mavenResult = CommandResult(1, oversizedOutput)), temporary.resolve("m2").toString())
             .validate(repo)
         assertEquals(CheckOutcome.FAILED, bounded.outcome)
         assertTrue(bounded.details!!.length <= DockerValidationRunner.MAX_VALIDATION_OUTPUT)
+        assertTrue(bounded.details!!.contains("Maven started"), bounded.details!!.take(60))
+        assertTrue(bounded.details!!.contains("Tests run: 824, Failures: 4"))
+        assertTrue(bounded.details!!.contains("BUILD FAILURE"))
+        assertTrue(bounded.details!!.contains("characters omitted"))
     }
 
     @Test

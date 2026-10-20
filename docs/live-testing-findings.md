@@ -314,6 +314,25 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   through the test update and validation. That is an external ceiling, recorded rather than smoothed
   over; the loop did the right thing at every failure point.
 
+### 18. A head-only output cap can cut the line that says whether the suite passed
+
+- **Context.** Run M's stored validation details are exactly 12,000 characters and end mid-URL
+  (`...confluence/dis`). The `Tests run: 824, Failures: 4` summary sits at character 10,924 of that
+  capture, so it survived by about 1,100 characters. A slightly longer Maven log would have left the
+  model with the per-test failures but not the suite verdict, and the stored report would have lost it
+  too.
+- **Cause.** `DockerValidationRunner` asked the command executor for 12,000 characters and then kept
+  the first 12,000. Maven prints the verdict last, so the cap and the useful line were on opposite ends.
+- **Fix.** The runner captures up to 48,000 characters and trims the display copy to 12,000 by keeping
+  the start and the end with an explicit omission marker. The tool result does the same around its
+  header, so a control-plane runner that returns more than the limit cannot hide the verdict either.
+  The shared command executor stays head-only on purpose: `patchDiff` detects truncation by asking for
+  one character more than it keeps, and a head-and-tail result would make a cut diff look short enough
+  to export.
+- **Test.** An oversized Maven capture keeps `Tests run: 824, Failures: 4` and `BUILD FAILURE` while
+  staying within the limit, and a validation result whose details plus header exceed the tool limit
+  keeps its end.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
