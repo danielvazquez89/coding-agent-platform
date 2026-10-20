@@ -389,6 +389,31 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   `docs/local-deployment.md` now sets `OLLAMA_NUM_CTX=8192` in the recipe rather than leaving it
   commented out, because the default window is smaller than the conversation this task produces.
 
+### 21. A larger window does not fix the narrowing; the duplicate guard bounds it
+
+- **Setup.** The jar now carried the read-the-enclosing-block prompt (`ad09433`) and the duplicate
+  guard (`70e5f4e`), and `OLLAMA_NUM_CTX=8192` was set and confirmed with `ollama ps`. Same task,
+  same local 14B.
+- **Run S (`8ec6f803-94ac-4bcd-8d0e-6c1af0ebc693`, attempt `4f6e43e2`).** Nine tool calls in eleven
+  minutes: a file-scoped `find_symbol(writeValue)` (486 characters), then a read of **3165-3175**
+  (521 characters), then a 630-character patch aimed at **3170** - the declaration line - which git
+  rejected. The model then repeated read-3165-3175 / same-patch four times. It never read line 3185,
+  where the enum branch is.
+- **What the larger window ruled out.** The whole conversation in this run was well under 8,192
+  tokens: the largest tool result was a 521-character read and the patch was 630 characters. Ollama
+  therefore received the full context, so the narrow read is not a truncation artifact. Run R's
+  confound is removed, and the anchoring is the model/prompt problem it looked like.
+- **The duplicate guard works live.** Call 3 cost 93 ms in `git apply`; calls 5, 7 and 9 were refused
+  in **6 ms** each, before `git`, and audited `REJECTED` with the byte-for-byte message. The model
+  received that message and still re-read the same window and resent the same patch, so the guard
+  bounds the wasted work but cannot teach a 14B to look further. That is the right division: the
+  application refuses an action that cannot succeed, and does not pretend it changed the model's mind.
+- **Bounded stop and honest recovery.** Stopped after call 9; reaped `FAILED` with the same
+  outcome-unknown report, `changedFiles=0`, no validation. Nothing was reported as a pass.
+- **What this argues for.** The prompt alone did not widen the read. `450d2a1` now has `find_symbol`
+  report the method's heuristic block end (`JSONObject.writeValue` ends at line 3203), so the next run
+  can read 3169-3203 and reach 3185 without guessing. That is the next experiment, not yet run.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -416,6 +441,7 @@ recorded rather than glossed over, because the failures are informative.
 | P `7cdfcd1d` | `qwen/qwen3.8-27b`, 36-call cap | 35 calls, `FAILED` on its own daily cap (`193374/200000`): correct production patch through the real `quote(String, Writer)` overload, a second hunk rejected honestly, no test update or validation (finding 17) |
 | Q `5711e308` | local `qwen2.5-coder:14b`, after the test-update prompt | 10 tool calls, `NEEDS_INPUT`: read only lines 3168-3175 around `writeValue`, then guessed patches at 3171 and 3173 (the enum branch is at 3185); both were rejected and recorded `REJECTED` with the actionable message. It ran validation on the unchanged tree (baseline PASS, 66 s), reported no change, and all criteria stayed `UNVERIFIED`; 15 model calls, 50,623 prompt tokens, 858 s (finding 19) |
 | R `f5ad2e79` | local `qwen2.5-coder:14b`, Ollama context **4096** | 10 tool calls, operator-stopped and reaped `FAILED` with an outcome-unknown report: the first refusal quoted the numbered lines at `EnumTest.java:100` and the model immediately read 94-104, then sent the **same 1,582-character patch** twice more (calls 7, 8) and a 1,643-character variant twice (calls 9, 10), all rejected at the same line. `ollama ps` showed 4,096 tokens, smaller than this conversation, so truncation confounds the result (finding 20) |
+| S `8ec6f803` | local `qwen2.5-coder:14b`, Ollama context **8192** | 9 tool calls, operator-stopped and reaped `FAILED`: `find_symbol` scoped to `JSONObject.java`, then four reads of 3165-3175 and five 630-character patches aimed at 3170 (the enum branch is 3185). Call 3 was rejected by git; calls 5, 7 and 9 were refused in **6 ms** by the new duplicate guard. The larger window did not change the narrow read (finding 21) |
 
 What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
 unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
