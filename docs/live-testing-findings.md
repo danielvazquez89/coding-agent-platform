@@ -414,6 +414,42 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   report the method's heuristic block end (`JSONObject.writeValue` ends at line 3203), so the next run
   can read 3169-3203 and reach 3185 without guessing. That is the next experiment, not yet run.
 
+### 22. The block-end hint widens the read; a corrupt patch needs its patch line named
+
+- **Setup.** The jar carried `450d2a1` (a method hit in `find_symbol` reports its heuristic block end)
+  and the 8,192-token window, but not `46d6a14` (the corrupt-patch hint, committed while this run was
+  in flight). Same task, same local 14B.
+- **Run T (`37aca9ff-58ec-4cd2-9c97-a7b43e459cb2`, attempt `c3d1f4d2`).** Six tool calls in twenty
+  minutes before the operator stopped it:
+  1. `find_symbol(writeValue, JSONObject.java)` returned 602 characters (486 without the hint) and
+     reported that the block ends at line 3203.
+  2. `read_file 3169-3203` (1,761 characters) - the **whole method**, including the enum branch at
+     3185. Runs Q, R and S had read only a narrow window around the declaration (3168-3175,
+     3168-3172 and 3165-3175) and patched the opening; this is the first change that moved the read.
+  3. `find_symbol(jsonObjectFromEnum, EnumTest.java)`, 466 characters.
+  4. `read_file EnumTest 38-72`, 1,916 characters - it had moved on to the test helper, as the task
+     requires.
+  5. A 2,575-character `apply_patch`, its first two-file attempt, was **rejected**: an
+     `index 1234567..89abcde 100644` line inside a hunk produced
+     `warning: recount: unexpected line: ...` and `error: corrupt patch at <stdin>:34`.
+  6. **13.5 minutes later**, the identical 2,575-character patch; the duplicate guard refused it in
+     5 ms.
+- **The refusal was not actionable.** `<stdin>:34` names a line in git's stdin, not anything the model
+  can match to the text it wrote, and the model's next reply repeated the same bytes. `46d6a14`
+  (built after this jar) now quotes that patch line, says a hunk line must start with a space, `+` or
+  `-`, and notes that a working-tree patch does not need an `index` line. Whether that lets the model
+  fix it is the next run's question, not an assumption.
+- **Slow local turns are a real cost.** Ollama's log showed about 1,590 generated tokens at
+  **2.4 tokens/s** by 21:15; the turn returned at 21:17:54 with the same patch. A 14B on this machine
+  can spend 13+ minutes on one reply, and the per-call timeout (1,200 s) is close enough that a longer
+  reply would be lost as a timeout rather than delivered. That is a hardware limit the prompt cannot
+  remove; the duplicate guard at least keeps the repeat from spending another `git apply`.
+- **Bounded stop and honest recovery.** Stopped after call 6; reaped `FAILED` with the outcome-unknown
+  report, `changedFiles=0`, no validation. Nothing was reported as a pass.
+- **What this run shows.** The block-end hint is validated: it changed the read from a ten-line window
+  to the whole block and let the model reach the test. The next bottleneck is a malformed patch whose
+  refusal was opaque; `46d6a14` is the direct fix to test.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -442,6 +478,7 @@ recorded rather than glossed over, because the failures are informative.
 | Q `5711e308` | local `qwen2.5-coder:14b`, after the test-update prompt | 10 tool calls, `NEEDS_INPUT`: read only lines 3168-3175 around `writeValue`, then guessed patches at 3171 and 3173 (the enum branch is at 3185); both were rejected and recorded `REJECTED` with the actionable message. It ran validation on the unchanged tree (baseline PASS, 66 s), reported no change, and all criteria stayed `UNVERIFIED`; 15 model calls, 50,623 prompt tokens, 858 s (finding 19) |
 | R `f5ad2e79` | local `qwen2.5-coder:14b`, Ollama context **4096** | 10 tool calls, operator-stopped and reaped `FAILED` with an outcome-unknown report: the first refusal quoted the numbered lines at `EnumTest.java:100` and the model immediately read 94-104, then sent the **same 1,582-character patch** twice more (calls 7, 8) and a 1,643-character variant twice (calls 9, 10), all rejected at the same line. `ollama ps` showed 4,096 tokens, smaller than this conversation, so truncation confounds the result (finding 20) |
 | S `8ec6f803` | local `qwen2.5-coder:14b`, Ollama context **8192** | 9 tool calls, operator-stopped and reaped `FAILED`: `find_symbol` scoped to `JSONObject.java`, then four reads of 3165-3175 and five 630-character patches aimed at 3170 (the enum branch is 3185). Call 3 was rejected by git; calls 5, 7 and 9 were refused in **6 ms** by the new duplicate guard. The larger window did not change the narrow read (finding 21) |
+| T `37aca9ff` | local `qwen2.5-coder:14b`, context **8192**, with the block-end hint | 6 tool calls, operator-stopped and reaped `FAILED`: `find_symbol` reported the block end (602 characters) and the model read **3169-3203**, the whole method including the enum branch, then `EnumTest` 38-72. Its first two-file patch (2,575 characters) was rejected for an `index 1234567..89abcde` line **inside a hunk** (`corrupt patch at <stdin>:34`); after a 13.5-minute turn it resent the identical patch and the duplicate guard refused it in 5 ms (finding 22) |
 
 What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
 unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
