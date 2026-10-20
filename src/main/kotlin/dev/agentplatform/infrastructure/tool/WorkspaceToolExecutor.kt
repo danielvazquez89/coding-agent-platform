@@ -388,7 +388,11 @@ class WorkspaceToolExecutor(
             timeout = Duration.ofSeconds(20),
             maxOutputChars = 3000
         )
-        require(check.exitCode == 0 && !check.timedOut) { "Patch did not apply cleanly: ${check.output.take(2000)}" }
+        if (check.exitCode != 0 || check.timedOut) {
+            throw IllegalArgumentException(
+                "Patch did not apply cleanly: ${check.output.take(2000)}${patchContextHint(workspace, check.output)}"
+            )
+        }
         val applied = commands.run(
             applyCommand,
             workspace,
@@ -398,6 +402,35 @@ class WorkspaceToolExecutor(
         )
         check(applied.exitCode == 0 && !applied.timedOut) { "Patch application failed: ${applied.output.take(2000)}" }
         return "Patch applied to ${paths.size} file(s): ${paths.joinToString()}."
+    }
+
+    /**
+     * `git apply` reports only a path and a line number. A model that guessed the line then guesses
+     * again: a live 14B produced two rejected patches in a row, at lines 3171 and 3173, while the
+     * changed branch was at 3185. Show the numbered lines that are actually there so the next attempt
+     * can use real context. The text is repository data quoted inside a tool message, not an
+     * instruction the model may follow.
+     */
+    private fun patchContextHint(workspace: Path, gitOutput: String): String {
+        val match = GIT_APPLY_FAILURE.find(gitOutput) ?: return ""
+        val path = match.groupValues[1].trim().removePrefix("a/").removePrefix("b/")
+        val reportedLine = match.groupValues[2].toIntOrNull() ?: return ""
+        val file = runCatching { resolve(workspace, path) }.getOrNull() ?: return ""
+        if (!Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) return ""
+        val size = runCatching { Files.size(file) }.getOrNull() ?: return ""
+        if (size > PATCH_CONTEXT_FILE_LIMIT) return ""
+        val lines = runCatching { Files.readAllLines(file) }.getOrNull().orEmpty()
+        if (lines.isEmpty()) return ""
+        val center = reportedLine.coerceIn(1, lines.size)
+        val start = (center - PATCH_CONTEXT_LINES).coerceAtLeast(1)
+        val end = (center + PATCH_CONTEXT_LINES).coerceAtMost(lines.size)
+        return buildString {
+            append("\nActual lines in ").append(path).append(" around line ").append(reportedLine).append(":\n")
+            if (reportedLine > lines.size) append("(the file has ").append(lines.size).append(" lines)\n")
+            for (number in start..end) {
+                append(number).append(": ").append(lines[number - 1].take(PATCH_CONTEXT_LINE_CHARS)).append('\n')
+            }
+        }.take(PATCH_CONTEXT_HINT_LIMIT)
     }
 
     private fun sanitizePatch(patch: String): String {
@@ -565,6 +598,11 @@ class WorkspaceToolExecutor(
         const val READ_FILE_SIZE_LIMIT = 50_000L
         const val READ_FILE_MAX_BYTES = 10L * 1024 * 1024
         const val CREATE_FILE_SIZE_LIMIT = 64_000
+        const val PATCH_CONTEXT_LINES = 6
+        const val PATCH_CONTEXT_HINT_LIMIT = 2_500
+        const val PATCH_CONTEXT_LINE_CHARS = 200
+        const val PATCH_CONTEXT_FILE_LIMIT = 2_000_000L
+        val GIT_APPLY_FAILURE = Regex("""patch failed:\s*(.+):(\d+)""")
         const val RELATED_TEST_LIMIT = 10
         const val RELATED_TEST_LIMIT_MAX = 50
         const val PATCH_SIZE_LIMIT = 64_000

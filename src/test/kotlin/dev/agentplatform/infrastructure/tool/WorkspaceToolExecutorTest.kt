@@ -292,6 +292,51 @@ class WorkspaceToolExecutorTest {
     }
 
     @Test
+    fun `shows the actual file lines when a patch hunk does not match`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src"))
+        Files.writeString(root.resolve("src/Hello.kt"), (1..20).joinToString("\n") { "line $it" } + "\n")
+        val patch = """
+            --- a/src/Hello.kt
+            +++ b/src/Hello.kt
+            @@ -10,2 +10,2 @@
+            -wrong 10
+            +line ten
+             wrong 11
+        """.trimIndent() + "\n"
+
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            executor().execute("apply_patch", mapper.createObjectNode().put("patch", patch), root)
+        }
+
+        assertTrue(failure.message!!.contains("Patch did not apply cleanly"), failure.message)
+        assertTrue(failure.message!!.contains("Actual lines in src/Hello.kt around line 10"), failure.message)
+        assertTrue(failure.message!!.contains("10: line 10"), failure.message)
+        assertTrue(failure.message!!.contains("11: line 11"), failure.message)
+    }
+
+    @Test
+    fun `states the file length when a patch hunk points past the end`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src"))
+        Files.writeString(root.resolve("src/Hello.kt"), (1..5).joinToString("\n") { "line $it" } + "\n")
+        val patch = """
+            --- a/src/Hello.kt
+            +++ b/src/Hello.kt
+            @@ -99,1 +99,1 @@
+            -line 99
+            +line ninety-nine
+        """.trimIndent() + "\n"
+
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            executor().execute("apply_patch", mapper.createObjectNode().put("patch", patch), root)
+        }
+
+        assertTrue(failure.message!!.contains("the file has 5 lines"), failure.message)
+        assertTrue(failure.message!!.contains("5: line 5"), failure.message)
+    }
+
+    @Test
     fun `applies model-style patches with wrong hunk counts and markdown fences`() {
         val root = repository()
         Files.createDirectories(root.resolve("src/main/java/dev/example"))
