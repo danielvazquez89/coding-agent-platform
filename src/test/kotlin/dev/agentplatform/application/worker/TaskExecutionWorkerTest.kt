@@ -1225,6 +1225,31 @@ class TaskExecutionWorkerTest {
         assertTrue(system.contains("Always read a line with read_file before you change it"))
     }
 
+    @Test
+    fun `tells the model to update tests that assert the changed behavior`() {
+        val task = task()
+        val provider = ScriptedProvider(
+            ModelTurn(
+                """{"summary":"No change","implementation":"Prompt check."}""",
+                emptyList(),
+                "stop",
+                null,
+                null
+            )
+        )
+
+        worker(FakeState(task), FakeAttempts(), provider, FakeWorkspace(temporary)).execute(task.id)
+
+        val system = provider.messages.first { it.role == "system" }.content
+        val user = provider.messages.first { it.role == "user" }.content
+        assertTrue(
+            system.contains("a behavior change is not finished while an existing test still asserts the old behavior"),
+            system
+        )
+        assertTrue(system.contains("fix that test and rerun validation"), system)
+        assertTrue(user.contains("updates any existing test asserting the old behavior"), user)
+    }
+
     private fun worker(
         state: FakeState,
         attempts: FakeAttempts,
