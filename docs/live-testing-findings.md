@@ -275,6 +275,45 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   (updating the test a correct source change breaks), not localization. The safe default is unchanged:
   the unverified change is stored and refused, never reported as complete.
 
+### 17. A refreshed free-tier quota funds three real attempts, not one completion
+
+- **Context.** The daily quota reset, so the real JSON-java task was retried on Groq with
+  `openai/gpt-oss-120b` (the largest model in the catalog) and then `qwen/qwen3.8-27b` (a
+  code-specialized model with its own 200,000-token daily bucket). Pacing was set to 8,000 and 7,000
+  tokens per minute respectively. The task text now also says explicitly to update the `EnumTest`
+  expectations and add a regression test.
+- **Run N (`48e3992a-7fa3-46a3-a133-05dcbe565bf4`, attempt `ca642ad7`), `gpt-oss-120b`, 24-call cap.**
+  25 calls, **FAILED** on `The agent exceeded its limit of 24 tool calls`. It produced the correct
+  production patch (`name()` → `toString()`, plus a nine-line explanatory comment, 988 characters)
+  but never touched `EnumTest`; its last executed call was a search inside `EnumTest` for the
+  assertion site. 118,270 prompt / 4,608 completion tokens, 21 minutes, no validation.
+- **Run O (`850ab03f-a142-4aaa-858f-c3d4ce599ce7`, attempt `0ffc04d7`), `gpt-oss-120b`, 36-call cap.**
+  24 calls, **FAILED** on HTTP 429 *daily* tokens: `TPD Limit 200000, Used 194875, Requested 5910`
+  after five 60-second retries. Correct production patch again (817 characters, seven-line comment),
+  no test update, no validation. 25 minutes.
+- **Run P (`7cdfcd1d-c418-47b1-98d3-7ff1f5e71e1b`, attempt `da395c24`), `qwen/qwen3.8-27b`, 35 calls.**
+  **FAILED** on `TPD Limit 200000, Used 193374, Requested 6675`. Its first patch (444 characters) was
+  also the right change, written through a real overload: `quote(value.toString(), writer)` is
+  `quote(String, Writer)` at `JSONObject.java:2579`, not a hallucinated API. A second, 2,335-character
+  patch failed honestly — `Codex patch hunk ... Expected 8 line(s) starting with: if (value == this) {`
+  — because the model targeted the wrong site, and it never reached `EnumTest` or validation.
+  38 minutes.
+- **The shared cause is the free tier, not the loop.** One realistic attempt costs 118,000–125,000
+  prompt tokens, and the daily bucket is 200,000 *per model*, so two attempts exhaust one. All three
+  runs also show the working-set squeeze: the `16000`-character history budget dropped 2–27 older
+  exchanges on nearly every turn, and `EnumTest` was re-read three, two and five times respectively.
+  Raising the history further would exceed the 8,000-token-per-minute request cap (finding 5), so the
+  free tier is caught between the two limits.
+- **What held.** Every run failed honestly with all criteria `UNVERIFIED`, stored the unvalidated diff
+  without exporting it, and surfaced the provider error verbatim. The bounded retry recovered
+  transient 400/429 responses (waits up to 60 s) but correctly did not pretend a daily cap could be
+  waited out. No run reported a failed or unrun validation as a pass.
+- **Conclusion.** On Groq's free tier this multi-file task cannot complete: three models, two fresh
+  daily buckets and 388,249 tokens produced three correct source localizations and zero completions.
+  A funded key (a higher tier lifts TPM/TPD) or a different provider is required to carry this task
+  through the test update and validation. That is an external ceiling, recorded rather than smoothed
+  over; the loop did the right thing at every failure point.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -297,6 +336,9 @@ recorded rather than glossed over, because the failures are informative.
 | K `bcd59f58` | local `gpt-oss:20b`, after the retry | 25 tool calls, no patch: the retry removed the fatal provider error, the first whole-file refusal produced a ranged read, two `search_code` calls pasted a glob into `path` (finding 14), then the 24-tool-call limit ended the run (finding 15) |
 | L `878bdb97` | local `gpt-oss:20b`, after the glob hint | 15 tool calls, no patch, `NEEDS_INPUT`: `run_validation` passed JSON-java's full 824-test suite in Docker, the model never called `find_symbol`, then answered the report request with prose asking for the acceptance criteria instead of the JSON report (finding 15) |
 | M `5affe250` | local `qwen2.5-coder:14b` (Ollama) | 6 tool calls, `NEEDS_INPUT`: file-scoped `find_symbol` on the first turn, then the **correct** production change (`name()` → `toString()`, 636-char patch), then Docker validation reported `824 tests, 4 failures` in `EnumTest` honestly; the model changed the source but not the tests it breaks, so no criterion passed and the diff is refused for export (finding 16) |
+| N `48e3992a` | `openai/gpt-oss-120b` (Groq, refreshed quota) | 25 calls, `FAILED` on the 24-call cap: correct production patch (988 characters) but the `EnumTest` update was still in progress, and validation never ran; 118,270 prompt / 4,608 completion tokens (finding 17) |
+| O `850ab03f` | `openai/gpt-oss-120b`, 36-call cap | 24 calls, `FAILED` on the **daily** token cap (`194875/200000`): correct production patch, no test update, no validation (finding 17) |
+| P `7cdfcd1d` | `qwen/qwen3.8-27b`, 36-call cap | 35 calls, `FAILED` on its own daily cap (`193374/200000`): correct production patch through the real `quote(String, Writer)` overload, a second hunk rejected honestly, no test update or validation (finding 17) |
 
 What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
 unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
@@ -325,6 +367,16 @@ same prompt — for a code-specialized 14B, `qwen2.5-coder:14b`, produced the co
 change and an honest 824-test result in a single six-call run (finding 16). The local limit is the
 model's family more than its size class, and in every local run the loop held: it refused to report a
 failing or unverified result as a pass.
+
+Runs N–P returned to the hosted path once the daily quota reset. The refreshed quota funded three real
+attempts — two on `gpt-oss-120b`, one on `qwen/qwen3.8-27b` — and all three produced the correct
+source localization, but none reached the test update or validation: the first ended on the 24-call
+cap and the other two on their models' 200,000-token daily caps (finding 17). Both strong model buckets
+were exhausted by roughly one and a half attempts each. On the free tier the remaining gap is therefore
+neither localization (three different models found `writeValue`) nor the safety loop (every run failed
+honestly with unverified criteria), but the quota needed to carry a multi-file change through the test
+update and a real Maven validation. A funded key or another provider is the next experiment worth
+running; without one, the honest statement is that the loop is ready and the free tier is not.
 
 ## Repository selection (the gate, in practice)
 
