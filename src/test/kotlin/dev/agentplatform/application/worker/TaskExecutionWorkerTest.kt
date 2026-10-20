@@ -556,6 +556,12 @@ class TaskExecutionWorkerTest {
             "the newest read must be kept"
         )
         assertTrue(request.any { it.role == "user" && it.content.contains("dropped from this conversation") })
+        val note = request.single { it.role == "user" && it.content.contains("dropped from this conversation") }.content
+        assertTrue(note.contains("Dropped: read_file(First.java)"), note)
+        assertFalse(
+            note.contains("Do not re-read a file whose contents you have already seen"),
+            "the note must not forbid recovering content it just removed: $note"
+        )
         val assistantCallIds = request.filter { it.role == "assistant" }.flatMap { it.toolCalls }.map { it.id }.toSet()
         request.filter { it.role == "tool" }.forEach { result ->
             assertTrue(

@@ -510,25 +510,45 @@ class TaskExecutionWorker @Inject constructor(
         val head = messages.take(FIXED_MESSAGE_COUNT)
         val tail = messages.drop(FIXED_MESSAGE_COUNT)
         var history = tail.sumOf { it.estimatedCharacters() }
-        // The note is added to the tail, so it has to fit the same budget.
-        val noteCharacters = HISTORY_DROP_NOTE.length
-        if (history + noteCharacters <= budgetCharacters) return messages
 
         val blocks = exchangeBlocks(tail)
         var retained = blocks
-        var droppedExchanges = 0
-        while (retained.size > 1 && history + noteCharacters > budgetCharacters) {
-            val dropped = retained.first()
-            history -= dropped.sumOf { it.estimatedCharacters() }
+        val dropped = mutableListOf<List<ModelMessage>>()
+        // The note is added to the tail, so it has to fit the same budget. It names what was dropped and
+        // grows as more is dropped, so the exact note is measured on each pass rather than reserving a
+        // worst case (which would evict more history than the budget requires).
+        while (retained.size > 1 && history + historyDropNote(dropped).length > budgetCharacters) {
+            val block = retained.first()
+            history -= block.sumOf { it.estimatedCharacters() }
+            dropped += block
             retained = retained.drop(1)
-            droppedExchanges++
         }
-        if (droppedExchanges == 0) return messages
+        if (dropped.isEmpty()) return messages
+        val note = historyDropNote(dropped)
         log.warnf(
-            "Task conversation exceeded the %d character history budget; dropped %d older tool exchange(s)",
-            budgetCharacters, droppedExchanges
+            "Task conversation exceeded the %d character history budget; dropped %d older tool exchange(s): %s",
+            budgetCharacters, dropped.size, note
         )
-        return head + ModelMessage("user", HISTORY_DROP_NOTE) + retained.flatten()
+        return head + ModelMessage("user", note) + retained.flatten()
+    }
+
+    /**
+     * Names the tool calls whose results were dropped so the model knows what it no longer has, instead
+     * of guessing or re-reading everything. Only tool names and `path` arguments are quoted: a search
+     * query or file content would put repository data into a note that reads like an instruction.
+     */
+    private fun historyDropNote(dropped: List<List<ModelMessage>>): String {
+        val references = dropped.mapNotNull { block ->
+            val call = block.firstOrNull { it.role == ASSISTANT_ROLE }?.toolCalls?.firstOrNull()
+                ?: return@mapNotNull null
+            val path = call.arguments.path("path").asText("").takeIf(String::isNotBlank)
+            if (path == null) call.name else "${call.name}(${path.take(MAX_DROPPED_REFERENCE_CHARS)})"
+        }.distinct().take(MAX_DROPPED_REFERENCES)
+        return buildString {
+            append(HISTORY_DROP_NOTE_PREFIX)
+            if (references.isNotEmpty()) append(" Dropped: ").append(references.joinToString(", ")).append('.')
+            append(HISTORY_DROP_NOTE_SUFFIX)
+        }
     }
 
     /**
@@ -991,10 +1011,14 @@ class TaskExecutionWorker @Inject constructor(
         const val DISABLED_SENTINEL = "disabled"
         const val FIXED_MESSAGE_COUNT = 2
         const val TOOL_ROLE = "tool"
-        const val HISTORY_DROP_NOTE =
-            "Older tool results were dropped from this conversation to stay inside the model's request limit. " +
-                "Do not re-read a file whose contents you have already seen unless the change needs its current " +
-                "text; if you still need one, read only the lines you need with read_file's range."
+        const val ASSISTANT_ROLE = "assistant"
+        const val HISTORY_DROP_NOTE_PREFIX =
+            "Older tool results were dropped from this conversation to stay inside the model's request limit."
+        const val HISTORY_DROP_NOTE_SUFFIX =
+            " If you still need one, read only the lines you need with read_file's range; " +
+                "do not re-read a whole file to recover a few lines."
+        const val MAX_DROPPED_REFERENCES = 8
+        const val MAX_DROPPED_REFERENCE_CHARS = 80
 
         fun resolveHistoryBudget(configured: String): Int {
             val trimmed = configured.trim()
