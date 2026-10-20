@@ -113,7 +113,10 @@ Consequences, all measured:
 - **Context.** The Ollama server's own context (4,096 tokens here) is a *separate* limit from the
   application's `AGENT_MAX_HISTORY_CHARACTERS` (48,000 characters ≈ 12,000 tokens on these runs). A
   local operator doing repository-scale work should raise the server's `num_ctx`; the application's
-  budget can only be as large as the server will accept.
+  budget can only be as large as the server will accept. Run R left `OLLAMA_NUM_CTX` unset, loaded
+  4,096 tokens, and repeated a rejected patch whose corrected lines it had just read; that result
+  cannot be used to judge the prompt because Ollama truncates an over-window conversation. The local
+  recipe now sets `OLLAMA_NUM_CTX=8192`; confirm it with `ollama ps` before starting a run.
 - **Fit.** Offloading is what makes a 14B "work" at all on 6 GB; it is also why a local run is minutes,
   not seconds. This is a hardware statement, not a platform one.
 
@@ -149,9 +152,10 @@ project, and the repository green on its own terms before the agent touches it.
 # provider + model
 $env:AGENT_MODEL_PROVIDER              = "ollama"
 $env:OLLAMA_MODEL                      = "qwen2.5-coder:14b"
-# Optional: ask Ollama for a larger context window. The server default is often 4096 tokens, which a
-# long agent conversation outgrows; leave unset to keep the server default.
-# $env:OLLAMA_NUM_CTX                  = "8192"
+# Required for repository-scale work: Ollama's server default is often 4096 tokens, smaller than the
+# system prompt + task + repository map + one whole-file read (run R loaded 4096 and could not be
+# trusted as a test of the prompt). Raise it before judging a local model's behavior.
+$env:OLLAMA_NUM_CTX                    = "8192"
 
 # local-only relaxations: no quota to pace, a bigger working set, a long wall clock
 $env:AGENT_RATE_LIMIT_TOKENS_PER_MINUTE = "disabled"

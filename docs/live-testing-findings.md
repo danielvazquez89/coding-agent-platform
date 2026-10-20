@@ -359,6 +359,36 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   the validation trim from `21cde1a` rides along, though this run's 9,586-character output did not
   reach the old 12,000-character cut.
 
+### 20. The patch hint works; the model resends the same bytes, and a 4,096-token window confounds it
+
+- **Setup.** Same task, model and local settings as run Q, with `21cde1a` (start-and-end validation
+  trim) and `536d139` (numbered lines at a failed hunk) in the jar. It did **not** carry `ad09433`
+  (read the enclosing block), `6fedf1f` (retry) or `70e5f4e` (duplicate-resend guard).
+  `OLLAMA_NUM_CTX` was unset, so Ollama loaded the model with its default window.
+- **Run R (`f5ad2e79-13f6-4c9b-b870-6b1d84230a95`, attempt `2a108f7c`).** Ten tool calls in
+  31 minutes: `find_symbol(writeValue)`, `read_file` 3168-3172, a file-scoped `search_code`, a
+  whole-file read of `EnumTest` (11,999 characters), then five `apply_patch` attempts. Call 5
+  (1,582 characters) was rejected at **`EnumTest.java:100`**, and its refusal carried the numbered
+  actual lines. Call 6 read exactly **94-104** - the hint worked. Calls 7 and 8 sent the **same
+  1,582-character patch** again; calls 9 and 10 sent a 1,643-character variant; all four were
+  rejected at the same line.
+- **The context confounder.** `ollama ps` reported **4,096 tokens**, and the whole-file `EnumTest`
+  result alone is roughly 3,000 tokens before the system prompt, the task and the repository map.
+  Ollama truncates a prompt that exceeds the loaded window, so this run cannot separate "the model
+  ignores the hint" from "the model never received the hint in full". The next local run must set
+  `OLLAMA_NUM_CTX=8192` and confirm the loaded context before using the result to judge the prompt.
+- **Bounded stop and honest recovery.** Rather than let the remaining 14 calls repeat the same hunk,
+  the operator stopped the app after call 10. A restart with `AGENT_MAX_TASK_DURATION_SECONDS=1`
+  (the derived stale timeout is twice that) reaped the orphan: the task and attempt became `FAILED`
+  with "The execution worker stopped while attempt 1 was running (started ...); its outcome is
+  unknown ... a new task is required to retry the work", a report summary of "no result was
+  recorded", `changedFiles=0` and no validation. Nothing was reported as a pass.
+- **What this argues for.** `70e5f4e` refuses a byte-identical resend of a patch already rejected in
+  the same attempt (SHA-256, per attempt) and tells the model to change the hunk context; `ad09433`
+  tells the model to read the enclosing declaration, not four lines around the declaration.
+  `docs/local-deployment.md` now sets `OLLAMA_NUM_CTX=8192` in the recipe rather than leaving it
+  commented out, because the default window is smaller than the conversation this task produces.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -385,6 +415,7 @@ recorded rather than glossed over, because the failures are informative.
 | O `850ab03f` | `openai/gpt-oss-120b`, 36-call cap | 24 calls, `FAILED` on the **daily** token cap (`194875/200000`): correct production patch, no test update, no validation (finding 17) |
 | P `7cdfcd1d` | `qwen/qwen3.8-27b`, 36-call cap | 35 calls, `FAILED` on its own daily cap (`193374/200000`): correct production patch through the real `quote(String, Writer)` overload, a second hunk rejected honestly, no test update or validation (finding 17) |
 | Q `5711e308` | local `qwen2.5-coder:14b`, after the test-update prompt | 10 tool calls, `NEEDS_INPUT`: read only lines 3168-3175 around `writeValue`, then guessed patches at 3171 and 3173 (the enum branch is at 3185); both were rejected and recorded `REJECTED` with the actionable message. It ran validation on the unchanged tree (baseline PASS, 66 s), reported no change, and all criteria stayed `UNVERIFIED`; 15 model calls, 50,623 prompt tokens, 858 s (finding 19) |
+| R `f5ad2e79` | local `qwen2.5-coder:14b`, Ollama context **4096** | 10 tool calls, operator-stopped and reaped `FAILED` with an outcome-unknown report: the first refusal quoted the numbered lines at `EnumTest.java:100` and the model immediately read 94-104, then sent the **same 1,582-character patch** twice more (calls 7, 8) and a 1,643-character variant twice (calls 9, 10), all rejected at the same line. `ollama ps` showed 4,096 tokens, smaller than this conversation, so truncation confounds the result (finding 20) |
 
 What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
 unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
