@@ -383,6 +383,88 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `nudges the model to fix a failed validation before accepting its report`() {
+        val criterion = "The full Maven test suite passes"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val state = FakeState(task)
+        val attempts = FakeAttempts()
+        val workspace = FakeWorkspace(temporary, listOf("README.md"))
+        Files.writeString(temporary.resolve("README.md"), "project context\n")
+        val firstPatch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-project context",
+            "+updated project context"
+        ).joinToString("\n", postfix = "\n")
+        val secondPatch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-updated project context",
+            "+updated project context with the test fix"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to firstPatch)))),
+                "tool_calls", 1, 1
+            ),
+            ModelTurn(null, listOf(call("run_validation", "{}")), "tool_calls", 1, 1),
+            ModelTurn(
+                """{"summary":"Not finished","implementation":"The tests still assert the old behavior.","acceptanceChecks":[{"criterion":"$criterion","outcome":"UNVERIFIED","evidence":"The failing test was not updated."}]}""",
+                emptyList(), "stop", 1, 1
+            ),
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to secondPatch)))),
+                "tool_calls", 1, 1
+            ),
+            ModelTurn(null, listOf(call("run_validation", "{}")), "tool_calls", 1, 1),
+            ModelTurn(
+                """{"summary":"Fixed","implementation":"Updated the stale test and reran validation.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"The second validation run passed."}]}""",
+                emptyList(), "stop", 1, 1
+            )
+        )
+        var runs = 0
+        val validationRunner = object : ValidationRunner {
+            override fun validate(workspace: Path): ValidationCheck {
+                runs++
+                return if (runs == 1) {
+                    ValidationCheck(
+                        "Maven tests",
+                        outcome = CheckOutcome.FAILED,
+                        details = "EnumTest expected the old enum name"
+                    )
+                } else {
+                    ValidationCheck("Maven tests", outcome = CheckOutcome.PASSED)
+                }
+            }
+        }
+
+        assertTrue(
+            worker(state, attempts, provider, workspace, validationRunner = validationRunner).execute(task.id)
+        )
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(AttemptStatus.COMPLETED, attempts.finished?.status)
+        val report = attempts.finishedReport!!
+        // The report describes the final state; the failed run stays visible in the tool audit.
+        assertEquals(CheckOutcome.PASSED, report.validation.single().outcome)
+        assertEquals(
+            listOf("apply_patch", "run_validation", "apply_patch", "run_validation"),
+            report.toolExecutions.map { it.toolName }
+        )
+        assertTrue(report.toolExecutions[1].resultSummary.contains("FAILED"), report.toolExecutions[1].resultSummary)
+        assertTrue(
+            provider.messages.any { it.role == "user" && it.content.contains("the last validation failed") },
+            provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
+        )
+    }
+
+    @Test
     fun `fails after patch recovery is exhausted instead of asking the user to repair it`() {
         val task = task()
         val attempts = FakeAttempts()
@@ -756,8 +838,11 @@ class TaskExecutionWorkerTest {
 
         assertEquals(2, validationCalls)
         assertEquals(TaskStatus.FAILED, task.status)
-        assertEquals(2, attempts.finishedReport!!.validation.size)
-        assertEquals(CheckOutcome.FAILED, attempts.finishedReport!!.validation.last().outcome)
+        val report = attempts.finishedReport!!
+        // The report holds the final run's check; the baseline run remains in the tool audit.
+        assertEquals(1, report.validation.size)
+        assertEquals(CheckOutcome.FAILED, report.validation.single().outcome)
+        assertEquals(2, report.toolExecutions.count { it.toolName == "run_validation" })
         assertEquals("Post-patch tests failed", attempts.finished?.errorSummary)
     }
 

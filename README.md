@@ -56,7 +56,12 @@ The conservatism is deliberate:
   acceptance criterion has an evidence-bearing passing assessment, and supported validation passed.
   Unknown outcomes stay `NEEDS_INPUT` or `FAILED`, never a pass. A final report that cannot be parsed as
   JSON is re-requested at most twice, because a formatting slip should not hide an otherwise validated
-  change; if it still cannot be parsed, every criterion stays unverified.
+  change; if it still cannot be parsed, every criterion stays unverified. A report is also not accepted
+  while the patched tree fails validation: the worker validates before evaluating the final answer and
+  tells the model to fix the failing test and rerun validation, at most twice. The report stores the
+  final run's check, while each earlier run remains in the persisted tool audit. A local run applied the
+  correct enum change, saw `EnumTest` fail against the old expectation, and then reported that the tests
+  were not updated; that is the case this nudge addresses.
 - **Draft pull requests only.** Nothing merges, deploys, or writes to a default branch.
 
 The honest trade-off: this conservatism caps capability. A bounded eight-tool loop driven by a small local

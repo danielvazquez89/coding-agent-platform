@@ -361,12 +361,13 @@ class TaskExecutionWorker @Inject constructor(
         var prematureFinalRetries = 0
         var patchFailureRetries = 0
         var reportFormatRetries = 0
+        var validationFixRetries = 0
         var lastPatchFailure: String? = null
         var lastToolResult: String? = null
         var patchApplied = false
         var validationCurrent = false
         var lastModelText: String? = null
-        repeat(maxToolCalls + MAX_PATCH_FAILURE_RETRIES + MAX_REPORT_FORMAT_RETRIES + 4) {
+        repeat(maxToolCalls + MAX_PATCH_FAILURE_RETRIES + MAX_REPORT_FORMAT_RETRIES + MAX_VALIDATION_FIX_RETRIES + 4) {
             checkBudget(trace.startedAtNanos, trace)
             val modelCallStartedAt = System.nanoTime()
             val requestMessages = boundedHistory(messages, historyBudgetCharacters)
@@ -407,6 +408,31 @@ class TaskExecutionWorker @Inject constructor(
                     )
                     return@repeat
                 }
+                // A patch that applied is not a finished task. Run U applied the right source change,
+                // ran validation, saw EnumTest fail against the old expectation, and then returned a
+                // report saying the tests were not updated. Validate the patched tree before accepting
+                // a final answer, then say explicitly that a failed validation is not the end, with a
+                // bounded number of retries.
+                if (patchApplied && !validationCurrent) {
+                    checkBudget(trace.startedAtNanos, trace)
+                    validation.clear()
+                    validation += executeAuditedTool(
+                        "run_validation", objectMapper.createObjectNode(), root, trace
+                    ).validation!!
+                    validationCurrent = true
+                }
+                val failedValidation = validation.lastOrNull()?.takeIf { it.outcome == CheckOutcome.FAILED }
+                if (patchApplied && failedValidation != null && validationFixRetries < MAX_VALIDATION_FIX_RETRIES) {
+                    validationFixRetries++
+                    messages += ModelMessage("assistant", turn.content.orEmpty())
+                    messages += ModelMessage(
+                        "user",
+                        "Your patch applied, but the last validation failed: ${
+                            failedValidation.details.orEmpty().take(1500)
+                        } The task is not complete while a supported validation fails. Read the failing test or source, fix it with apply_patch (update an existing test whose expectation is now stale), and call run_validation again. Do not return a final report or ask a question while validation fails."
+                    )
+                    return@repeat
+                }
                 val response = (turn.content?.takeIf(String::isNotBlank) ?: lastModelText).orEmpty()
                 if (
                     lastPatchFailure == null &&
@@ -432,6 +458,7 @@ class TaskExecutionWorker @Inject constructor(
                 }
                 if (!validationCurrent) {
                     checkBudget(trace.startedAtNanos, trace)
+                    validation.clear()
                     validation += executeAuditedTool(
                         "run_validation", objectMapper.createObjectNode(), root, trace
                     ).validation!!
@@ -472,6 +499,10 @@ class TaskExecutionWorker @Inject constructor(
                     )
                 }
                 result.validation?.let {
+                    // The report describes the final state; an earlier run's result stays in the tool
+                    // audit. Appending would make exportablePatch refuse a patch that passed after a
+                    // fix, because it requires every stored check to be PASSED.
+                    validation.clear()
                     validation += it
                     validationCurrent = true
                 }
@@ -1031,6 +1062,7 @@ class TaskExecutionWorker @Inject constructor(
         const val MAX_DIFF_CHARS = 30_000
         const val MAX_PATCH_FAILURE_RETRIES = 3
         const val MAX_REPORT_FORMAT_RETRIES = 2
+        const val MAX_VALIDATION_FIX_RETRIES = 2
         const val DISABLED_SENTINEL = "disabled"
         const val FIXED_MESSAGE_COUNT = 2
         const val TOOL_ROLE = "tool"

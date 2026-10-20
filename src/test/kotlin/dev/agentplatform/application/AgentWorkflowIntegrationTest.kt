@@ -168,7 +168,10 @@ class AgentWorkflowIntegrationTest {
         val repository = repository("before")
         validation.result = ValidationCheck("Maven tests", outcome = CheckOutcome.FAILED, exitCode = 1, details = "Tests failed")
         AgentWorkflowTestSupport.enqueueToolCall("apply_patch", mapOf("patch" to AgentWorkflowTestSupport.patch("before", "after")))
-        AgentWorkflowTestSupport.enqueueAssistant(AgentWorkflowTestSupport.successfulFinal(criterion))
+        // The first report arrives after the failed validation; the worker asks for a fix twice
+        // before accepting that the task cannot complete. The validation keeps failing, so the
+        // outcome must still be FAILED and no pull request may be opened.
+        repeat(1 + 2) { AgentWorkflowTestSupport.enqueueAssistant(AgentWorkflowTestSupport.successfulFinal(criterion)) }
 
         val taskId = submitTask(repository, criterion)
         worker.execute(java.util.UUID.fromString(taskId))
@@ -180,6 +183,13 @@ class AgentWorkflowIntegrationTest {
         assertTrue(pullRequest.isMissingNode || pullRequest.isNull)
         assertTrue(publisher.calls.isEmpty())
         assertEquals(listOf("QUEUED", "RUNNING", "VALIDATING", "FAILED"), history(taskId))
+        assertTrue(
+            AgentWorkflowTestSupport.modelRequests.any { request ->
+                AgentWorkflowTestSupport.mapper.readTree(request).path("messages")
+                    .any { it.path("content").asText().contains("the last validation failed") }
+            },
+            "the worker should ask the model to fix the failed validation before giving up"
+        )
     }
 
     @Test
