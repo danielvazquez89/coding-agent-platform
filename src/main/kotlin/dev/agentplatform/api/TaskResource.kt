@@ -72,6 +72,21 @@ class TaskResource @Inject constructor(
         }
     }
 
+    @POST
+    @Path("/{id}/retry")
+    @Consumes(MediaType.WILDCARD)
+    fun retry(@PathParam("id") id: UUID): Response {
+        val task = try {
+            taskService.retry(id) ?: throw NotFoundException("Task $id was not found")
+        } catch (failure: IllegalStateException) {
+            return Response.status(Response.Status.CONFLICT)
+                .type(MediaType.APPLICATION_JSON)
+                .entity(ApiError(failure.message ?: "Task $id cannot be retried"))
+                .build()
+        }
+        return Response.created(URI.create("/api/tasks/${task.id}")).entity(task).build()
+    }
+
     @GET
     @Path("/{id}/history")
     fun history(@PathParam("id") id: UUID): List<TaskStatusTransitionResponse> {

@@ -175,6 +175,45 @@ class TaskResourceTest {
     }
 
     @Test
+    fun `retry endpoint clones a failed task and rejects non-terminal ones`() {
+        val id = createTask()
+        transition(id, "RUNNING")
+        transition(id, "FAILED", "Daily quota exhausted")
+
+        val response = given()
+            .`when`().post("/api/tasks/$id/retry")
+            .then()
+            .statusCode(201)
+            .body("status", equalTo("QUEUED"))
+            .body("title", equalTo("Lifecycle test task"))
+            .body("description", equalTo("Exercise persisted task lifecycle behavior"))
+            .body("acceptanceCriteria", equalTo(listOf("First criterion", "Second criterion")))
+            .body("retryOf", equalTo(id))
+            .extract()
+
+        assertNotNull(response.header("Location"))
+        val retryId = response.path("id") as String
+
+        given()
+            .`when`().get("/api/tasks/$retryId/history")
+            .then()
+            .statusCode(200)
+            .body("size()", equalTo(1))
+            .body("[0].reason", equalTo("Retry of task $id"))
+
+        given()
+            .`when`().post("/api/tasks/$retryId/retry")
+            .then()
+            .statusCode(409)
+            .body("message", containsString("can only be retried"))
+
+        given()
+            .`when`().post("/api/tasks/00000000-0000-0000-0000-000000000001/retry")
+            .then()
+            .statusCode(404)
+    }
+
+    @Test
     fun `unknown tasks return not found for status and history`() {
         val missingId = "00000000-0000-0000-0000-000000000001"
 

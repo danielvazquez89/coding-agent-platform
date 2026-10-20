@@ -41,16 +41,50 @@ class TaskService(
     }
 
     @Transactional
-    fun create(request: CreateTaskRequest): CodingTask {
+    fun create(request: CreateTaskRequest): CodingTask = persistNewTask(
+        title = request.title.trim(),
+        description = request.description.trim(),
+        acceptanceCriteria = request.acceptanceCriteria.map(String::trim).filter(String::isNotEmpty),
+        repositoryUrl = request.repositoryUrl?.trim()?.takeIf(String::isNotEmpty),
+        retryOf = null
+    )
+
+    /**
+     * A failed or cancelled task is retried by cloning its text into a new queued task, because its
+     * workspace and attempt history are terminal. The clone keeps the source id so an operator can
+     * follow the chain instead of matching identical descriptions by hand.
+     */
+    @Transactional
+    fun retry(id: UUID): CodingTask? {
+        val source = taskRepository.findById(id) ?: return null
+        check(source.status == TaskStatus.FAILED || source.status == TaskStatus.CANCELLED) {
+            "Task $id can only be retried after it failed or was cancelled; it is ${source.status}"
+        }
+        return persistNewTask(
+            title = source.title,
+            description = source.description,
+            acceptanceCriteria = source.acceptanceCriteria.toList(),
+            repositoryUrl = source.repositoryUrl,
+            retryOf = source.id
+        )
+    }
+
+    private fun persistNewTask(
+        title: String,
+        description: String,
+        acceptanceCriteria: List<String>,
+        repositoryUrl: String?,
+        retryOf: UUID?
+    ): CodingTask {
         val task = CodingTask(
             id = UUID.randomUUID(),
-            title = request.title.trim(),
-            description = request.description.trim(),
-            acceptanceCriteria = request.acceptanceCriteria.map(String::trim).filter(String::isNotEmpty)
-                .toMutableList(),
-            repositoryUrl = request.repositoryUrl?.trim()?.takeIf(String::isNotEmpty),
+            title = title,
+            description = description,
+            acceptanceCriteria = acceptanceCriteria.toMutableList(),
+            repositoryUrl = repositoryUrl,
             status = TaskStatus.QUEUED,
-            createdAt = Instant.now()
+            createdAt = Instant.now(),
+            retryOf = retryOf
         )
         taskRepository.persist(task)
         transitionRepository.persist(
@@ -59,6 +93,7 @@ class TaskService(
                 sequenceNumber = 1,
                 fromStatus = null,
                 toStatus = task.status,
+                reason = retryOf?.let { "Retry of task $it" },
                 actor = "API"
             )
         )

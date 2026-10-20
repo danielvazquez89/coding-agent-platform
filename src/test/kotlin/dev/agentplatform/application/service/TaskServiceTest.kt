@@ -47,6 +47,48 @@ class TaskServiceTest {
     }
 
     @Test
+    fun `retrying a failed task clones it into a queued task linked to the source`() {
+        val source = taskService.create(
+            CreateTaskRequest(
+                title = "Retry me",
+                description = "Original description",
+                acceptanceCriteria = listOf("First", "Second"),
+                repositoryUrl = "https://example.com/repo.git"
+            )
+        )
+        taskService.transition(source.id, TaskStatus.RUNNING, null, "API")
+        taskService.transition(source.id, TaskStatus.FAILED, "Daily quota exhausted", "WORKER")
+
+        val retry = taskService.retry(source.id)!!
+
+        assertNotEquals(source.id, retry.id)
+        assertEquals("Retry me", retry.title)
+        assertEquals("Original description", retry.description)
+        assertEquals(listOf("First", "Second"), retry.acceptanceCriteria)
+        assertEquals("https://example.com/repo.git", retry.repositoryUrl)
+        assertEquals(TaskStatus.QUEUED, retry.status)
+        assertEquals(source.id, retry.retryOf)
+        val history = taskService.history(retry.id)
+        assertEquals(1, history.size)
+        assertEquals("Retry of task ${source.id}", history.single().reason)
+        assertEquals("API", history.single().actor)
+
+        assertEquals(TaskStatus.FAILED, taskService.findById(source.id)!!.status)
+    }
+
+    @Test
+    fun `retry rejects non-terminal tasks and reports a missing source`() {
+        assertNull(taskService.retry(UUID.randomUUID()))
+
+        val queued = taskService.create(CreateTaskRequest("Queued", "Description"))
+        assertThrows(IllegalStateException::class.java) { taskService.retry(queued.id) }
+
+        val cancelled = taskService.create(CreateTaskRequest("Cancelled", "Description"))
+        taskService.transition(cancelled.id, TaskStatus.CANCELLED, null, "API")
+        assertEquals(TaskStatus.QUEUED, taskService.retry(cancelled.id)!!.status)
+    }
+
+    @Test
     fun `blank transition reasons normalize to null and custom actor is retained`() {
         val task = taskService.create(CreateTaskRequest("Task", "Description"))
         taskService.transition(task.id, TaskStatus.RUNNING, "   ", actor = "WORKER")

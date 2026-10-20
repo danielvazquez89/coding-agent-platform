@@ -30,5 +30,9 @@ class CodingTask(
     var status: TaskStatus = TaskStatus.QUEUED,
 
     @field:Column(name = "created_at", nullable = false)
-    var createdAt: Instant = Instant.now()
+    var createdAt: Instant = Instant.now(),
+
+    /** The task this one was cloned from by a retry, so a re-run keeps its audit chain. */
+    @field:Column(name = "retry_of")
+    var retryOf: UUID? = null
 )
