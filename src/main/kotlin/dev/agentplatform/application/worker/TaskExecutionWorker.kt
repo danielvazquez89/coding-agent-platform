@@ -11,6 +11,7 @@ import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.jboss.logging.Logger
 import java.nio.file.Path
+import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
 import java.util.*
@@ -676,6 +677,11 @@ class TaskExecutionWorker @Inject constructor(
     ): ToolExecutionResult {
         val startedAt = System.nanoTime()
         val argumentSummary = summarizeToolArguments(name, arguments)
+        val patchFingerprint = if (name == APPLY_PATCH_TOOL) {
+            arguments.path("patch").asText("").takeIf(String::isNotBlank)?.let(::fingerprint)
+        } else {
+            null
+        }
         val pending = trace.nextToolAudit(
             name, argumentSummary, ToolExecutionOutcome.STARTED, "Tool execution started", 0
         )
@@ -686,6 +692,12 @@ class TaskExecutionWorker @Inject constructor(
         }
         trace.toolExecutions += pending
         val result = try {
+            if (patchFingerprint != null && patchFingerprint in trace.rejectedPatches) {
+                // Resending a byte-identical patch cannot apply. Refuse it here instead of paying for
+                // another git invocation and another confused turn; a live 14B sent the same failing
+                // 1,582-character patch three times in a row.
+                throw IllegalArgumentException(DUPLICATE_PATCH_MESSAGE)
+            }
             tools.execute(name, arguments, root)
         } catch (failure: Exception) {
             if (failure is AuditPersistenceException) throw failure
@@ -695,6 +707,7 @@ class TaskExecutionWorker @Inject constructor(
             // do, and the message tells it how to proceed, so the audit says so instead of blaming the
             // tool. The executor already tags the same calls `rejected` in the metrics.
             val refused = failure is IllegalArgumentException
+            if (refused && patchFingerprint != null) trace.rejectedPatches += patchFingerprint
             val outcome = if (refused) ToolExecutionOutcome.REJECTED else ToolExecutionOutcome.FAILED
             val summary = if (refused) {
                 "Rejected: ${failure.message ?: failure.javaClass.simpleName}"
@@ -713,6 +726,9 @@ class TaskExecutionWorker @Inject constructor(
         finishToolAudit(trace, pending, ToolExecutionOutcome.SUCCEEDED, summary, elapsedMillis(startedAt))
         return result
     }
+
+    private fun fingerprint(value: String): String =
+        HexFormat.of().formatHex(MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8)))
 
     private fun recordToolAudit(
         taskId: UUID,
@@ -938,6 +954,7 @@ class TaskExecutionWorker @Inject constructor(
         var priorBudgetUsage: TaskBudgetUsage = TaskBudgetUsage()
     ) {
         val patchFailures = mutableListOf<String>()
+        val rejectedPatches = mutableSetOf<String>()
         val toolExecutions = mutableListOf<ToolExecutionAudit>()
         private var promptTokens = 0
         private var completionTokens = 0
@@ -1003,6 +1020,12 @@ class TaskExecutionWorker @Inject constructor(
     private class AuditPersistenceException(message: String, cause: Throwable) : RuntimeException(message, cause)
 
     private companion object {
+        const val APPLY_PATCH_TOOL = "apply_patch"
+        const val DUPLICATE_PATCH_MESSAGE =
+            "This patch is byte-for-byte identical to one that was rejected earlier in this attempt, " +
+                "so resending it cannot apply. The earlier refusal quoted the actual lines at the failed " +
+                "location; change the hunk context to match those lines (or use create_file if the file " +
+                "is new) and submit a different patch."
         const val MAX_TOOL_RESULT_CHARS = 12_000
         const val MAX_FINAL_TEXT_CHARS = 15_000
         const val MAX_DIFF_CHARS = 30_000

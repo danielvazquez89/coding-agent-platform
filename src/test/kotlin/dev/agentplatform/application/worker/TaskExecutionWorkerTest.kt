@@ -335,6 +335,54 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `refuses a byte-identical rejected patch without running it again`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val rejected = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Missing",
+            "+Hello from Qwen"
+        ).joinToString("\n", postfix = "\n")
+        val corrected = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello from Qwen"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to rejected)))), "tool_calls", 1, 1),
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to rejected)))), "tool_calls", 1, 1),
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to corrected)))), "tool_calls", 1, 1),
+            ModelTurn(
+                """{"summary":"Applied the change","implementation":"Greeting now names the model."}""",
+                emptyList(),
+                "stop",
+                1,
+                1
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        val patchEvents = attempts.persistedToolEvents.filter { it.toolName == "apply_patch" }
+        assertEquals(3, patchEvents.size)
+        assertEquals(
+            listOf(ToolExecutionOutcome.REJECTED, ToolExecutionOutcome.REJECTED, ToolExecutionOutcome.SUCCEEDED),
+            patchEvents.map { it.outcome }
+        )
+        assertTrue(patchEvents[1].resultSummary.contains("byte-for-byte identical"))
+        assertTrue(provider.messages.filter { it.role == "tool" }.any { it.content.contains("byte-for-byte identical") })
+        assertEquals("Hello from Qwen\n", Files.readString(temporary.resolve("Greeting.java")))
+        assertEquals(TaskStatus.COMPLETED, task.status)
+    }
+
+    @Test
     fun `fails after patch recovery is exhausted instead of asking the user to repair it`() {
         val task = task()
         val attempts = FakeAttempts()
