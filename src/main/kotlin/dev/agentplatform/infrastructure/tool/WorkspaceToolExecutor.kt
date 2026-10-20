@@ -197,7 +197,10 @@ class WorkspaceToolExecutor(
                 val line = lines[index]
                 if (!word.containsMatchIn(line)) continue
                 val kind = declarationKind(name, line)
-                val hit = SymbolHit(path, index + 1, kind, line.trim().take(300), test)
+                val hit = SymbolHit(
+                    path, index + 1, kind, line.trim().take(300), test,
+                    endLine = if (kind == "method" || kind == "function") blockEnd(lines, index) else null
+                )
                 if (kind == REFERENCE_KIND) {
                     if (references.size < SEARCH_SCAN_MATCH_LIMIT) references += hit
                 } else {
@@ -214,7 +217,10 @@ class WorkspaceToolExecutor(
         } else {
             "Declarations of '$name' (bounded line scan, a heuristic; confirm the line before editing):"
         }
-        val body = page.joinToString("\n") { "  ${it.path}:${it.line}: [${it.kind}] ${it.text}" }
+        val body = page.joinToString("\n") {
+            val end = it.endLine?.let { endLine -> " (block ends at line $endLine)" } ?: ""
+            "  ${it.path}:${it.line}: [${it.kind}] ${it.text}$end"
+        }
         val footer = if (ordered.size > page.size) {
             "\n(showing ${page.size} of ${ordered.size} matches; narrow with path or glob)"
         } else {
@@ -223,8 +229,74 @@ class WorkspaceToolExecutor(
         // The declaration line is trimmed and only a hint: a patch must reproduce the file's exact
         // content, so point the model at read_file before it edits.
         val next = "\nNext: read the lines around a declaration with read_file (startLine/endLine) and copy " +
-            "them exactly, including leading whitespace, when you write the patch."
+            "them exactly, including leading whitespace, when you write the patch. A method's block can " +
+            "extend well past its declaration, so read to the reported block end."
         return (header + "\n" + body + footer + next).take(TOOL_OUTPUT_LIMIT)
+    }
+
+    /**
+     * The end line of a method or function body, found by a brace count from the declaration. It is
+     * a hint, not a parser: brace-like text in a block comment can still confuse it, which is why the
+     * tool calls the line scan a heuristic. Knowing that a method ends well past its declaration is
+     * what stops a model from patching only the first branch it read (runs Q, R and S all did).
+     */
+    private fun blockEnd(lines: List<String>, declarationIndex: Int): Int? {
+        var depth = 0
+        var opened = false
+        val headerEnd = minOf(lines.lastIndex, declarationIndex + BLOCK_HEADER_LOOKAHEAD)
+        for (index in declarationIndex..headerEnd) {
+            for (character in codeOnly(lines[index])) {
+                when (character) {
+                    '{' -> { depth++; opened = true }
+                    '}' -> if (opened) {
+                        depth--
+                        if (depth == 0) return index + 1
+                    }
+                }
+            }
+        }
+        if (!opened) return null
+        for (index in (headerEnd + 1)..lines.lastIndex) {
+            for (character in codeOnly(lines[index])) {
+                when (character) {
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) return index + 1
+                    }
+                }
+            }
+        }
+        return null
+    }
+
+    /** Drops comments and string/char literals so a brace inside them does not count as code. */
+    private fun codeOnly(line: String): String {
+        val trimmed = line.trimStart()
+        if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) return ""
+        val code = StringBuilder(line.length)
+        var index = 0
+        var inString = false
+        var inChar = false
+        while (index < line.length) {
+            val character = line[index]
+            when {
+                inString -> when (character) {
+                    '\\' -> index++
+                    '"' -> inString = false
+                }
+                inChar -> when (character) {
+                    '\\' -> index++
+                    '\'' -> inChar = false
+                }
+                character == '"' -> inString = true
+                character == '\'' -> inChar = true
+                character == '/' && index + 1 < line.length && line[index + 1] == '/' -> return code.toString()
+                else -> code.append(character)
+            }
+            index++
+        }
+        return code.toString()
     }
 
     /**
@@ -251,7 +323,14 @@ class WorkspaceToolExecutor(
         }
     }
 
-    private data class SymbolHit(val path: String, val line: Int, val kind: String, val text: String, val test: Boolean)
+    private data class SymbolHit(
+        val path: String,
+        val line: Int,
+        val kind: String,
+        val text: String,
+        val test: Boolean,
+        val endLine: Int? = null
+    )
 
     private fun readFile(workspace: Path, relative: String, startLine: Int?, endLine: Int?): String {
         val file = resolve(workspace, relative)
@@ -599,6 +678,7 @@ class WorkspaceToolExecutor(
         const val READ_FILE_MAX_BYTES = 10L * 1024 * 1024
         const val CREATE_FILE_SIZE_LIMIT = 64_000
         const val PATCH_CONTEXT_LINES = 6
+        const val BLOCK_HEADER_LOOKAHEAD = 20
         const val PATCH_CONTEXT_HINT_LIMIT = 2_500
         const val PATCH_CONTEXT_LINE_CHARS = 200
         const val PATCH_CONTEXT_FILE_LIMIT = 2_000_000L

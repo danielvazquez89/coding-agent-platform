@@ -130,7 +130,9 @@ class WorkspaceToolExecutorTest {
 
         val method = tools.execute("find_symbol", mapper.readTree("""{"name":"writeValue"}"""), root).content
         assertTrue(method.contains("src/main/java/dev/example/Writer.java:6: [method]"), method)
+        assertTrue(method.contains("(block ends at line 8)"), method)
         assertTrue(method.contains("src/main/kotlin/sample/Sample.kt:3: [function]"), method)
+        assertTrue(method.contains("(block ends at line 5)"), method)
         assertTrue(method.contains("src/test/java/dev/example/WriterTest.java:5: [reference]"), method)
         assertTrue(
             method.indexOf("Writer.java:6") < method.indexOf("WriterTest.java:5"),
@@ -139,8 +141,10 @@ class WorkspaceToolExecutorTest {
 
         val type = tools.execute("find_symbol", mapper.readTree("""{"name":"Writer"}"""), root).content
         assertTrue(type.contains("src/main/java/dev/example/Writer.java:3: [type]"), type)
+        assertFalse(type.contains("(block ends at line"), type)
         val field = tools.execute("find_symbol", mapper.readTree("""{"name":"buffer"}"""), root).content
         assertTrue(field.contains("src/main/java/dev/example/Writer.java:4: [field]"), field)
+        assertFalse(field.contains("(block ends at line"), field)
 
         val bounded = tools.execute("find_symbol", mapper.readTree("""{"name":"writeValue","maxResults":1}"""), root).content
         assertEquals(1, bounded.lines().count { it.trimStart().startsWith("src/") })
@@ -178,6 +182,57 @@ class WorkspaceToolExecutorTest {
         assertThrows(IllegalArgumentException::class.java) {
             tools.execute("find_symbol", mapper.createObjectNode(), root)
         }
+    }
+
+    @Test
+    fun `find symbol reports a block end without counting braces inside strings`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src/main/java/dev/example"))
+        Files.writeString(
+            root.resolve("src/main/java/dev/example/Braces.java"),
+            """
+            |package dev.example;
+            |
+            |public class Braces {
+            |    static String braces() {
+            |        return "{";
+            |    }
+            |}
+            |""".trimMargin() + "\n"
+        )
+        Files.writeString(
+            root.resolve("src/main/java/dev/example/Contract.java"),
+            """
+            |package dev.example;
+            |
+            |public interface Contract {
+            |    public String value();
+            |}
+            |""".trimMargin() + "\n"
+        )
+        Files.writeString(
+            root.resolve("src/main/java/dev/example/Broken.java"),
+            """
+            |package dev.example;
+            |
+            |public class Broken {
+            |    static void broken() {
+            |""".trimMargin() + "\n"
+        )
+
+        val tools = executor()
+        val result = tools.execute("find_symbol", mapper.readTree("""{"name":"braces"}"""), root).content
+
+        assertTrue(result.contains("Braces.java:4: [method]"), result)
+        assertTrue(result.contains("(block ends at line 6)"), result)
+
+        // A declaration without a body and a body that is never closed report no end rather than a guess.
+        val contract = tools.execute("find_symbol", mapper.readTree("""{"name":"value"}"""), root).content
+        assertTrue(contract.contains("Contract.java:4: [method]"), contract)
+        assertFalse(contract.contains("(block ends at line"), contract)
+        val broken = tools.execute("find_symbol", mapper.readTree("""{"name":"broken"}"""), root).content
+        assertTrue(broken.contains("Broken.java:4: [method]"), broken)
+        assertFalse(broken.contains("(block ends at line"), broken)
     }
 
     @Test
