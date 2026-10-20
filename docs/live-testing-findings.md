@@ -333,6 +333,32 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   staying within the limit, and a validation result whose details plus header exceed the tool limit
   keeps its end.
 
+### 19. The 14B anchors on the method start, and a patch refusal needs to show the file
+
+- **Setup.** Same task, model and local settings as run M (finding 16), but the jar now carries the
+  test-update prompt (`ac9d1a5`), the named history drop note (`d6b96e4`) and the live `REJECTED`
+  audit (`0e82772`). It does not yet carry the start-and-end validation trim (`21cde1a`) or the
+  patch-context hint (`536d139`).
+- **Run Q (`5711e308-419e-4dbe-b91a-f6830613f9d5`, attempt `73849308`).** Ten tool calls: file-scoped
+  `find_symbol` for `writeValue`, then ranged reads of **3168-3175 only**, a file-scoped `search_code`,
+  and two `apply_patch` attempts at lines **3171** and **3173**. The enum branch is at 3185. Both
+  patches were rejected (`error: patch failed: ...:3171`, then `:3173`); the audit recorded `REJECTED`
+  with the refusal text, as designed in `0e82772`. The model then ran validation on the unchanged tree,
+  which passed the 824-test suite in 66 s.
+- **The honest result of a baseline pass.** `NEEDS_INPUT`, `changedFiles=[]`, `patchDiff=null`, all
+  three criteria `UNVERIFIED`. A green suite on an unmodified workspace is not evidence for the task,
+  and the platform did not treat it as such; the report also says "Patch recovery: 2 patch attempt(s)
+  failed before the final outcome".
+- **Cost.** 15 model calls, 50,623 prompt / 2,094 completion tokens, 789 s generating, 858 s wall
+  clock. The last five model turns proposed no tool call; the model had given up after the refusals.
+- **What this run argues for.** The model localizes to the method but reads a four-line window and
+  patches the method's opening instead of the branch. `git apply` reports only a path and a line
+  number, so the refusal gave it nothing to correct against and it guessed again two lines later.
+  Run Q therefore motivated `536d139`: a rejected patch now quotes the numbered lines that are
+  actually at the reported location. Whether that is enough for a 14B is the next local experiment;
+  the validation trim from `21cde1a` rides along, though this run's 9,586-character output did not
+  reach the old 12,000-character cut.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -358,6 +384,7 @@ recorded rather than glossed over, because the failures are informative.
 | N `48e3992a` | `openai/gpt-oss-120b` (Groq, refreshed quota) | 25 calls, `FAILED` on the 24-call cap: correct production patch (988 characters) but the `EnumTest` update was still in progress, and validation never ran; 118,270 prompt / 4,608 completion tokens (finding 17) |
 | O `850ab03f` | `openai/gpt-oss-120b`, 36-call cap | 24 calls, `FAILED` on the **daily** token cap (`194875/200000`): correct production patch, no test update, no validation (finding 17) |
 | P `7cdfcd1d` | `qwen/qwen3.8-27b`, 36-call cap | 35 calls, `FAILED` on its own daily cap (`193374/200000`): correct production patch through the real `quote(String, Writer)` overload, a second hunk rejected honestly, no test update or validation (finding 17) |
+| Q `5711e308` | local `qwen2.5-coder:14b`, after the test-update prompt | 10 tool calls, `NEEDS_INPUT`: read only lines 3168-3175 around `writeValue`, then guessed patches at 3171 and 3173 (the enum branch is at 3185); both were rejected and recorded `REJECTED` with the actionable message. It ran validation on the unchanged tree (baseline PASS, 66 s), reported no change, and all criteria stayed `UNVERIFIED`; 15 model calls, 50,623 prompt tokens, 858 s (finding 19) |
 
 What the runs do show: the safety model held in every case (no bad patch was applied, no failed or
 unavailable check was reported as a pass, every provider error was surfaced verbatim), the once-fatal
