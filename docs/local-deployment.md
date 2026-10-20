@@ -149,6 +149,9 @@ project, and the repository green on its own terms before the agent touches it.
 # provider + model
 $env:AGENT_MODEL_PROVIDER              = "ollama"
 $env:OLLAMA_MODEL                      = "qwen2.5-coder:14b"
+# Optional: ask Ollama for a larger context window. The server default is often 4096 tokens, which a
+# long agent conversation outgrows; leave unset to keep the server default.
+# $env:OLLAMA_NUM_CTX                  = "8192"
 
 # local-only relaxations: no quota to pace, a bigger working set, a long wall clock
 $env:AGENT_RATE_LIMIT_TOKENS_PER_MINUTE = "disabled"

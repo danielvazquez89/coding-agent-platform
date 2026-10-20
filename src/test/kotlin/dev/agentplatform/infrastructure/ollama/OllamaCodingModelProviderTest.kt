@@ -48,6 +48,44 @@ class OllamaCodingModelProviderTest {
     }
 
     @Test
+    fun `sends the configured context window as a request option`() {
+        val receivedBody = AtomicReference<String>()
+        withServer(
+            200,
+            """{"message":{"content":"ok"}}""",
+            onRequest = { receivedBody.set(it) },
+            numCtx = "16384"
+        ) { provider, _ ->
+            provider.chat(listOf(ModelMessage("user", "hello")), emptyList())
+        }
+
+        assertEquals(16384, mapper.readTree(receivedBody.get()).path("options").path("num_ctx").asInt())
+    }
+
+    @Test
+    fun `omits request options when the context window is disabled`() {
+        val receivedBody = AtomicReference<String>()
+        withServer(
+            200,
+            """{"message":{"content":"ok"}}""",
+            onRequest = { receivedBody.set(it) },
+            numCtx = "DISABLED"
+        ) { provider, _ ->
+            provider.chat(listOf(ModelMessage("user", "hello")), emptyList())
+        }
+
+        assertTrue(mapper.readTree(receivedBody.get()).path("options").isMissingNode)
+    }
+
+    @Test
+    fun `rejects an invalid context window at startup`() {
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            provider("http://localhost:11434", numCtx = "as much as it can")
+        }
+        assertTrue(failure.message!!.contains("num_ctx"), failure.message)
+    }
+
+    @Test
     fun `handles text-only response and omitted optional response fields`() = withServer(
         200,
         """{"message":{"content":"Ready"}}"""
@@ -248,7 +286,9 @@ class OllamaCodingModelProviderTest {
         val server = startServer(200, """{"message":{"content":""}}""")
         try {
             val endpoint = "http://127.0.0.1:${server.address.port}"
-            val turn = OllamaCodingModelProvider(endpoint, "qwen2.5-coder:7b", 5, 1, 1, 1, nullForEmptyInputMapper, ExecutionMetrics.NONE)
+            val turn = OllamaCodingModelProvider(
+                endpoint, "qwen2.5-coder:7b", "disabled", 5, 1, 1, 1, nullForEmptyInputMapper, ExecutionMetrics.NONE
+            )
                 .chat(listOf(ModelMessage("user", "Read the README")), listOf(readFileTool()))
             assertEquals("", turn.content)
             assertTrue(turn.toolCalls.isEmpty())
@@ -515,6 +555,7 @@ class OllamaCodingModelProviderTest {
     private fun provider(
         baseUrl: String,
         model: String = "qwen2.5-coder:7b",
+        numCtx: String = "disabled",
         timeoutSeconds: Long = 5,
         retryMaxAttempts: Int = 3,
         retryInitialBackoffMillis: Long = 1,
@@ -523,6 +564,7 @@ class OllamaCodingModelProviderTest {
     ) = OllamaCodingModelProvider(
         baseUrl,
         model,
+        numCtx,
         timeoutSeconds,
         retryMaxAttempts,
         retryInitialBackoffMillis,
@@ -541,11 +583,15 @@ class OllamaCodingModelProviderTest {
         status: Int,
         body: String,
         onRequest: ((String) -> Unit)? = null,
+        numCtx: String = "disabled",
         test: (OllamaCodingModelProvider, HttpServer) -> Unit
     ) {
         val server = startServer(status, body, onRequest)
         try {
-            test(provider("http://127.0.0.1:${server.address.port}"), server)
+            test(
+                provider("http://127.0.0.1:${server.address.port}", numCtx = numCtx),
+                server
+            )
         } finally {
             server.stop(0)
         }

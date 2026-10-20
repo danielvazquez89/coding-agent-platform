@@ -24,6 +24,8 @@ class OllamaCodingModelProvider(
     private val baseUrl: String,
     @ConfigProperty(name = "agent.model.ollama.model", defaultValue = "qwen3:8b")
     private val model: String,
+    @ConfigProperty(name = "agent.model.ollama.num-ctx", defaultValue = "disabled")
+    private val numCtx: String,
     @ConfigProperty(name = "agent.model.ollama.timeout-seconds", defaultValue = "1200")
     private val timeoutSeconds: Long,
     @ConfigProperty(name = "agent.model.ollama.retry.max-attempts", defaultValue = "5")
@@ -48,6 +50,11 @@ class OllamaCodingModelProvider(
     init {
         require(baseUrl.isNotBlank()) { "Ollama base URL must not be blank" }
         require(model.isNotBlank()) { "Ollama model name must not be blank" }
+        val configuredContext = numCtx.trim()
+        require(
+            !isConfigured(configuredContext) ||
+                (configuredContext.toIntOrNull()?.let { it > 0 } == true)
+        ) { "Ollama num_ctx must be a positive integer or 'disabled'" }
         require(timeoutSeconds > 0) { "Ollama timeout must be greater than zero" }
         require(retryMaxAttempts >= 1) { "Ollama retry attempts must be at least one" }
         require(retryInitialBackoffMillis > 0) { "Ollama retry backoff must be greater than zero" }
@@ -170,6 +177,7 @@ class OllamaCodingModelProvider(
         val request = objectMapper.createObjectNode()
         request.put("model", model)
         request.put("stream", false)
+        configuredContextWindow()?.let { request.putObject("options").put("num_ctx", it) }
         val messagesNode = request.putArray("messages")
         messages.forEach { message ->
             val messageNode = messagesNode.addObject()
@@ -197,6 +205,20 @@ class OllamaCodingModelProvider(
         }
         return objectMapper.writeValueAsString(request)
     }
+
+    /**
+     * Ollama's default context window is often 4096 tokens, which a real agent conversation outgrows.
+     * When the operator sets `num_ctx`, the request asks for that window; `disabled` leaves the server
+     * default in place, and startup rejects anything that is not a positive integer so a typo cannot
+     * silently fall back to a context the task cannot fit in.
+     */
+    private fun configuredContextWindow(): Int? {
+        val configured = numCtx.trim()
+        return if (isConfigured(configured)) configured.toInt() else null
+    }
+
+    private fun isConfigured(value: String): Boolean =
+        value.isNotBlank() && !value.equals("disabled", ignoreCase = true)
 
     private fun parseToolCall(call: JsonNode): ModelToolCall {
         val function = call.path("function")
