@@ -513,6 +513,32 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   names the existing file with the same suffix, and the duplicate refusal quotes the original
   rejection instead of assuming hunk context.
 
+### 25. On a tiny fixture the repair nudge fires twice and the model still explains
+
+- **Setup.** W2 (`165b5c36`, attempt `c7ef6bf2`) ran the same `small-java` task on the jar with the
+  acceptance nudge (`93b973e`), Docker 29.8.2, `qwen2.5-coder:14b`, context 8192.
+- **Calls 1-3:** `find_symbol` (452 characters), a 6-line read of `Greeting.java`, then
+  `run_validation` **before any change** - the baseline passed. The model returned a report (0 calls);
+  the premature-final nudge ("you have not applied a patch") sent it back.
+- **Calls 4-6:** it read `GreetingTest.java`, applied a **618-character test-only patch** (added
+  `greetsNullNameAsGuest`), and ran validation, which **failed**: the new test calls
+  `Greeting.greet(null)` and the source still calls `name.isBlank()` (NPE at `Greeting.java:8`).
+- **The validation nudge fired twice.** The model answered each nudge with a 0-tool-call turn
+  (5.6 and 5.5 minutes of prose), not with `apply_patch`; the worker refused both as final answers.
+  After the third 0-call turn (4.7 minutes) the retries were exhausted and the report was accepted.
+- **Outcome.** `NEEDS_INPUT`, `changedFiles=src/test/java/example/GreetingTest.java`, validation
+  `FAILED`, all three criteria `UNVERIFIED`, no false pass. The report's validation details name the
+  exact NPE and test. The model still had 18 of 24 tool calls left; the missing source change was one
+  `if (name == null)`. The acceptance nudge correctly did not fire while validation failed.
+- **What this isolates.** W1 showed the model can produce the correct two-file patch; W2 shows the
+  failure is repair behavior, not localization: given a failing test it wrote, it explains the
+  failure instead of fixing the source. The two validation nudges (finding 23's fix) did not change
+  that on this model.
+- **Export check, live.** W1b's stored 1,025-character diff applies cleanly to a fresh clone at
+  `6187794` (`git apply --check` accepts both files), but the patch endpoint returns `409` for W1
+  (now `FAILED` after the reaped third attempt) and for W2: only a `COMPLETED` task with evidenced
+  criteria exports a patch. The refusal is the policy working, not a defect.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -594,6 +620,7 @@ with one bug: `Greeting.greet(null)` throws. Every task has the same three crite
 | W1a `057934ee` attempt `22d7ea81` | local `qwen2.5-coder:14b`, context 8192 | 6 calls: correct 1,051-character two-file patch (null check + test) applied; validation failed because Docker Desktop's Linux engine was down; `NEEDS_INPUT`, criteria 1-2 UNVERIFIED, criterion 3 FAILED with the Docker error - no false pass |
 | W1b attempt `7d6f6c4e` (via `/answer`) | same, Docker restarted | 6 calls: correct 1,008-character patch applied; validation **PASSED**; criteria 2-3 PASSED, criterion 1 left UNVERIFIED with no evidence -> `NEEDS_INPUT` |
 | W1c attempt `b567d1e1` (via `/answer` with the evidence) | same | 752-character patch used `main/java/...` (no `src/`); git said only `No such file or directory`; the identical patch was resent twice and refused by the duplicate guard with hunk-context advice that did not fit; the model re-read, then returned prose; operator stopped, reaper recorded FAILED outcome unknown - nothing applied |
+| W2 `165b5c36` attempt `c7ef6bf2` | same, jar with the acceptance nudge (`93b973e`) | 6 calls: baseline validation before any change (the premature-final nudge corrected that), then a test-only 618-character patch and a **failed** validation (the source still NPEs); two validation nudges produced two 0-call prose turns of 5+ minutes instead of a source fix; `NEEDS_INPUT`, test-only change, all criteria UNVERIFIED, export 409 (finding 25) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
 validation; the remaining gap is the report's acceptance assessment (finding 24).
