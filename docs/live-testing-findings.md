@@ -479,6 +479,40 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   validation fails. It also stores only the final validation run in the report, so a successful retry
   can export its patch; the earlier failure remains in the tool audit. Run V tests that live.
 
+### 24. A tiny fixture completes the work; the report can still end NEEDS_INPUT
+
+- **Setup.** To separate the model's limits from a large repository, a new fixture,
+  `repos/small-java` (commit `6187794`), holds a 30-line Maven project with JUnit 4.13.2 and one bug:
+  `Greeting.greet(String)` calls `name.isBlank()` before a null check, so `greet(null)` throws. The
+  task asks for the null check, a `greetsNullNameAsGuest` test, and a green suite. The jar was
+  `1f4e5dd` (validation nudge), model `qwen2.5-coder:14b`, context 8192.
+- **W1a (`057934ee`, attempt 1 `22d7ea81`).** Six calls: `find_symbol(greet)`, a 6-line read, a
+  1,206-character create-style patch rejected because `GreetingTest.java` already exists (the model
+  read the existing test next), then a **1,051-character patch applied**: the null check plus the
+  test. `run_validation` failed in 2 s because Docker Desktop's Linux engine was down
+  (`dockerDesktopLinuxEngine` pipe missing), not because of the code. The attempt ended
+  `NEEDS_INPUT`, `changedFiles=2`, criteria 1-2 `UNVERIFIED`, criterion 3 `FAILED` with the Docker
+  error. The platform did not report the unavailable check as a pass.
+- **W1b (attempt 2 `7d6f6c4e`, via `POST /answer` "Docker is available again").** Docker was
+  restarted (29.8.2). Six calls: it read both files before patching, applied a **1,008-character
+  patch** with the same correct change, and validation **passed**. The report marked criteria 2 and 3
+  `PASSED`, but criterion 1 stayed `UNVERIFIED` with no evidence, so the task again ended
+  `NEEDS_INPUT` ("Acceptance criteria could not be verified") despite the correct, validated change.
+- **W1c (attempt 3 `b567d1e1`, via `POST /answer` citing the new test as evidence).** The model read
+  both files, then sent a 752-character patch with `main/java/example/Greeting.java` - the `src/`
+  prefix was dropped - and git answered only `No such file or directory`. It resent the **identical**
+  patch twice; the duplicate guard refused both, but its message said to "change the hunk context",
+  which was wrong for a missing path. The model re-read the file, then returned prose; the operator
+  stopped the run and the reaper recorded `FAILED` with an outcome-unknown report. The patch was never
+  applied, so nothing false was reported.
+- **What this shows.** On a small, unambiguous change the loop reaches the right two-file patch and a
+  real Docker validation pass; the remaining failure was reporting, not code. A valid report that
+  leaves a supplied criterion unassessed is accepted as final (there is no "assess every criterion"
+  nudge, only the report-format retry), and the answer flow then depends on the operator guessing the
+  missing evidence. The two message gaps W1c exposed are fixed in `b04f111`: the missing-path refusal
+  names the existing file with the same suffix, and the duplicate refusal quotes the original
+  rejection instead of assuming hunk context.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -547,6 +581,22 @@ neither localization (three different models found `writeValue`) nor the safety 
 honestly with unverified criteria), but the quota needed to carry a multi-file change through the test
 update and a real Maven validation. A funded key or another provider is the next experiment worth
 running; without one, the honest statement is that the loop is ready and the free tier is not.
+
+## The small-fixture runs
+
+The JSON-java task carries the whole repository and a 24-call budget; this fixture isolates the
+model's report discipline. `small-java` is a 30-line Maven project (JUnit 4.13.2, compiler 3.11.0)
+with one bug: `Greeting.greet(null)` throws. Every task has the same three criteria: null returns
+"Hello guest", a test covers it, and the suite passes.
+
+| Run | Model | Outcome |
+| --- | --- | --- |
+| W1a `057934ee` attempt `22d7ea81` | local `qwen2.5-coder:14b`, context 8192 | 6 calls: correct 1,051-character two-file patch (null check + test) applied; validation failed because Docker Desktop's Linux engine was down; `NEEDS_INPUT`, criteria 1-2 UNVERIFIED, criterion 3 FAILED with the Docker error - no false pass |
+| W1b attempt `7d6f6c4e` (via `/answer`) | same, Docker restarted | 6 calls: correct 1,008-character patch applied; validation **PASSED**; criteria 2-3 PASSED, criterion 1 left UNVERIFIED with no evidence -> `NEEDS_INPUT` |
+| W1c attempt `b567d1e1` (via `/answer` with the evidence) | same | 752-character patch used `main/java/...` (no `src/`); git said only `No such file or directory`; the identical patch was resent twice and refused by the duplicate guard with hunk-context advice that did not fit; the model re-read, then returned prose; operator stopped, reaper recorded FAILED outcome unknown - nothing applied |
+
+This is the first local evidence that the loop can carry a small change through a real Docker
+validation; the remaining gap is the report's acceptance assessment (finding 24).
 
 ## Repository selection (the gate, in practice)
 
