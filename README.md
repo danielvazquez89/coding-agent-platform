@@ -61,7 +61,12 @@ The conservatism is deliberate:
   tells the model to fix the failing test and rerun validation, at most twice. The report stores the
   final run's check, while each earlier run remains in the persisted tool audit. A local run applied the
   correct enum change, saw `EnumTest` fail against the old expectation, and then reported that the tests
-  were not updated; that is the case this nudge addresses.
+  were not updated; that is the case this nudge addresses. When the patch applied and validation passed
+  but the report leaves a supplied criterion without an evidence-bearing assessment, the worker asks for
+  the missing assessments at most twice, citing the change and the passing run already in the
+  conversation; a blocking question from the model is accepted as a legitimate `NEEDS_INPUT` stop. A
+  small-fixture run applied the correct null check and test and passed Docker validation, yet left one
+  criterion `UNVERIFIED` and ended `NEEDS_INPUT`; that is the case this second nudge addresses.
 - **Draft pull requests only.** Nothing merges, deploys, or writes to a default branch.
 
 The honest trade-off: this conservatism caps capability. A bounded eight-tool loop driven by a small local

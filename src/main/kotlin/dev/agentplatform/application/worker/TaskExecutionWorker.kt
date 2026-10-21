@@ -362,12 +362,16 @@ class TaskExecutionWorker @Inject constructor(
         var patchFailureRetries = 0
         var reportFormatRetries = 0
         var validationFixRetries = 0
+        var acceptanceFixRetries = 0
         var lastPatchFailure: String? = null
         var lastToolResult: String? = null
         var patchApplied = false
         var validationCurrent = false
         var lastModelText: String? = null
-        repeat(maxToolCalls + MAX_PATCH_FAILURE_RETRIES + MAX_REPORT_FORMAT_RETRIES + MAX_VALIDATION_FIX_RETRIES + 4) {
+        repeat(
+            maxToolCalls + MAX_PATCH_FAILURE_RETRIES + MAX_REPORT_FORMAT_RETRIES + MAX_VALIDATION_FIX_RETRIES +
+                MAX_ACCEPTANCE_FIX_RETRIES + 4
+        ) {
             checkBudget(trace.startedAtNanos, trace)
             val modelCallStartedAt = System.nanoTime()
             val requestMessages = boundedHistory(messages, historyBudgetCharacters)
@@ -434,17 +438,44 @@ class TaskExecutionWorker @Inject constructor(
                     return@repeat
                 }
                 val response = (turn.content?.takeIf(String::isNotBlank) ?: lastModelText).orEmpty()
+                val parsedReport = parseReport(response)
                 if (
                     lastPatchFailure == null &&
                     reportFormatRetries < MAX_REPORT_FORMAT_RETRIES &&
                     task.acceptanceCriteria.isNotEmpty() &&
-                    parseReport(response).isEmpty
+                    parsedReport.isEmpty
                 ) {
                     reportFormatRetries++
                     messages += ModelMessage("assistant", response)
                     messages += ModelMessage(
                         "user",
                         "That final answer is not the required report: it must be a single valid JSON object with summary, implementation, decisions, openQuestions and acceptanceChecks, and every acceptance criterion must be copied verbatim. Resend only the corrected JSON object. Do not wrap it in prose, Markdown fences, function-call tags, or a second object. A report that still cannot be parsed leaves the criteria unverified."
+                    )
+                    return@repeat
+                }
+                // A correct patch and a passing validation are not enough if the report never assessed a
+                // supplied criterion: run W1 applied the right two-file change and passed Docker
+                // validation, yet marked the first criterion UNVERIFIED with no evidence, so the task
+                // ended NEEDS_INPUT with no question to answer. Ask once or twice for the assessment,
+                // with the evidence the conversation already contains; a blocking question is a
+                // legitimate way to stop and is left alone.
+                val unassessed = acceptanceChecks(task, parsedReport.acceptanceChecks)
+                    .filter { it.outcome == AcceptanceOutcome.UNVERIFIED }
+                if (
+                    !parsedReport.isEmpty &&
+                    parsedReport.questions.none { it.blocking } &&
+                    patchApplied &&
+                    validation.lastOrNull()?.outcome == CheckOutcome.PASSED &&
+                    unassessed.isNotEmpty() &&
+                    acceptanceFixRetries < MAX_ACCEPTANCE_FIX_RETRIES
+                ) {
+                    acceptanceFixRetries++
+                    messages += ModelMessage("assistant", response)
+                    messages += ModelMessage(
+                        "user",
+                        "Your patch applied and the last validation passed, but the report does not assess every supplied acceptance criterion with evidence: ${
+                            unassessed.joinToString("; ") { "'${it.criterion.take(200)}'" }
+                        }. The tool conversation already contains the change and the passing validation. Resend the same JSON report with exactly one acceptanceChecks entry per supplied criterion; mark a criterion PASSED only with concrete evidence (the changed file and line, a test name, or the validation result), or FAILED/UNVERIFIED with the reason. Do not claim a pass you cannot evidence."
                     )
                     return@repeat
                 }
@@ -1074,6 +1105,7 @@ class TaskExecutionWorker @Inject constructor(
         const val MAX_PATCH_FAILURE_RETRIES = 3
         const val MAX_REPORT_FORMAT_RETRIES = 2
         const val MAX_VALIDATION_FIX_RETRIES = 2
+        const val MAX_ACCEPTANCE_FIX_RETRIES = 2
         const val DISABLED_SENTINEL = "disabled"
         const val FIXED_MESSAGE_COUNT = 2
         const val TOOL_ROLE = "tool"

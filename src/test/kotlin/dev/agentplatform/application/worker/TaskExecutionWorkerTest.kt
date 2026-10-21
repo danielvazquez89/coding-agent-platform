@@ -509,6 +509,132 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `nudges the model to assess a criterion left unverified after validation passed`() {
+        val criterion = "Greeting.greet(null) returns Hello guest"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val state = FakeState(task)
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val patch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello guest"
+        ).joinToString("\n", postfix = "\n")
+        val unverified =
+            """{"summary":"Applied","implementation":"Null is handled.","acceptanceChecks":[{"criterion":"$criterion","outcome":"UNVERIFIED","evidence":""}]}"""
+        val evidenced =
+            """{"summary":"Applied","implementation":"Null is handled.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"Maven tests passed after the patch to Greeting.java."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn(unverified, emptyList(), "stop", 1, 1),
+            ModelTurn(evidenced, emptyList(), "stop", 1, 1)
+        )
+
+        assertTrue(worker(state, attempts, provider, FakeWorkspace(temporary)).execute(task.id))
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(
+            1,
+            provider.messages.count {
+                it.role == "user" && it.content.contains("does not assess every supplied acceptance criterion")
+            }
+        )
+        val check = attempts.finishedReport!!.acceptanceChecks.single()
+        assertEquals(AcceptanceOutcome.PASSED, check.outcome)
+        assertTrue(check.evidence!!.contains("Maven tests passed"))
+    }
+
+    @Test
+    fun `accepts an honest unverified report after two evidence nudges`() {
+        val criterion = "Greeting.greet(null) returns Hello guest"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val state = FakeState(task)
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val patch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello guest"
+        ).joinToString("\n", postfix = "\n")
+        val unverified =
+            """{"summary":"Applied","implementation":"Null is handled.","acceptanceChecks":[{"criterion":"$criterion","outcome":"UNVERIFIED","evidence":""}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn(unverified, emptyList(), "stop", 1, 1),
+            ModelTurn(unverified, emptyList(), "stop", 1, 1),
+            ModelTurn(unverified, emptyList(), "stop", 1, 1)
+        )
+
+        assertTrue(worker(state, attempts, provider, FakeWorkspace(temporary)).execute(task.id))
+
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        assertEquals(
+            2,
+            provider.messages.count {
+                it.role == "user" && it.content.contains("does not assess every supplied acceptance criterion")
+            }
+        )
+        assertEquals(AcceptanceOutcome.UNVERIFIED, attempts.finishedReport!!.acceptanceChecks.single().outcome)
+    }
+
+    @Test
+    fun `does not ask for criterion evidence when the model asks a blocking question`() {
+        val criterion = "Greeting.greet(null) returns Hello guest"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val state = FakeState(task)
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val patch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello guest"
+        ).joinToString("\n", postfix = "\n")
+        val report =
+            """{"summary":"Blocked","implementation":"The patch applied.","openQuestions":[{"question":"Should guest text be localizable?","impact":"The wording may change per locale.","blocking":true}],"acceptanceChecks":[{"criterion":"$criterion","outcome":"UNVERIFIED","evidence":""}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn(report, emptyList(), "stop", 1, 1)
+        )
+
+        assertTrue(worker(state, attempts, provider, FakeWorkspace(temporary)).execute(task.id))
+
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        assertTrue(
+            provider.messages.none {
+                it.role == "user" && it.content.contains("does not assess every supplied acceptance criterion")
+            }
+        )
+        assertEquals(1, attempts.finishedReport!!.openQuestions.size)
+    }
+
+    @Test
     fun `fails after patch recovery is exhausted instead of asking the user to repair it`() {
         val task = task()
         val attempts = FakeAttempts()
