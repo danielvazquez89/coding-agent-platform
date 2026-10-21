@@ -371,6 +371,73 @@ class WorkspaceToolExecutorTest {
     }
 
     @Test
+    fun `names the existing file when a patch path is missing a directory`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src/main/java/example"))
+        Files.writeString(root.resolve("src/main/java/example/Greeting.java"), "class Greeting {}\n")
+        val patch = """
+            --- a/main/java/example/Greeting.java
+            +++ b/main/java/example/Greeting.java
+            @@ -1 +1 @@
+            -class Greeting {}
+            +class Greeting { /* fixed */ }
+        """.trimIndent() + "\n"
+
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            executor().execute("apply_patch", mapper.createObjectNode().put("patch", patch), root)
+        }
+
+        assertTrue(failure.message!!.contains("does not exist in this workspace"), failure.message)
+        assertTrue(failure.message!!.contains("`src/main/java/example/Greeting.java`"), failure.message)
+        assertTrue(failure.message!!.contains("use that exact path in the ---/+++ headers"), failure.message)
+    }
+
+    @Test
+    fun `lists matching paths when a missing patch path has several candidates`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("module-a/src/main/java/example"))
+        Files.createDirectories(root.resolve("module-b/src/main/java/example"))
+        Files.writeString(root.resolve("module-a/src/main/java/example/Greeting.java"), "class A {}\n")
+        Files.writeString(root.resolve("module-b/src/main/java/example/Greeting.java"), "class B {}\n")
+        val patch = """
+            --- a/src/main/java/example/Greeting.java
+            +++ b/src/main/java/example/Greeting.java
+            @@ -1 +1 @@
+            -class A {}
+            +class C {}
+        """.trimIndent() + "\n"
+
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            executor().execute("apply_patch", mapper.createObjectNode().put("patch", patch), root)
+        }
+
+        assertTrue(failure.message!!.contains("Paths with that suffix"), failure.message)
+        assertTrue(failure.message!!.contains("module-a/src/main/java/example/Greeting.java"), failure.message)
+        assertTrue(failure.message!!.contains("module-b/src/main/java/example/Greeting.java"), failure.message)
+    }
+
+    @Test
+    fun `points to repository tools when no existing path matches`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src"))
+        Files.writeString(root.resolve("src/Hello.kt"), "hello\n")
+        val patch = """
+            --- a/missing/Hello.kt
+            +++ b/missing/Hello.kt
+            @@ -1 +1 @@
+            -hello
+            +world
+        """.trimIndent() + "\n"
+
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            executor().execute("apply_patch", mapper.createObjectNode().put("patch", patch), root)
+        }
+
+        assertTrue(failure.message!!.contains("does not exist in this workspace"), failure.message)
+        assertTrue(failure.message!!.contains("list_files or find_symbol"), failure.message)
+    }
+
+    @Test
     fun `states the file length when a patch hunk points past the end`() {
         val root = repository()
         Files.createDirectories(root.resolve("src"))

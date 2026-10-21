@@ -471,6 +471,7 @@ class WorkspaceToolExecutor(
             throw IllegalArgumentException(
                 "Patch did not apply cleanly: ${check.output.take(2000)}" +
                     patchContextHint(workspace, check.output) +
+                    missingPathHint(workspace, check.output) +
                     corruptPatchHint(normalized, check.output)
             )
         }
@@ -510,6 +511,39 @@ class WorkspaceToolExecutor(
             if (reportedLine > lines.size) append("(the file has ").append(lines.size).append(" lines)\n")
             for (number in start..end) {
                 append(number).append(": ").append(lines[number - 1].take(PATCH_CONTEXT_LINE_CHARS)).append('\n')
+            }
+        }.take(PATCH_CONTEXT_HINT_LIMIT)
+    }
+
+    /**
+     * A model can drop a leading directory from the path it read (`main/java/...` instead of
+     * `src/main/java/...`); git then answers only "No such file or directory", which does not say
+     * which path would work. Name the existing file whose path ends with the one in the patch, so the
+     * next attempt can copy the exact header. Paths are repository data, not instructions.
+     */
+    private fun missingPathHint(workspace: Path, gitOutput: String): String {
+        val missing = GIT_MISSING_PATH.find(gitOutput)?.groupValues?.get(1)
+            ?.trim()?.removePrefix("a/")?.removePrefix("b/") ?: return ""
+        if (missing.isBlank() || missing == "/dev/null") return ""
+        val direct = runCatching { resolve(workspace, missing) }.getOrNull()
+        if (direct != null && Files.exists(direct, LinkOption.NOFOLLOW_LINKS)) return ""
+        val normalized = missing.replace('\\', '/').trimStart('/')
+        if (normalized.isBlank()) return ""
+        val candidates = collectFiles(workspace, PATCH_PATH_HINT_SCAN_LIMIT)
+            .map { workspace.relativize(it).toString().replace('\\', '/') }
+            .filter { it != normalized && (it == normalized || it.endsWith("/$normalized")) }
+            .take(PATCH_PATH_HINT_LIMIT)
+        return buildString {
+            append("\nThe patch path `").append(missing).append("` does not exist in this workspace. ")
+            if (candidates.size == 1) {
+                append("The repository has `").append(candidates.single())
+                append("`; use that exact path in the ---/+++ headers.")
+            } else if (candidates.isNotEmpty()) {
+                append("Paths with that suffix: ")
+                append(candidates.joinToString(", ") { "`$it`" })
+                append(". Use the exact path in the ---/+++ headers.")
+            } else {
+                append("Use a path returned by list_files or find_symbol in the ---/+++ headers.")
             }
         }.take(PATCH_CONTEXT_HINT_LIMIT)
     }
@@ -708,7 +742,10 @@ class WorkspaceToolExecutor(
         const val PATCH_CONTEXT_HINT_LIMIT = 2_500
         const val PATCH_CONTEXT_LINE_CHARS = 200
         const val PATCH_CONTEXT_FILE_LIMIT = 2_000_000L
+        const val PATCH_PATH_HINT_LIMIT = 3
+        const val PATCH_PATH_HINT_SCAN_LIMIT = 5_000
         val GIT_APPLY_FAILURE = Regex("""patch failed:\s*(.+):(\d+)""")
+        val GIT_MISSING_PATH = Regex("""error:\s*(.+?):\s*No such file or directory""")
         val CORRUPT_PATCH_LINE = Regex("""corrupt patch at <stdin>:(\d+)""")
         const val RELATED_TEST_LIMIT = 10
         const val RELATED_TEST_LIMIT_MAX = 50

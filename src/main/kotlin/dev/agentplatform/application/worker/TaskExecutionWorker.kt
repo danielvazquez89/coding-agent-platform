@@ -723,11 +723,14 @@ class TaskExecutionWorker @Inject constructor(
         }
         trace.toolExecutions += pending
         val result = try {
-            if (patchFingerprint != null && patchFingerprint in trace.rejectedPatches) {
+            if (patchFingerprint != null && trace.rejectedPatches.containsKey(patchFingerprint)) {
                 // Resending a byte-identical patch cannot apply. Refuse it here instead of paying for
                 // another git invocation and another confused turn; a live 14B sent the same failing
-                // 1,582-character patch three times in a row.
-                throw IllegalArgumentException(DUPLICATE_PATCH_MESSAGE)
+                // 1,582-character patch three times in a row. Quote the original refusal: the reason
+                // may be a missing path or malformed line, not hunk context.
+                throw IllegalArgumentException(
+                    duplicatePatchMessage(trace.rejectedPatches.getValue(patchFingerprint))
+                )
             }
             tools.execute(name, arguments, root)
         } catch (failure: Exception) {
@@ -738,7 +741,9 @@ class TaskExecutionWorker @Inject constructor(
             // do, and the message tells it how to proceed, so the audit says so instead of blaming the
             // tool. The executor already tags the same calls `rejected` in the metrics.
             val refused = failure is IllegalArgumentException
-            if (refused && patchFingerprint != null) trace.rejectedPatches += patchFingerprint
+            if (refused && patchFingerprint != null) {
+                trace.rejectedPatches.putIfAbsent(patchFingerprint, failure.message.orEmpty())
+            }
             val outcome = if (refused) ToolExecutionOutcome.REJECTED else ToolExecutionOutcome.FAILED
             val summary = if (refused) {
                 "Rejected: ${failure.message ?: failure.javaClass.simpleName}"
@@ -985,7 +990,7 @@ class TaskExecutionWorker @Inject constructor(
         var priorBudgetUsage: TaskBudgetUsage = TaskBudgetUsage()
     ) {
         val patchFailures = mutableListOf<String>()
-        val rejectedPatches = mutableSetOf<String>()
+        val rejectedPatches = mutableMapOf<String, String>()
         val toolExecutions = mutableListOf<ToolExecutionAudit>()
         private var promptTokens = 0
         private var completionTokens = 0
@@ -1046,17 +1051,23 @@ class TaskExecutionWorker @Inject constructor(
         )
     }
 
+    private fun duplicatePatchMessage(previousRefusal: String): String = buildString {
+        append("This patch is byte-for-byte identical to one that was rejected earlier in this attempt, ")
+        append("so resending it cannot apply. The earlier refusal began: ")
+        append(
+            previousRefusal.lineSequence().firstOrNull { it.isNotBlank() }?.trim()?.take(DUPLICATE_REFUSAL_CHARS)
+                ?: "(no message)"
+        )
+        append(". Change the patch (the file path, the hunk lines, or the content) before retrying.")
+    }
+
     private class NeedsInputException(message: String) : RuntimeException(message)
     private class ExecutionBudgetExceededException(message: String) : RuntimeException(message)
     private class AuditPersistenceException(message: String, cause: Throwable) : RuntimeException(message, cause)
 
     private companion object {
         const val APPLY_PATCH_TOOL = "apply_patch"
-        const val DUPLICATE_PATCH_MESSAGE =
-            "This patch is byte-for-byte identical to one that was rejected earlier in this attempt, " +
-                "so resending it cannot apply. The earlier refusal quoted the actual lines at the failed " +
-                "location; change the hunk context to match those lines (or use create_file if the file " +
-                "is new) and submit a different patch."
+        const val DUPLICATE_REFUSAL_CHARS = 400
         const val MAX_TOOL_RESULT_CHARS = 12_000
         const val MAX_FINAL_TEXT_CHARS = 15_000
         const val MAX_DIFF_CHARS = 30_000

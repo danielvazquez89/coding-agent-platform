@@ -377,9 +377,53 @@ class TaskExecutionWorkerTest {
             patchEvents.map { it.outcome }
         )
         assertTrue(patchEvents[1].resultSummary.contains("byte-for-byte identical"))
+        assertTrue(patchEvents[1].resultSummary.contains("The earlier refusal began: Patch did not apply cleanly"))
+        assertTrue(patchEvents[1].resultSummary.contains("patch failed: Greeting.java:1"))
         assertTrue(provider.messages.filter { it.role == "tool" }.any { it.content.contains("byte-for-byte identical") })
         assertEquals("Hello from Qwen\n", Files.readString(temporary.resolve("Greeting.java")))
         assertEquals(TaskStatus.COMPLETED, task.status)
+    }
+
+    @Test
+    fun `quotes a missing-path refusal when the same patch is resent`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val missingPath = listOf(
+            "--- a/main/Greeting.java",
+            "+++ b/main/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hi"
+        ).joinToString("\n", postfix = "\n")
+        val corrected = listOf(
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hi"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to missingPath)))), "tool_calls", 1, 1),
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to missingPath)))), "tool_calls", 1, 1),
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to corrected)))), "tool_calls", 1, 1),
+            ModelTurn(
+                """{"summary":"Applied the change","implementation":"Greeting now says Hi."}""",
+                emptyList(),
+                "stop",
+                1,
+                1
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id)
+
+        val patchEvents = attempts.persistedToolEvents.filter { it.toolName == "apply_patch" }
+        assertEquals(3, patchEvents.size)
+        assertTrue(patchEvents[0].resultSummary.contains("No such file or directory"), patchEvents[0].resultSummary)
+        assertTrue(patchEvents[1].resultSummary.contains("The earlier refusal began"), patchEvents[1].resultSummary)
+        assertTrue(patchEvents[1].resultSummary.contains("No such file or directory"), patchEvents[1].resultSummary)
+        assertEquals("Hi\n", Files.readString(temporary.resolve("Greeting.java")))
     }
 
     @Test
