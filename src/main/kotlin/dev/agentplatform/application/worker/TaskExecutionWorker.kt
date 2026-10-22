@@ -576,8 +576,13 @@ class TaskExecutionWorker @Inject constructor(
                 if (call.name == "apply_patch") {
                     lastPatchFailure = if (result.content.startsWith("Patch applied to ")) null else result.content
                     if (lastPatchFailure != null) trace.patchFailures += lastPatchFailure.take(2000)
-                    patchApplied = lastPatchFailure == null
-                    if (patchApplied) validationCurrent = false
+                    // A later rejected patch does not undo one that already applied. Keep the
+                    // workspace-changed fact so the worker validates and reports the changed tree
+                    // instead of telling the model it never applied a patch (W8b).
+                    if (lastPatchFailure == null) {
+                        patchApplied = true
+                        validationCurrent = false
+                    }
                 }
                 log.infof("Task %s tool %s returned %d characters", task.id, call.name, result.content.length)
                 toolResults += call to result

@@ -342,6 +342,60 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `keeps an applied patch when a later patch is rejected`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val applied = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello guest"
+        ).joinToString("\n", postfix = "\n")
+        val stale = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello again"
+        ).joinToString("\n", postfix = "\n")
+        val report = ModelTurn(
+            """{"summary":"Applied the change","implementation":"Greeting now welcomes guests."}""",
+            emptyList(), "stop", null, null
+        )
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to applied)))),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to stale)))),
+                "tool_calls", null, null
+            ),
+            report, report, report, report, report, report
+        )
+
+        assertTrue(worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id))
+
+        assertEquals("Hello guest\n", Files.readString(temporary.resolve("Greeting.java")))
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(AttemptStatus.COMPLETED, attempts.finished?.status)
+        assertTrue(
+            provider.messages.none { it.role == "user" && it.content.contains("you have not applied a patch") },
+            provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
+        )
+        // The nudge clears lastPatchFailure, so one rejected patch earns one correction request.
+        // The assertion above is the regression check: without the fix the worker forgets the
+        // applied patch and says it never changed the workspace.
+        assertEquals(1, provider.messages.count { it.role == "user" && it.content.contains("Your apply_patch tool call failed") })
+    }
+
+    @Test
     fun `refuses a byte-identical rejected patch without running it again`() {
         val task = task()
         val attempts = FakeAttempts()
