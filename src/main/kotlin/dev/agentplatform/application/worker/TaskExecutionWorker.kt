@@ -184,9 +184,14 @@ class TaskExecutionWorker @Inject constructor(
             val blockingQuestions = modelQuestions.filter(AgentQuestion::blocking)
             val lastValidation = validation.lastOrNull()
             val acceptanceChecks = acceptanceChecks(task, parsedReport.acceptanceChecks)
+            // A failed supported validation is a known negative result, not a missing assessment.
+            // The attempt must not become NEEDS_INPUT just because the model also left its criteria
+            // UNVERIFIED: the change is not deliverable, and retrying is the documented next step.
+            // A blocking question or a validation that could not run still legitimately needs input.
             var taskStatus = when {
                 blockingQuestions.isNotEmpty() || lastValidation?.outcome == CheckOutcome.SKIPPED -> TaskStatus.NEEDS_INPUT
                 acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } -> TaskStatus.FAILED
+                lastValidation?.outcome == CheckOutcome.FAILED -> TaskStatus.FAILED
                 acceptanceChecks.any { it.outcome != AcceptanceOutcome.PASSED } -> TaskStatus.NEEDS_INPUT
                 changedFiles.isEmpty() -> TaskStatus.FAILED
                 lastValidation?.outcome == CheckOutcome.PASSED -> TaskStatus.COMPLETED
@@ -196,7 +201,9 @@ class TaskExecutionWorker @Inject constructor(
                 lastValidation?.outcome == CheckOutcome.SKIPPED && blockingQuestions.isEmpty() -> modelQuestions + AgentQuestion(
                     "Which supported validation should run for this repository?", lastValidation.details.orEmpty(), true
                 )
-                acceptanceChecks.any { it.outcome == AcceptanceOutcome.UNVERIFIED } && blockingQuestions.isEmpty() ->
+                taskStatus == TaskStatus.NEEDS_INPUT &&
+                    acceptanceChecks.any { it.outcome == AcceptanceOutcome.UNVERIFIED } &&
+                    blockingQuestions.isEmpty() ->
                     modelQuestions + AgentQuestion(
                         "Acceptance criteria were not verified",
                         acceptanceChecks.filter { it.outcome == AcceptanceOutcome.UNVERIFIED }
@@ -249,7 +256,9 @@ class TaskExecutionWorker @Inject constructor(
                 acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } ->
                     "One or more acceptance criteria were reported as not met"
                 changedFiles.isEmpty() -> "The agent did not produce a repository change"
-                else -> lastValidation?.details?.take(500) ?: "Agent could not produce a validated result"
+                else -> lastValidation?.takeIf { it.outcome == CheckOutcome.FAILED }
+                    ?.let(::validationFailureSummary)
+                    ?: "Agent could not produce a validated result"
             }
             val report = buildReport(
                 task, finalText, workspace, changedFiles, validation, questions, taskStatus,
@@ -994,6 +1003,24 @@ class TaskExecutionWorker @Inject constructor(
                 else -> check
             }
         }
+    }
+
+    /**
+     * The first characters of Maven's output are its project banner, not its verdict: a report's
+     * bounded details start with `[INFO] Scanning...`, so a blind prefix would hide the failing
+     * test. Keep the two most specific `[ERROR]` lines (the test counts and the failing test) and
+     * fall back to the first line for setup failures such as an unavailable Docker daemon, which
+     * have no Maven output at all. The full details stay in the report.
+     */
+    private fun validationFailureSummary(check: ValidationCheck): String {
+        val lines = check.details.orEmpty().lineSequence().map(String::trim).filter(String::isNotEmpty).toList()
+        if (lines.isEmpty()) return "Validation failed"
+        val errors = lines.filter { it.startsWith("[ERROR]") }
+        val selected = errors.filter {
+            it.contains("Tests run:") || it.contains("<<<") || it.contains("Failed to execute goal") ||
+                it.contains("COMPILATION ERROR")
+        }.ifEmpty { errors }.ifEmpty { lines }
+        return selected.take(2).joinToString(" | ").take(500)
     }
 
     private fun elapsedMillis(startedAt: Long) = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)

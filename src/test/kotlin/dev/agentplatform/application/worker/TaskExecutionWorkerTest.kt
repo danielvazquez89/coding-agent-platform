@@ -728,6 +728,56 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `fails a changed task when validation failed even if the model left criteria unverified`() {
+        val criterion = "README documents the new behavior"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "old\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-old",
+            "+new"
+        ).joinToString("\n", postfix = "\n")
+        val unverified = """{"summary":"Not finished","implementation":"The change did not pass.","acceptanceChecks":[{"criterion":"$criterion","outcome":"UNVERIFIED","evidence":"Validation failed."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))), "tool_calls", null, null),
+            ModelTurn(unverified, emptyList(), "stop", null, null),
+            ModelTurn(unverified, emptyList(), "stop", null, null),
+            ModelTurn(unverified, emptyList(), "stop", null, null)
+        )
+        val details = """
+            [INFO] Scanning for projects...
+            [INFO] BUILD FAILURE
+            [ERROR] Tests run: 3, Failures: 0, Errors: 1, Skipped: 0
+            [ERROR] example.GreetingTest.greetsNullNameAsGuest <<< ERROR!
+            java.lang.NullPointerException: Cannot invoke "String.isBlank()" because "name" is null
+        """.trimIndent()
+
+        worker(
+            FakeState(task), attempts, provider, FakeWorkspace(temporary),
+            validation = ValidationCheck("Maven tests", outcome = CheckOutcome.FAILED, exitCode = 1, details = details)
+        ).execute(task.id)
+
+        assertEquals(TaskStatus.FAILED, task.status)
+        assertEquals(AttemptStatus.FAILED, attempts.finished?.status)
+        assertEquals(CheckOutcome.FAILED, attempts.finishedReport!!.validation.single().outcome)
+        assertEquals(AcceptanceOutcome.UNVERIFIED, attempts.finishedReport!!.acceptanceChecks.single().outcome)
+        assertTrue(attempts.finishedReport!!.openQuestions.isEmpty(), attempts.finishedReport!!.openQuestions.toString())
+        assertEquals(
+            "[ERROR] Tests run: 3, Failures: 0, Errors: 1, Skipped: 0 | " +
+                "[ERROR] example.GreetingTest.greetsNullNameAsGuest <<< ERROR!",
+            attempts.finished?.errorSummary
+        )
+        assertEquals(
+            2,
+            provider.messages.count { it.role == "user" && it.content.contains("the last validation failed") }
+        )
+    }
+
+    @Test
     fun `does not complete a changed and validated task when acceptance criteria are unverified`() {
         val criterion = "README documents the new behavior"
         val task = task(acceptanceCriteria = listOf(criterion))
