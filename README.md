@@ -66,7 +66,11 @@ The conservatism is deliberate:
   the missing assessments at most twice, citing the change and the passing run already in the
   conversation; a blocking question from the model is accepted as a legitimate `NEEDS_INPUT` stop. A
   small-fixture run applied the correct null check and test and passed Docker validation, yet left one
-  criterion `UNVERIFIED` and ended `NEEDS_INPUT`; that is the case this second nudge addresses.
+  criterion `UNVERIFIED` and ended `NEEDS_INPUT`; that is the case this second nudge addresses. A failed
+  supported validation is a known negative result, not an open question: unless the model asked a
+  blocking question or validation could not run, an attempt that failed validation or produced no
+  change ends `FAILED` even when the report left criteria `UNVERIFIED`, and the attempt summary names
+  the failing test lines rather than Maven's banner.
 - **Draft pull requests only.** Nothing merges, deploys, or writes to a default branch.
 
 The honest trade-off: this conservatism caps capability. A bounded eight-tool loop driven by a small local

@@ -184,16 +184,17 @@ class TaskExecutionWorker @Inject constructor(
             val blockingQuestions = modelQuestions.filter(AgentQuestion::blocking)
             val lastValidation = validation.lastOrNull()
             val acceptanceChecks = acceptanceChecks(task, parsedReport.acceptanceChecks)
-            // A failed supported validation is a known negative result, not a missing assessment.
-            // The attempt must not become NEEDS_INPUT just because the model also left its criteria
-            // UNVERIFIED: the change is not deliverable, and retrying is the documented next step.
-            // A blocking question or a validation that could not run still legitimately needs input.
+            // A failed supported validation or an unchanged workspace is a known negative result,
+            // not a missing assessment. The attempt must not become NEEDS_INPUT just because the
+            // model also left its criteria UNVERIFIED: there is nothing an answer can verify when
+            // no change exists, and retrying is the documented next step. A blocking question or a
+            // validation that could not run still legitimately needs input.
             var taskStatus = when {
                 blockingQuestions.isNotEmpty() || lastValidation?.outcome == CheckOutcome.SKIPPED -> TaskStatus.NEEDS_INPUT
                 acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } -> TaskStatus.FAILED
                 lastValidation?.outcome == CheckOutcome.FAILED -> TaskStatus.FAILED
-                acceptanceChecks.any { it.outcome != AcceptanceOutcome.PASSED } -> TaskStatus.NEEDS_INPUT
                 changedFiles.isEmpty() -> TaskStatus.FAILED
+                acceptanceChecks.any { it.outcome != AcceptanceOutcome.PASSED } -> TaskStatus.NEEDS_INPUT
                 lastValidation?.outcome == CheckOutcome.PASSED -> TaskStatus.COMPLETED
                 else -> TaskStatus.FAILED
             }

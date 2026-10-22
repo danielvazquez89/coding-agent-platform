@@ -778,6 +778,28 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `fails a task that produced no change even when criteria are unverified`() {
+        val criterion = "README documents the new behavior"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        val report = """{"summary":"No change","implementation":"No patch was applied.","acceptanceChecks":[{"criterion":"$criterion","outcome":"UNVERIFIED","evidence":"No patch was applied."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(report, emptyList(), "stop", null, null),
+            ModelTurn(report, emptyList(), "stop", null, null),
+            ModelTurn(report, emptyList(), "stop", null, null)
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, emptyList())).execute(task.id)
+
+        assertEquals(TaskStatus.FAILED, task.status)
+        assertEquals(AttemptStatus.FAILED, attempts.finished?.status)
+        assertEquals("The agent did not produce a repository change", attempts.finished?.errorSummary)
+        assertTrue(attempts.finishedReport!!.openQuestions.isEmpty(), attempts.finishedReport!!.openQuestions.toString())
+        assertEquals(AcceptanceOutcome.UNVERIFIED, attempts.finishedReport!!.acceptanceChecks.single().outcome)
+        assertEquals(CheckOutcome.PASSED, attempts.finishedReport!!.validation.single().outcome)
+    }
+
+    @Test
     fun `does not complete a changed and validated task when acceptance criteria are unverified`() {
         val criterion = "README documents the new behavior"
         val task = task(acceptanceCriteria = listOf(criterion))
