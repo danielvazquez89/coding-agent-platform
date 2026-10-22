@@ -342,7 +342,7 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
-    fun `keeps an applied patch when a later patch is rejected`() {
+    fun `keeps an applied patch but blocks completion when a later patch stays rejected`() {
         val task = task()
         val attempts = FakeAttempts()
         Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
@@ -383,16 +383,83 @@ class TaskExecutionWorkerTest {
         assertTrue(worker(FakeState(task), attempts, provider, FakeWorkspace(temporary)).execute(task.id))
 
         assertEquals("Hello guest\n", Files.readString(temporary.resolve("Greeting.java")))
-        assertEquals(TaskStatus.COMPLETED, task.status)
-        assertEquals(AttemptStatus.COMPLETED, attempts.finished?.status)
+        // The applied patch remains, but the rejected later patch is still unresolved. The worker
+        // must not accept a final report that treats the rejected change as if it had been applied.
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        assertEquals(AttemptStatus.NEEDS_INPUT, attempts.finished?.status)
+        assertEquals("A patch failed and was not corrected", attempts.finished?.errorSummary)
+        assertEquals(1, attempts.finishedReport!!.patchFailures.size)
+        assertTrue(attempts.finishedReport!!.implementation.contains("Patch application still failed"))
         assertTrue(
             provider.messages.none { it.role == "user" && it.content.contains("you have not applied a patch") },
             provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
         )
-        // The nudge clears lastPatchFailure, so one rejected patch earns one correction request.
-        // The assertion above is the regression check: without the fix the worker forgets the
-        // applied patch and says it never changed the workspace.
+        // The nudge still clears its one-shot state, so one rejected patch earns one correction
+        // request. The assertion above is the regression check: without the applied-patch fix the
+        // worker forgets the applied patch and says it never changed the workspace.
         assertEquals(1, provider.messages.count { it.role == "user" && it.content.contains("Your apply_patch tool call failed") })
+    }
+
+    @Test
+    fun `does not complete when the final report claims success after an unapplied patch`() {
+        val behavior = "Greeting handles a null name"
+        val testCriterion = "A test covers the null name"
+        val task = task(acceptanceCriteria = listOf(behavior, testCriterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        Files.writeString(temporary.resolve("GreetingTest.java"), "class GreetingTest {}\n")
+        val sourcePatch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello guest"
+        ).joinToString("\n", postfix = "\n")
+        val rejectedTestPatch = listOf(
+            "diff --git a/GreetingTest.java b/GreetingTest.java",
+            "--- a/GreetingTest.java",
+            "+++ b/GreetingTest.java",
+            "@@ -1 +1 @@",
+            "-class OldGreetingTest {}",
+            "+class GreetingTest { void greetsNullNameAsGuest() {} }"
+        ).joinToString("\n", postfix = "\n")
+        val report = """{"summary":"Applied both changes","implementation":"Added the null guard and a regression test.","acceptanceChecks":[{"criterion":"$behavior","outcome":"PASSED","evidence":"Greeting.java line 2"},{"criterion":"$testCriterion","outcome":"PASSED","evidence":"GreetingTest.greetsNullNameAsGuest asserts the null result."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to sourcePatch)))),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to rejectedTestPatch)))),
+                "tool_calls", null, null
+            ),
+            ModelTurn(report, emptyList(), "stop", null, null),
+            ModelTurn(report, emptyList(), "stop", null, null)
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("Greeting.java"))).execute(task.id)
+
+        // The report says both criteria passed and validation passed, but the test patch never
+        // applied. The machine must not turn that claim into a COMPLETED task.
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        assertEquals(AttemptStatus.NEEDS_INPUT, attempts.finished?.status)
+        assertEquals("A patch failed and was not corrected", attempts.finished?.errorSummary)
+        val stored = attempts.finishedReport!!
+        assertEquals(listOf("Greeting.java"), stored.changedFiles)
+        assertEquals(CheckOutcome.PASSED, stored.validation.single().outcome)
+        assertTrue(stored.acceptanceChecks.all { it.outcome == AcceptanceOutcome.PASSED })
+        assertEquals(1, stored.patchFailures.size)
+        assertTrue(stored.openQuestions.isEmpty(), stored.openQuestions.toString())
+        assertTrue(stored.implementation.contains("Patch application still failed"))
+        assertEquals("Hello guest\n", Files.readString(temporary.resolve("Greeting.java")))
+        assertEquals("class GreetingTest {}\n", Files.readString(temporary.resolve("GreetingTest.java")))
+        assertTrue(
+            provider.messages.none { it.role == "user" && it.content.contains("you have not applied a patch") },
+            provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
+        )
     }
 
     @Test

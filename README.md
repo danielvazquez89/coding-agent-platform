@@ -61,8 +61,13 @@ The conservatism is deliberate:
   tells the model to fix the failing test and rerun validation, at most twice. The report stores the
   final run's check, while each earlier run remains in the persisted tool audit. A local run applied the
   correct enum change, saw `EnumTest` fail against the old expectation, and then reported that the tests
-  were not updated; that is the case this nudge addresses. When the patch applied and validation passed
-  but the report leaves a supplied criterion without an evidence-bearing assessment, the worker asks for
+  were not updated; that is the case this nudge addresses. An unresolved patch failure also blocks
+  automatic completion: if an `apply_patch` call was rejected and no later patch applied, the task ends
+  `NEEDS_INPUT` even when the final report claims every criterion passed and validation passed, because
+  the unapplied change may be exactly the evidence the report asserts. The failure is recorded in the
+  report. A rejected patch followed by a successful one does not block completion. When the patch
+  applied and validation passed but the report leaves a supplied criterion without an evidence-bearing
+  assessment, the worker asks for
   the missing assessments at most twice, citing the change and the passing run already in the
   conversation; a changed test that calls the changed code and asserts the required result is valid
   evidence when that test ran in the passing validation, and the model must cite the test method and
@@ -122,7 +127,7 @@ The worker's tool allowlist is `list_files`, `search_code`, `find_symbol`, `read
 
 `NEEDS_INPUT` tasks can be answered through the review page or API. The answer is prepended to the task prompt as a labeled clarification so it remains in the prompt when the original description is long; a status-history entry records the requeue, and a fresh attempt runs against a new workspace. The previous report remains available in attempt history.
 
-When acceptance criteria are supplied, the agent must return one evidence-bearing assessment per criterion. Missing or evidence-free checks prevent completion; failed criteria fail the task, and unverified criteria require input. This is a model assessment, not independent proof: Maven tests and benchmark-specific expected-diff checks provide separate machine-verifiable evidence. A task is completed only when the workspace changed, all supplied criteria are reported as passed, and supported validation passed.
+When acceptance criteria are supplied, the agent must return one evidence-bearing assessment per criterion. Missing or evidence-free checks prevent completion; failed criteria fail the task, and unverified criteria require input. This is a model assessment, not independent proof: Maven tests and benchmark-specific expected-diff checks provide separate machine-verifiable evidence. A task is completed only when the workspace changed, all supplied criteria are reported as passed, supported validation passed, and no patch failure remains unresolved. A failed patch must never be treated as applied just because the final narrative says so.
 
 #### Draft pull-request publishing
 

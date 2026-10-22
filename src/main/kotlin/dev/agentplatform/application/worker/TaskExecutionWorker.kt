@@ -188,12 +188,15 @@ class TaskExecutionWorker @Inject constructor(
             // not a missing assessment. The attempt must not become NEEDS_INPUT just because the
             // model also left its criteria UNVERIFIED: there is nothing an answer can verify when
             // no change exists, and retrying is the documented next step. A blocking question or a
-            // validation that could not run still legitimately needs input.
+            // validation that could not run still legitimately needs input. A rejected patch with no
+            // later success is another known negative: the report may claim a change that never
+            // reached the workspace, so it must not complete automatically (W8b).
             var taskStatus = when {
                 blockingQuestions.isNotEmpty() || lastValidation?.outcome == CheckOutcome.SKIPPED -> TaskStatus.NEEDS_INPUT
                 acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } -> TaskStatus.FAILED
                 lastValidation?.outcome == CheckOutcome.FAILED -> TaskStatus.FAILED
                 changedFiles.isEmpty() -> TaskStatus.FAILED
+                trace.unresolvedPatchFailure != null -> TaskStatus.NEEDS_INPUT
                 acceptanceChecks.any { it.outcome != AcceptanceOutcome.PASSED } -> TaskStatus.NEEDS_INPUT
                 lastValidation?.outcome == CheckOutcome.PASSED -> TaskStatus.COMPLETED
                 else -> TaskStatus.FAILED
@@ -250,6 +253,7 @@ class TaskExecutionWorker @Inject constructor(
                 taskStatus == TaskStatus.NEEDS_INPUT -> when {
                     blockingQuestions.isNotEmpty() -> "Agent needs a user decision"
                     lastValidation?.outcome == CheckOutcome.SKIPPED -> "No supported validation could run"
+                    trace.unresolvedPatchFailure != null -> "A patch failed and was not corrected"
                     acceptanceChecks.any { it.outcome == AcceptanceOutcome.UNVERIFIED } -> "Acceptance criteria could not be verified"
                     else -> null
                 }
@@ -514,13 +518,13 @@ class TaskExecutionWorker @Inject constructor(
                     )
                     return@repeat
                 }
-                val remainingPatchFailure = lastPatchFailure
-                val finalText = if (remainingPatchFailure == null) response else buildString {
+                val unresolvedPatchFailure = trace.unresolvedPatchFailure
+                val finalText = if (unresolvedPatchFailure == null) response else buildString {
                     append(response)
                     append("\n\nPatch application still failed after ")
                     append(patchFailureRetries)
                     append(" correction attempts: ")
-                    append(remainingPatchFailure.take(2000))
+                    append(unresolvedPatchFailure.take(2000))
                 }
                 if (!validationCurrent) {
                     checkBudget(trace.startedAtNanos, trace)
@@ -575,6 +579,10 @@ class TaskExecutionWorker @Inject constructor(
                 lastToolResult = result.content.take(MAX_TOOL_RESULT_CHARS)
                 if (call.name == "apply_patch") {
                     lastPatchFailure = if (result.content.startsWith("Patch applied to ")) null else result.content
+                    // Track the last outcome separately from the one-shot correction nudge. A nudge
+                    // clears lastPatchFailure so it fires once, but the failure is still unresolved
+                    // until a later patch applies.
+                    trace.unresolvedPatchFailure = lastPatchFailure?.take(2000)
                     if (lastPatchFailure != null) trace.patchFailures += lastPatchFailure.take(2000)
                     // A later rejected patch does not undo one that already applied. Keep the
                     // workspace-changed fact so the worker validates and reports the changed tree
@@ -718,6 +726,7 @@ class TaskExecutionWorker @Inject constructor(
             alternatives = listOf("Run arbitrary host commands", "Allow unrestricted network access during tests")
         )
         val finalQuestions = questions.ifEmpty { parsed.questions }
+        val unresolvedPatchFailure = trace.unresolvedPatchFailure
         val summary = when (status) {
             TaskStatus.COMPLETED -> if (pullRequest != null) {
                 "Changes were applied, reported acceptance criteria passed, validation passed, and pull request #${pullRequest.number} (${pullRequest.state}${if (pullRequest.draft) ", draft" else ""}) is available."
@@ -740,6 +749,9 @@ class TaskExecutionWorker @Inject constructor(
             if (trace.patchFailures.isNotEmpty()) {
                 append("\nPatch recovery: ").append(trace.patchFailures.size)
                     .append(" patch attempt(s) failed before the final outcome.")
+            }
+            if (unresolvedPatchFailure != null) {
+                append("\nPatch application still failed: ").append(unresolvedPatchFailure.take(2000))
             }
             if (acceptanceChecks.isNotEmpty()) {
                 append("\nAcceptance criteria are model-assessed; see acceptanceChecks and evidence.")
@@ -1081,6 +1093,9 @@ class TaskExecutionWorker @Inject constructor(
         val patchFailures = mutableListOf<String>()
         val rejectedPatches = mutableMapOf<String, String>()
         val toolExecutions = mutableListOf<ToolExecutionAudit>()
+
+        /** The latest patch failure, kept until a later patch applies successfully. */
+        var unresolvedPatchFailure: String? = null
         private var promptTokens = 0
         private var completionTokens = 0
         private var tokenCountsAvailable = true

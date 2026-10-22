@@ -727,6 +727,29 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   because the test never changed; it did expose and fix a worker-state bug that would otherwise
   misreport a partly changed workspace.
 
+### 33. A confident report cannot hide an unapplied patch
+
+- **The gap.** W8b applied the source fix, never applied the test patch, and happened to end
+  `NEEDS_INPUT` because it asked a blocking question. The status decision did not read
+  `trace.patchFailures` at all: a source patch plus a rejected test patch, passing validation, and a
+  final report claiming both criteria `PASSED` would have satisfied the old completion rule. The
+  failure was stored in the report but had no effect on the outcome.
+- **Fix.** The worker now tracks the latest `apply_patch` outcome separately from the one-shot
+  correction nudge. The unresolved failure is set on a rejection and cleared only when a later patch
+  applies. If it is still set at finalization, the task ends `NEEDS_INPUT` with the reason "A patch failed
+  and was not corrected", even when the report claims every criterion passed and validation passed.
+  The report's implementation records the failure, and `patchFailures` still keeps the full recovery
+  history. A failure followed by a successful patch clears the state and can still complete.
+- **Regression coverage.** `does not complete when the final report claims success after an unapplied
+  patch` applies a source patch, rejects a test patch, then returns a report claiming both criteria
+  passed against a passing validation. It asserts `NEEDS_INPUT`, all criteria still `PASSED` in the
+  stored model assessment, one recorded patch failure, and an unchanged test file. The earlier
+  `keeps an applied patch when a later patch is rejected` test now expects `NEEDS_INPUT` while keeping
+  its no-false-no-patch-nudge assertion. The failure-then-success tests still complete.
+- **What this shows.** The report field was not a status input; the guard prevents a false completion
+  even when the model's narrative is confident. This is a code-review finding from W8b, not a new live
+  run: W8b remains unconfirmed `NEEDS_INPUT`.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`

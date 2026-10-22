@@ -181,6 +181,12 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   dropped and can exhaust the tool-call limit, so keep it large enough for a task's working set while
   prompt plus history stays under the provider's own limit. Never orphan a `tool` message from its
   assistant call.
+- **An unresolved patch failure blocks `COMPLETED`.** The worker tracks the latest `apply_patch`
+  outcome separately from the one-shot correction nudge. A failed patch stays unresolved until a later
+  patch applies successfully; while it is unresolved, even a final report that claims every criterion
+  passed and a passing validation ends `NEEDS_INPUT` (the attempt reason is "A patch failed and was not
+  corrected"). A failure followed by a successful patch still completes. Do not treat a rejected patch
+  as applied because the model's narrative says so.
 - **Patch format differs by model family, and both common formats are accepted.** `apply_patch` takes a
   git unified diff, or the Codex `*** Begin Patch` / `*** Update File:` envelope that the OpenAI
   open-weight `gpt-oss` family emits. The envelope is converted to a unified diff first
