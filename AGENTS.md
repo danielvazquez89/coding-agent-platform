@@ -183,10 +183,12 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   assistant call.
 - **An unresolved patch failure blocks `COMPLETED`.** The worker tracks the latest `apply_patch`
   outcome separately from the one-shot correction nudge. A failed patch stays unresolved until a later
-  patch applies successfully; while it is unresolved, even a final report that claims every criterion
-  passed and a passing validation ends `NEEDS_INPUT` (the attempt reason is "A patch failed and was not
-  corrected"). A failure followed by a successful patch still completes. Do not treat a rejected patch
-  as applied because the model's narrative says so.
+  patch applies successfully to every file it named. A malformed patch that names no files is cleared by
+  any later successful patch, because there is nothing to match; a successful patch to a different file
+  is not a correction. While it is unresolved, even a final report that claims every criterion passed
+  and a passing validation ends `NEEDS_INPUT` (the attempt reason is "A patch failed and was not
+  corrected"). A failure followed by a successful patch to its named files still completes. Do not
+  treat a rejected patch as applied because the model's narrative says so.
 - **A rejected `create_file` is also unresolved until that path is written.** The worker records the
   failure under its normalized repository path. A later successful `create_file` for that path or an
   `apply_patch` whose reported path list includes it clears the failure; while any remains, even a

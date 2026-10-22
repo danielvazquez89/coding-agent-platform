@@ -736,16 +736,21 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   failure was stored in the report but had no effect on the outcome.
 - **Fix.** The worker now tracks the latest `apply_patch` outcome separately from the one-shot
   correction nudge. The unresolved failure is set on a rejection and cleared only when a later patch
-  applies. If it is still set at finalization, the task ends `NEEDS_INPUT` with the reason "A patch failed
-  and was not corrected", even when the report claims every criterion passed and validation passed.
-  The report's implementation records the failure, and `patchFailures` still keeps the full recovery
-  history. A failure followed by a successful patch clears the state and can still complete.
+  applies to every file the rejected patch named. A malformed patch that names no files is cleared by any
+  later successful patch, because there is nothing to match; a successful patch to a different file is
+  not a correction. If the failure is still set at finalization, the task ends `NEEDS_INPUT` with the
+  reason "A patch failed and was not corrected", even when the report claims every criterion passed and
+  validation passed. The report's implementation records the failure, and `patchFailures` still keeps
+  the full recovery history. A failure followed by a successful patch to its named files clears the
+  state and can still complete.
 - **Regression coverage.** `does not complete when the final report claims success after an unapplied
   patch` applies a source patch, rejects a test patch, then returns a report claiming both criteria
   passed against a passing validation. It asserts `NEEDS_INPUT`, all criteria still `PASSED` in the
   stored model assessment, one recorded patch failure, and an unchanged test file. The earlier
   `keeps an applied patch but blocks completion when a later patch stays rejected` test now expects
-  `NEEDS_INPUT` while keeping its no-false-no-patch-nudge assertion. The failure-then-success tests
+  `NEEDS_INPUT` while keeping its no-false-no-patch-nudge assertion. `does not clear a patch failure
+  when a later patch changes a different file` rejects a test patch, applies a source patch to another
+  file, and asserts the rejected test path still blocks completion. The failure-then-success tests
   still complete.
 - **What this shows.** The report field was not a status input; the guard prevents a false completion
   even when the model's narrative is confident. This is a code-review finding from W8b, not a new live

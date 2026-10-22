@@ -583,13 +583,19 @@ class TaskExecutionWorker @Inject constructor(
                     lastPatchFailure = if (result.content.startsWith("Patch applied to ")) null else result.content
                     // Track the last outcome separately from the one-shot correction nudge. A nudge
                     // clears lastPatchFailure so it fires once, but the failure is still unresolved
-                    // until a later patch applies.
-                    trace.unresolvedPatchFailure = lastPatchFailure?.take(2000)
-                    if (lastPatchFailure != null) trace.patchFailures += lastPatchFailure.take(2000)
+                    // until a later patch applies to every path the rejected patch named. A
+                    // malformed patch names no paths, so any successful patch clears that failure.
+                    val failure = lastPatchFailure
+                    if (failure == null) {
+                        trace.resolvePatchSuccess(patchAppliedPaths(result.content))
+                    } else {
+                        trace.recordPatchFailure(failure.take(2000), patchArgumentPaths(call.arguments))
+                        trace.patchFailures += failure.take(2000)
+                    }
                     // A later rejected patch does not undo one that already applied. Keep the
                     // workspace-changed fact so the worker validates and reports the changed tree
                     // instead of telling the model it never applied a patch (W8b).
-                    if (lastPatchFailure == null) {
+                    if (failure == null) {
                         workspaceChanged = true
                         validationCurrent = false
                         patchAppliedPaths(result.content).forEach { trace.unresolvedCreateFailures.remove(it) }
@@ -922,15 +928,39 @@ class TaskExecutionWorker @Inject constructor(
      * `apply_patch` reports the paths it changed after a colon. Match a failed `create_file` to a
      * later successful patch so the recovery is visible instead of leaving a false unresolved failure.
      */
-    private fun patchAppliedPaths(content: String): List<String> {
-        if (!content.startsWith("Patch applied to ")) return emptyList()
+    private fun patchAppliedPaths(content: String): Set<String> {
+        if (!content.startsWith("Patch applied to ")) return emptySet()
         val separator = content.indexOf(": ")
-        if (separator < 0) return emptyList()
+        if (separator < 0) return emptySet()
         return content.substring(separator + 2).removeSuffix(".")
             .split(", ")
             .map(::normalizeRepositoryPath)
             .filter(String::isNotEmpty)
+            .toSet()
     }
+
+    /**
+     * A rejected patch has no reported path list, so read the headings in the patch the model sent.
+     * A malformed patch yields no paths and is treated as matchable by any later success.
+     */
+    private fun patchArgumentPaths(arguments: JsonNode): Set<String> =
+        arguments.path("patch").asText("").lineSequence()
+            .map(String::trim)
+            .mapNotNull { line ->
+                when {
+                    line.startsWith("+++ ") || line.startsWith("--- ") ->
+                        line.substring(4).substringBefore('\t').trim()
+                    line.startsWith("*** Update File:") -> line.removePrefix("*** Update File:").trim()
+                    line.startsWith("*** Add File:") -> line.removePrefix("*** Add File:").trim()
+                    line.startsWith("*** Delete File:") -> line.removePrefix("*** Delete File:").trim()
+                    else -> null
+                }
+            }
+            .filterNot { it == "/dev/null" }
+            .map { it.removePrefix("a/").removePrefix("b/") }
+            .map(::normalizeRepositoryPath)
+            .filter(String::isNotEmpty)
+            .toSet()
 
     private fun summarizeToolArguments(name: String, arguments: JsonNode): String = when (name) {
         "list_files" -> buildString {
@@ -1136,8 +1166,27 @@ class TaskExecutionWorker @Inject constructor(
         val rejectedPatches = mutableMapOf<String, String>()
         val toolExecutions = mutableListOf<ToolExecutionAudit>()
 
-        /** The latest patch failure, kept until a later patch applies successfully. */
+        /**
+         * The latest patch failure, kept until a later patch applies successfully to every path it
+         * named. A failure that named no path (for example, malformed input) is cleared by any later
+         * successful patch.
+         */
         var unresolvedPatchFailure: String? = null
+            private set
+        private var unresolvedPatchPaths: Set<String> = emptySet()
+
+        fun recordPatchFailure(message: String, paths: Set<String>) {
+            unresolvedPatchFailure = message
+            unresolvedPatchPaths = paths
+        }
+
+        fun resolvePatchSuccess(appliedPaths: Set<String>) {
+            if (unresolvedPatchFailure == null) return
+            if (unresolvedPatchPaths.isEmpty() || appliedPaths.containsAll(unresolvedPatchPaths)) {
+                unresolvedPatchFailure = null
+                unresolvedPatchPaths = emptySet()
+            }
+        }
 
         /** Failed file creations by normalized repository path, cleared by a later write to that path. */
         val unresolvedCreateFailures = mutableMapOf<String, String>()

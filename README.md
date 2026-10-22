@@ -62,10 +62,11 @@ The conservatism is deliberate:
   final run's check, while each earlier run remains in the persisted tool audit. A local run applied the
   correct enum change, saw `EnumTest` fail against the old expectation, and then reported that the tests
   were not updated; that is the case this nudge addresses. An unresolved patch failure also blocks
-  automatic completion: if an `apply_patch` call was rejected and no later patch applied, the task ends
-  `NEEDS_INPUT` even when the final report claims every criterion passed and validation passed, because
-  the unapplied change may be exactly the evidence the report asserts. The failure is recorded in the
-  report. A rejected patch followed by a successful one does not block completion. An unresolved
+  automatic completion: if an `apply_patch` call was rejected and no later patch applies to the files it
+  named, the task ends `NEEDS_INPUT` even when the final report claims every criterion passed and
+  validation passed, because the unapplied change may be exactly the evidence the report asserts. The
+  failure is recorded in the report. A rejected patch followed by a successful patch to the files it
+  named does not block completion. An unresolved
   `create_file` failure is also a known negative: if the requested file was not created and no later
   write to that path succeeds, the task ends `NEEDS_INPUT` even when the report claims it exists. A
   later successful `apply_patch` that reports the same path clears it. When the patch applied and
