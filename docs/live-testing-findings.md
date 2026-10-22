@@ -539,6 +539,25 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   (now `FAILED` after the reaped third attempt) and for W2: only a `COMPLETED` task with evidenced
   criteria exports a patch. The refusal is the policy working, not a defect.
 
+### 26. A test-only task completes locally, and its exported patch verifies outside the platform
+
+- **Setup.** W3 (`05466bf5`, attempt `374af846`) asked for a test-only change on `small-java`: cover
+  surrounding-whitespace trimming (`greet("  Ada  ")` -> `"Hello Ada"`). Jar `9ef4ef5` (validation
+  details without Docker setup IDs), `qwen2.5-coder:14b`, context 8192, Docker 29.8.2.
+- **Six calls.** `find_symbol(greet)` scoped to `Greeting.java` (452 characters), the 6-line source
+  read, `find_symbol(GreetingTest)` (423), the test's lines 7-20 (321), a **568-character test-only
+  patch** adding `greetsTrimmedName`, and `run_validation` -> **PASSED**.
+- **Report.** Both criteria `PASSED` with evidence: the new test name and the passing suite. The
+  acceptance nudge (93b973e) was not needed here; it remains covered by its unit tests (missing
+  evidence, exhausted retries, blocking question). The task reached `COMPLETED` with
+  `changedFiles=1`.
+- **Export, live.** `GET /api/tasks/05466bf5.../attempts/374af846.../patch` returned `200`,
+  `text/x-patch`, 569 bytes. On a fresh clone at `6187794`, `git apply --check` and `git apply` both
+  exited 0; the clone then passed `mvn -B -o test` in the same Maven image (3 tests, 0 failures)
+  outside the platform. This is the first local run in this series to complete the full handoff.
+- **The details cleanup.** The report's validation details now start with `[INFO] Scanning for
+  projects...`; the two 64-hex Docker IDs from W2 are gone (`9ef4ef5`).
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -611,9 +630,10 @@ running; without one, the honest statement is that the loop is ready and the fre
 ## The small-fixture runs
 
 The JSON-java task carries the whole repository and a 24-call budget; this fixture isolates the
-model's report discipline. `small-java` is a 30-line Maven project (JUnit 4.13.2, compiler 3.11.0)
-with one bug: `Greeting.greet(null)` throws. Every task has the same three criteria: null returns
-"Hello guest", a test covers it, and the suite passes.
+model's report discipline. `small-java` is a 30-line Maven project (JUnit 4.13.2, compiler 3.11.0).
+W1/W2 fix a null-handling bug in `Greeting.greet` (three criteria: null returns "Hello guest", a test
+covers it, the suite passes); W3 adds a test for surrounding-whitespace trimming (two criteria: the
+test exists, the suite passes).
 
 | Run | Model | Outcome |
 | --- | --- | --- |
@@ -621,6 +641,7 @@ with one bug: `Greeting.greet(null)` throws. Every task has the same three crite
 | W1b attempt `7d6f6c4e` (via `/answer`) | same, Docker restarted | 6 calls: correct 1,008-character patch applied; validation **PASSED**; criteria 2-3 PASSED, criterion 1 left UNVERIFIED with no evidence -> `NEEDS_INPUT` |
 | W1c attempt `b567d1e1` (via `/answer` with the evidence) | same | 752-character patch used `main/java/...` (no `src/`); git said only `No such file or directory`; the identical patch was resent twice and refused by the duplicate guard with hunk-context advice that did not fit; the model re-read, then returned prose; operator stopped, reaper recorded FAILED outcome unknown - nothing applied |
 | W2 `165b5c36` attempt `c7ef6bf2` | same, jar with the acceptance nudge (`93b973e`) | 6 calls: baseline validation before any change (the premature-final nudge corrected that), then a test-only 618-character patch and a **failed** validation (the source still NPEs); two validation nudges produced two 0-call prose turns of 5+ minutes instead of a source fix; `NEEDS_INPUT`, test-only change, all criteria UNVERIFIED, export 409 (finding 25) |
+| W3 `05466bf5` attempt `374af846` | same, jar `9ef4ef5` (validation details without setup IDs) | 6 calls: read the source and test, applied a 568-character **test-only** patch (`greetsTrimmedName`), validation **PASSED**; both criteria PASSED with evidence -> **COMPLETED**. Export returned 200 (`text/x-patch`, 569 bytes); on a fresh clone `git apply --check` and `git apply` succeeded, and `mvn -B -o test` passed 3/3 outside the platform (finding 26) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
 validation; the remaining gap is the report's acceptance assessment (finding 24).
