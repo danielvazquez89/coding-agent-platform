@@ -22,7 +22,12 @@ class CodexPatchNormalizerTest {
         Files.writeString(workspace.resolve("README.md"), "initial\n")
         run("init", "--initial-branch=main")
         run("add", "README.md")
-        run("commit", "-m", "initial")
+        // GitHub's runners have no global Git identity; keep the fixture independent of it.
+        run(
+            "-c", "user.name=Codex Patch Test",
+            "-c", "user.email=codex-patch-test@example.invalid",
+            "commit", "-m", "initial"
+        )
     }
 
     @AfterEach
