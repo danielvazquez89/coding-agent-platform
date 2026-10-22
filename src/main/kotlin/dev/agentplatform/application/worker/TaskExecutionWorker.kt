@@ -197,6 +197,7 @@ class TaskExecutionWorker @Inject constructor(
                 lastValidation?.outcome == CheckOutcome.FAILED -> TaskStatus.FAILED
                 changedFiles.isEmpty() -> TaskStatus.FAILED
                 trace.unresolvedPatchFailure != null -> TaskStatus.NEEDS_INPUT
+                trace.unresolvedCreateFailures.isNotEmpty() -> TaskStatus.NEEDS_INPUT
                 acceptanceChecks.any { it.outcome != AcceptanceOutcome.PASSED } -> TaskStatus.NEEDS_INPUT
                 lastValidation?.outcome == CheckOutcome.PASSED -> TaskStatus.COMPLETED
                 else -> TaskStatus.FAILED
@@ -254,6 +255,7 @@ class TaskExecutionWorker @Inject constructor(
                     blockingQuestions.isNotEmpty() -> "Agent needs a user decision"
                     lastValidation?.outcome == CheckOutcome.SKIPPED -> "No supported validation could run"
                     trace.unresolvedPatchFailure != null -> "A patch failed and was not corrected"
+                    trace.unresolvedCreateFailures.isNotEmpty() -> "A file creation failed and was not corrected"
                     acceptanceChecks.any { it.outcome == AcceptanceOutcome.UNVERIFIED } -> "Acceptance criteria could not be verified"
                     else -> null
                 }
@@ -590,13 +592,21 @@ class TaskExecutionWorker @Inject constructor(
                     if (lastPatchFailure == null) {
                         workspaceChanged = true
                         validationCurrent = false
+                        patchAppliedPaths(result.content).forEach { trace.unresolvedCreateFailures.remove(it) }
                     }
                 }
-                if (call.name == "create_file" && result.content.startsWith("Created ")) {
-                    // A created file is a workspace change even though no patch was applied. It must
-                    // suppress the no-change nudge and invalidate an earlier validation result.
-                    workspaceChanged = true
-                    validationCurrent = false
+                if (call.name == "create_file") {
+                    val path = toolPath(call.arguments)
+                    if (result.content.startsWith("Created ")) {
+                        // A created file is a workspace change even though no patch was applied. It
+                        // must suppress the no-change nudge and invalidate an earlier validation.
+                        workspaceChanged = true
+                        validationCurrent = false
+                        if (path != null) trace.unresolvedCreateFailures.remove(normalizeRepositoryPath(path))
+                    } else {
+                        val key = path?.let(::normalizeRepositoryPath) ?: "<unknown>"
+                        trace.unresolvedCreateFailures[key] = result.content.take(2000)
+                    }
                 }
                 log.infof("Task %s tool %s returned %d characters", task.id, call.name, result.content.length)
                 toolResults += call to result
@@ -733,6 +743,7 @@ class TaskExecutionWorker @Inject constructor(
         )
         val finalQuestions = questions.ifEmpty { parsed.questions }
         val unresolvedPatchFailure = trace.unresolvedPatchFailure
+        val unresolvedCreateFailures = trace.unresolvedCreateFailures.toMap()
         val summary = when (status) {
             TaskStatus.COMPLETED -> if (pullRequest != null) {
                 "Changes were applied, reported acceptance criteria passed, validation passed, and pull request #${pullRequest.number} (${pullRequest.state}${if (pullRequest.draft) ", draft" else ""}) is available."
@@ -758,6 +769,11 @@ class TaskExecutionWorker @Inject constructor(
             }
             if (unresolvedPatchFailure != null) {
                 append("\nPatch application still failed: ").append(unresolvedPatchFailure.take(2000))
+            }
+            if (unresolvedCreateFailures.isNotEmpty()) {
+                append("\nFile creation still failed: ").append(
+                    unresolvedCreateFailures.entries.joinToString("; ") { "${it.key}: ${it.value}" }.take(2000)
+                )
             }
             if (acceptanceChecks.isNotEmpty()) {
                 append("\nAcceptance criteria are model-assessed; see acceptanceChecks and evidence.")
@@ -894,6 +910,26 @@ class TaskExecutionWorker @Inject constructor(
         val index = trace.toolExecutions.indexOfFirst { it.sequenceNumber == pending.sequenceNumber }
         check(index >= 0) { "Pending tool audit event ${pending.sequenceNumber} is missing from the execution trace" }
         trace.toolExecutions[index] = completed
+    }
+
+    private fun toolPath(arguments: JsonNode): String? =
+        arguments.path("path").asText("").trim().takeIf { it.isNotEmpty() }
+
+    private fun normalizeRepositoryPath(path: String): String =
+        path.replace('\\', '/').removePrefix("./").trim()
+
+    /**
+     * `apply_patch` reports the paths it changed after a colon. Match a failed `create_file` to a
+     * later successful patch so the recovery is visible instead of leaving a false unresolved failure.
+     */
+    private fun patchAppliedPaths(content: String): List<String> {
+        if (!content.startsWith("Patch applied to ")) return emptyList()
+        val separator = content.indexOf(": ")
+        if (separator < 0) return emptyList()
+        return content.substring(separator + 2).removeSuffix(".")
+            .split(", ")
+            .map(::normalizeRepositoryPath)
+            .filter(String::isNotEmpty)
     }
 
     private fun summarizeToolArguments(name: String, arguments: JsonNode): String = when (name) {
@@ -1102,6 +1138,9 @@ class TaskExecutionWorker @Inject constructor(
 
         /** The latest patch failure, kept until a later patch applies successfully. */
         var unresolvedPatchFailure: String? = null
+
+        /** Failed file creations by normalized repository path, cleared by a later write to that path. */
+        val unresolvedCreateFailures = mutableMapOf<String, String>()
         private var promptTokens = 0
         private var completionTokens = 0
         private var tokenCountsAvailable = true

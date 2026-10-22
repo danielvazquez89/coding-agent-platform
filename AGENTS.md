@@ -187,6 +187,12 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   passed and a passing validation ends `NEEDS_INPUT` (the attempt reason is "A patch failed and was not
   corrected"). A failure followed by a successful patch still completes. Do not treat a rejected patch
   as applied because the model's narrative says so.
+- **A rejected `create_file` is also unresolved until that path is written.** The worker records the
+  failure under its normalized repository path. A later successful `create_file` for that path or an
+  `apply_patch` whose reported path list includes it clears the failure; while any remains, even a
+  report claiming every criterion passed and a passing validation ends `NEEDS_INPUT` (the attempt reason
+  is "A file creation failed and was not corrected"). The report's implementation records the failure.
+  A missing file must not be treated as created because the model says so.
 - **Patch format differs by model family, and both common formats are accepted.** `apply_patch` takes a
   git unified diff, or the Codex `*** Begin Patch` / `*** Update File:` envelope that the OpenAI
   open-weight `gpt-oss` family emits. The envelope is converted to a unified diff first

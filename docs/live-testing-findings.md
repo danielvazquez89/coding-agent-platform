@@ -769,8 +769,29 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   workspace-changed fact.
 - **What this shows.** This is a code-review finding from the `create_file` path W6 exercised (its
   attempt was rejected because the test file already existed); no live run has completed a
-  create-only change. The check covers successful creation, not a failed `create_file` after another
-  change; whether that failure should also be treated as unresolved remains a separate question.
+  create-only change. Finding 35 covers the rejected-creation path.
+
+### 35. A rejected file creation cannot be reported as a created test
+
+- **The gap.** A failed `create_file` was only in the tool audit; the status decision did not read
+  it. A source patch plus a rejected `create_file` for the test, a passing validation of the old
+  suite, and a final report claiming both criteria `PASSED` would have satisfied the old completion
+  rule. This is the same shape as finding 33, through a different write tool.
+- **Fix.** The worker records a failed creation by normalized repository path. While any path remains
+  unresolved, the task ends `NEEDS_INPUT` with the reason "A file creation failed and was not
+  corrected", even when the report claims the file exists and validation passed. A later successful
+  `create_file` for that path, or an `apply_patch` whose reported path list includes that path, clears
+  the failure; a source-only patch does not. The report's implementation records "File creation still
+  failed".
+- **Regression coverage.** `does not complete when the final report claims a failed file creation
+  succeeded` applies the source patch, rejects a `create_file` for the existing test, and returns a
+  report claiming both criteria passed against a passing validation; it asserts `NEEDS_INPUT`, the
+  failed creation recorded in the report, all model checks still `PASSED`, no open question, and the
+  test file unchanged. `clears a failed file creation when a later patch changes the same file` rejects
+  the creation, applies a test patch to that path, and asserts `COMPLETED`.
+- **What this shows.** A failed creation is a known negative, not an invisible no-op. The path match
+  keeps a valid recovery unblocked; a failure for a path no later write touches remains unresolved
+  for human review. This is a code-review finding, not a live run.
 
 ## Where this stands after the real-repository runs
 

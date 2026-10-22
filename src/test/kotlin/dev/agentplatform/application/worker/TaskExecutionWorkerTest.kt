@@ -497,6 +497,131 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `does not complete when the final report claims a failed file creation succeeded`() {
+        val behavior = "Greeting handles a null name"
+        val testCriterion = "A test covers the null name"
+        val task = task(acceptanceCriteria = listOf(behavior, testCriterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\nWorld\n")
+        Files.writeString(temporary.resolve("GreetingTest.java"), "class GreetingTest {}\n")
+        val sourcePatch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1,2 +1,2 @@",
+            "-Hello",
+            "+Hello guest",
+            " World"
+        ).joinToString("\n", postfix = "\n")
+        val unrelatedSourcePatch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1,2 +1,2 @@",
+            " Hello guest",
+            "-World",
+            "+World guest"
+        ).joinToString("\n", postfix = "\n")
+        val report = """{"summary":"Applied both changes","implementation":"Added the null guard and a regression test.","acceptanceChecks":[{"criterion":"$behavior","outcome":"PASSED","evidence":"Greeting.java line 2"},{"criterion":"$testCriterion","outcome":"PASSED","evidence":"GreetingTest.greetsNullNameAsGuest asserts the null result."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to sourcePatch)))),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "create_file",
+                        """{"path":"GreetingTest.java","content":"class GreetingTest { void greetsNullNameAsGuest() {} }\n"}"""
+                    )
+                ),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to unrelatedSourcePatch)))),
+                "tool_calls", null, null
+            ),
+            ModelTurn(report, emptyList(), "stop", null, null)
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("Greeting.java"))).execute(task.id)
+
+        // The source patch applied, but create_file was rejected because the test already exists.
+        // A later source-only patch must not clear that failure. The report claims the test was added;
+        // the machine must keep the failed creation unresolved.
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        assertEquals(AttemptStatus.NEEDS_INPUT, attempts.finished?.status)
+        assertEquals("A file creation failed and was not corrected", attempts.finished?.errorSummary)
+        val stored = attempts.finishedReport!!
+        assertEquals(listOf("Greeting.java"), stored.changedFiles)
+        assertEquals(CheckOutcome.PASSED, stored.validation.single().outcome)
+        assertTrue(stored.acceptanceChecks.all { it.outcome == AcceptanceOutcome.PASSED })
+        assertTrue(stored.openQuestions.isEmpty(), stored.openQuestions.toString())
+        assertTrue(stored.implementation.contains("File creation still failed"))
+        assertEquals("Hello guest\nWorld guest\n", Files.readString(temporary.resolve("Greeting.java")))
+        assertEquals("class GreetingTest {}\n", Files.readString(temporary.resolve("GreetingTest.java")))
+        assertEquals(
+            listOf("apply_patch", "create_file", "apply_patch", "run_validation"),
+            stored.toolExecutions.map { it.toolName }
+        )
+    }
+
+    @Test
+    fun `clears a failed file creation when a later patch changes the same file`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("GreetingTest.java"), "class GreetingTest {}\n")
+        val testPatch = listOf(
+            "diff --git a/GreetingTest.java b/GreetingTest.java",
+            "--- a/GreetingTest.java",
+            "+++ b/GreetingTest.java",
+            "@@ -1 +1 @@",
+            "-class GreetingTest {}",
+            "+class GreetingTest { void greetsNullNameAsGuest() {} }"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "create_file",
+                        """{"path":"GreetingTest.java","content":"class GreetingTest {}\n"}"""
+                    )
+                ),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to testPatch)))),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                """{"summary":"Added a test","implementation":"Added the test through apply_patch."}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("GreetingTest.java"))).execute(task.id)
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(AttemptStatus.COMPLETED, attempts.finished?.status)
+        assertEquals(
+            "class GreetingTest { void greetsNullNameAsGuest() {} }\n",
+            Files.readString(temporary.resolve("GreetingTest.java"))
+        )
+        val report = attempts.finishedReport!!
+        assertEquals(CheckOutcome.PASSED, report.validation.single().outcome)
+        assertTrue(!report.implementation.contains("File creation still failed"))
+        assertEquals(
+            listOf("create_file", "apply_patch", "run_validation"),
+            report.toolExecutions.map { it.toolName }
+        )
+    }
+
+    @Test
     fun `refuses a byte-identical rejected patch without running it again`() {
         val task = task()
         val attempts = FakeAttempts()
