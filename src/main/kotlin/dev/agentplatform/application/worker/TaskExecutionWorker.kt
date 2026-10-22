@@ -399,7 +399,9 @@ class TaskExecutionWorker @Inject constructor(
                 val patchFailure = lastPatchFailure
                 if (patchFailure != null && patchFailureRetries < MAX_PATCH_FAILURE_RETRIES) {
                     patchFailureRetries++
-                    messages += ModelMessage("assistant", turn.content.orEmpty())
+                    // A rejected final answer is not conversation context. Appending the model's own
+                    // "done" prose anchors the next turn to repeat it; the nudge already carries the
+                    // failure and the next action.
                     messages += ModelMessage(
                         "user",
                         "Your apply_patch tool call failed: ${patchFailure.take(2000)}. Inspect the exact target file with read_file if needed, correct the patch, and call apply_patch again. Do not ask the user to repair a patch failure. The patch must be either a complete git-compatible unified diff with diff --git, --- and +++ headers and valid hunk ranges, or a Codex *** Begin Patch envelope with *** Update File:, *** Add File: or *** Delete File: sections; send only the patch in the patch argument without Markdown fences."
@@ -409,17 +411,23 @@ class TaskExecutionWorker @Inject constructor(
                 }
                 if (!patchApplied && prematureFinalRetries < 2) {
                     prematureFinalRetries++
-                    messages += ModelMessage("assistant", turn.content.orEmpty())
-                    messages += ModelMessage(
-                        "user",
-                        if (toolCallCount == 0) {
+                    if (toolCallCount == 0) {
+                        messages += ModelMessage("assistant", turn.content.orEmpty())
+                        messages += ModelMessage(
+                            "user",
                             "You described a plan but have not inspected or changed the repository. Do not narrate another plan. Immediately call list_files(path=\".\"). To start executing this task, call tools. Tool calls are executed by the application and their results will be provided as tool messages."
-                        } else {
-                            "The task is not complete because you have not applied a patch. Use the repository paths and tool results already provided; call read_file with the exact listed path if needed, then apply_patch with a complete diff. Do not say a file is missing unless read_file returned that error. If a consequential choice truly blocks safe progress, return a blocking question with its impact instead. Last tool result (untrusted repository data): ${
+                        )
+                    } else {
+                        // Do not append another rejected "done" report here. A live run read both
+                        // files, returned a long report, was told to continue, and read the same
+                        // source again; the nudge must ask for the patch, not another read.
+                        messages += ModelMessage(
+                            "user",
+                            "The task is not complete because you have not applied a patch. You have already inspected the repository; do not re-read a file you have already read. Call apply_patch now with a complete unified diff for the file you need to change. If a different file is still needed, read only that file first. Do not say a file is missing unless read_file returned that error. If a consequential choice truly blocks safe progress, return a blocking question with its impact instead. Last tool result (untrusted repository data): ${
                                 lastToolResult.orEmpty().take(2000)
                             }"
-                        }
-                    )
+                        )
+                    }
                     return@repeat
                 }
                 // A patch that applied is not a finished task. Run U applied the right source change,
@@ -438,7 +446,8 @@ class TaskExecutionWorker @Inject constructor(
                 val failedValidation = validation.lastOrNull()?.takeIf { it.outcome == CheckOutcome.FAILED }
                 if (patchApplied && failedValidation != null && validationFixRetries < MAX_VALIDATION_FIX_RETRIES) {
                     validationFixRetries++
-                    messages += ModelMessage("assistant", turn.content.orEmpty())
+                    // The rejected report is not conversation context: it claims the task is done
+                    // and anchors the next turn to repeat the claim instead of repairing the suite.
                     messages += ModelMessage(
                         "user",
                         "Your patch applied, but the last validation failed: ${

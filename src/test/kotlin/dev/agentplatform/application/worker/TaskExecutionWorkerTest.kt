@@ -285,7 +285,14 @@ class TaskExecutionWorkerTest {
         assertEquals(5, provider.calls)
         assertTrue(provider.messages.any { it.role == "user" && it.content.contains("Do not narrate another plan") })
         assertTrue(provider.messages.any { it.role == "user" && it.content.contains("Last tool result") && it.content.contains("project context") })
+        assertTrue(provider.messages.any { it.role == "user" && it.content.contains("do not re-read a file you have already read") })
         assertTrue(provider.messages.any { it.role == "assistant" && it.content == "I will inspect the files and make a patch." })
+        // A rejected "done" report after a read is not appended: it anchors the next turn to repeat
+        // the claim instead of writing the patch the task needs.
+        assertTrue(
+            provider.messages.none { it.role == "assistant" && it.content == "I could not find the file." },
+            provider.messages.filter { it.role == "assistant" }.joinToString(" | ") { it.content }
+        )
         assertEquals("updated project context\n", Files.readString(temporary.resolve("README.md")))
         assertEquals(TaskStatus.COMPLETED, task.status)
     }
@@ -505,6 +512,12 @@ class TaskExecutionWorkerTest {
         assertTrue(
             provider.messages.any { it.role == "user" && it.content.contains("the last validation failed") },
             provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
+        )
+        // The rejected report must not be replayed as assistant context: it claims the task is
+        // finished and anchors the repair turn to repeat that claim instead of fixing the suite.
+        assertTrue(
+            provider.messages.none { it.role == "assistant" && it.content.contains("The tests still assert the old behavior") },
+            provider.messages.filter { it.role == "assistant" }.joinToString(" | ") { it.content }
         )
     }
 
