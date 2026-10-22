@@ -558,6 +558,30 @@ a committed document; the day-to-day roadmap and open questions live in the unco
 - **The details cleanup.** The report's validation details now start with `[INFO] Scanning for
   projects...`; the two 64-hex Docker IDs from W2 are gone (`9ef4ef5`).
 
+### 27. A rejected patch is resent unchanged, and the model claims a change that never applied
+
+- **Setup.** W4 (`b4f1a8db`, attempt `c1b3f59a`) reran the null-handling task on `small-java` with the
+  jar at `fa6513f`, before the failed-validation and no-change status rules. `qwen2.5-coder:14b`,
+  context 8192, Docker 29.8.2.
+- **The patch loop.** `find_symbol(greet)` and a 6-line read found the relevant code. The model then
+  sent a 436-character patch that did not apply at `Greeting.java:7`; the refusal quoted the actual
+  numbered lines. The model **resent the byte-identical patch three times** - the duplicate guard
+  refused each without another `git apply` - then re-read lines 7-12 and **resent it again**. It never
+  produced a different hunk.
+- **The ending.** It ran `run_validation`, which passed on the unchanged tree (baseline), and produced
+  a final report after 12 model calls (9m46s of model time, 10m09s total). `changedFiles=[]`, yet the
+  report's narrative claimed `Greeting.greet` was modified and `greetsNullNameAsGuest` was added. The
+  acceptance checks are model-assessed: criterion 2 was `PASSED` with the fabricated test as evidence;
+  criteria 1 and 3 were `UNVERIFIED`. Under the old rules the task ended `NEEDS_INPUT` with the
+  synthetic "Acceptance criteria could not be verified" question.
+- **What this shows.** The duplicate guard prevents repeated git work, but it cannot teach a model to
+  repair a hunk; the exact-lines hint was delivered and ignored. The no-change guard is the reason the
+  fabricated claim did not complete: `COMPLETED` requires a changed workspace, and the new rule makes
+  this attempt `FAILED` ("The agent did not produce a repository change") rather than `NEEDS_INPUT`.
+  Acceptance evidence remains a model assessment, not independent proof; the report labels the
+  narrative as unverified and the reviewer sees the evidence, but a claim can still name a test that
+  does not exist. A future check could cross-reference cited identifiers against the changed tree.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -642,6 +666,7 @@ test exists, the suite passes).
 | W1c attempt `b567d1e1` (via `/answer` with the evidence) | same | 752-character patch used `main/java/...` (no `src/`); git said only `No such file or directory`; the identical patch was resent twice and refused by the duplicate guard with hunk-context advice that did not fit; the model re-read, then returned prose; operator stopped, reaper recorded FAILED outcome unknown - nothing applied |
 | W2 `165b5c36` attempt `c7ef6bf2` | same, jar with the acceptance nudge (`93b973e`) | 6 calls: baseline validation before any change (the premature-final nudge corrected that), then a test-only 618-character patch and a **failed** validation (the source still NPEs); two validation nudges produced two 0-call prose turns of 5+ minutes instead of a source fix; `NEEDS_INPUT`, test-only change, all criteria UNVERIFIED, export 409 (finding 25) |
 | W3 `05466bf5` attempt `374af846` | same, jar `9ef4ef5` (validation details without setup IDs) | 6 calls: read the source and test, applied a 568-character **test-only** patch (`greetsTrimmedName`), validation **PASSED**; both criteria PASSED with evidence -> **COMPLETED**. Export returned 200 (`text/x-patch`, 569 bytes); on a fresh clone `git apply --check` and `git apply` succeeded, and `mvn -B -o test` passed 3/3 outside the platform (finding 26) |
+| W4 `b4f1a8db` attempt `c1b3f59a` | same, jar `fa6513f` (before the failed-validation/no-change status rules) | 8 calls: read the source, a 436-character patch was rejected at line 7; the model resent the identical patch three times (duplicate guard) and re-read the file, then resent it again; baseline validation PASSED, `changedFiles=[]`, criterion 2 falsely PASSED with a claimed test, criteria 1/3 UNVERIFIED -> `NEEDS_INPUT` under the old rule; the new rule makes it `FAILED` (finding 27) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
 validation; the remaining gap is the report's acceptance assessment (finding 24).
