@@ -632,6 +632,50 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   a live run still cannot produce evidence, the next step is a human confirmation path rather than
   trusting model prose.
 
+### 30. A concrete acceptance nudge gets two of three criteria; a recorded human confirmation completes the validated run
+
+- **Setup.** W7 (`5e5b7731-2c1e-4e01-8fdc-4c0a80bb685a`, attempt
+  `bff28ad1-7fd5-43d9-ba0d-8cb41b583fea`) ran the same null-handling task on `small-java`
+  (`6187794`) with the jar rebuilt after the concrete acceptance nudge (`b3673c1`). Same local
+  `qwen2.5-coder:14b`, context 8192 and Docker validator.
+- **What the model did.** Eight tool calls: `find_symbol(greet)`, read `Greeting.java:7-12`, read
+  `GreetingTest.java:1-25`; a 891-character Codex envelope was rejected because its first content
+  line came before an explicit `@@`; a 972-character patch was rejected at `Greeting.java:7` and
+  `GreetingTest.java:13` with the actual-lines hint; the byte-identical resend was refused by the
+  duplicate guard; a corrected 1,034-character patch applied; `run_validation` **PASSED**.
+- **The diff is the requested change.** It adds `if (name == null || name.isBlank())` to
+  `Greeting.greet` and `greetsNullNameAsGuest`, which asserts `Greeting.greet(null)` returns
+  `"Hello guest"`. `changedFiles` contains both files; the stored diff is not truncated and the
+  exported patch is 1,037 bytes.
+- **The report improved but did not finish.** The concrete nudge visibly raised compliance from W6's
+  0/3 to 2/3 evidenced criteria: criteria 2 and 3 were `PASSED` citing the new test and the Maven
+  `BUILD SUCCESS`, but criterion 1 (the null behavior itself) stayed `UNVERIFIED` with empty
+  evidence. The synthetic question remained and the task ended `NEEDS_INPUT` after 12 model calls
+  (1,521,757 ms of model time, 1,546,068 ms total, 25m46s).
+- **A human confirmation completed it.** With the confirmation build, `POST
+  /api/tasks/{id}/attempts/{attemptId}/confirm` for that task and attempt, with reviewer `Daniel`,
+  returned `200`. The evidence was:
+  > Reviewed the stored diff: Greeting.greet now treats null as a guest, and greetsNullNameAsGuest
+  > asserts Greeting.greet(null) returns "Hello guest"; the stored run_validation result was Maven
+  > tests PASSED with exit 0.
+
+  Task and attempt became `COMPLETED`; `report.review` holds the reviewer, evidence
+  and timestamp; `acceptanceChecks` hold the human evidence; `modelAcceptanceChecks` preserve
+  criterion 1 as `UNVERIFIED` and criteria 2-3 as the model's `PASSED` claims; `openQuestions` is
+  empty; and history sequence 4 is `NEEDS_INPUT -> COMPLETED` with actor `REVIEWER`.
+- **The exported patch verified outside the platform.** The patch endpoint returned the 1,037-byte
+  diff. On a fresh clone of `small-java` at `6187794`, `git apply` changed both files cleanly and
+  `mvn -B -o test` passed **3/3** with `BUILD SUCCESS`.
+- **What this shows.** The concrete acceptance nudge is an improvement, but a local 14B still left the
+  behavioral criterion unevidenced; automated completion remains report-limited. The human path is
+  not a false pass: it required changed files, non-empty validation with every check `PASSED`, an
+  untruncated diff, no `FAILED` criterion and no blocking model question, and it records the reviewer
+  and evidence while preserving the model's original claims. The first rejection also exposed a
+  normalizer stricter than the Codex grammar; the follow-up commit (`3960220`) accepts an implicit
+  first update hunk, while exact-match placement and every path/size check remain. A generic
+  `PATCH /status` remains an administrative override; only the confirmation endpoint updates both the
+  attempt and the task and enables export.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -719,11 +763,16 @@ test exists, the suite passes).
 | W4 `b4f1a8db` attempt `c1b3f59a` | same, jar `fa6513f` (before the failed-validation/no-change status rules) | 8 calls: read the source, a 436-character patch was rejected at line 7; the model resent the identical patch three times (duplicate guard) and re-read the file, then resent it again; baseline validation PASSED, `changedFiles=[]`, criterion 2 falsely PASSED with a claimed test, criteria 1/3 UNVERIFIED -> `NEEDS_INPUT` under the old rule; the new rule makes it `FAILED` (finding 27) |
 | W5 `74feed0b` attempt `141c76c0` | same, jar `3d9ce1b` (both status rules) | 5 calls: read the source and test, read the source again after a nudge, baseline validation PASSED; no patch was ever attempted, 4 prose turns (two five minutes long), 8 model calls / 19m05s; `changedFiles=[]`, criterion 2 falsely PASSED with a claimed test, criterion 3 PASSED on the baseline suite, criterion 1 UNVERIFIED -> **FAILED** ("The agent did not produce a repository change"), no synthetic question (finding 28) |
 | W6 `c8775b02` attempt `cde00335` | same, jar `dcfdc31` (anti-anchoring nudge) | 8 calls: source patch applied (432 chars), `create_file` rejected, first test patch rejected, re-read the test, test patch applied (509 chars), validation **PASSED**; the diff is the correct null guard plus `greetsNullNameAsGuest`; `changedFiles=2`, all criteria UNVERIFIED with empty evidence, two acceptance nudges did not help -> `NEEDS_INPUT`; 12 calls / 16m49s (finding 29) |
+| W7 `5e5b7731` attempt `bff28ad1` | same, jar `b3673c1` (concrete acceptance nudge) | 8 calls: `find_symbol`, two reads, a 891-char implicit-hunk rejection, a 972-char context rejection, an identical-resend rejection, a corrected 1,034-char patch applied, validation **PASSED**; criteria 2-3 PASSED with evidence, criterion 1 UNVERIFIED -> `NEEDS_INPUT`; 12 calls / 25m46s. Reviewer confirmation -> **COMPLETED**; exported 1,037-byte patch applied to a fresh `6187794` clone, `mvn -B -o test` 3/3 (finding 30) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
 validation; the remaining gap is the report's acceptance assessment (finding 24). W6 repeated it with
 the source and test change and a green suite, but an empty acceptance report stranded the validated
-change in `NEEDS_INPUT` (finding 29).
+change in `NEEDS_INPUT` (finding 29). W7, with the concrete nudge, evidenced two of three criteria;
+the stored diff and validation were sound, so an explicit reviewer confirmation completed the task and
+the exported patch passed the suite outside the platform (finding 30). The human path is an audited
+fallback, not an automated completion, and the remaining automation gap is the local model's report
+discipline.
 
 ## Repository selection (the gate, in practice)
 

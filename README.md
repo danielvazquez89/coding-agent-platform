@@ -4,7 +4,7 @@
 
 A Kotlin + Quarkus project for a controlled software engineering agent. The intended product takes a GitHub issue, inspects one repository, proposes a patch, runs validation in isolation, and opens a pull request for a person to review.
 
-The project runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks a configured model provider (local Ollama or any OpenAI-compatible endpoint) for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and validates Maven projects in a separate Docker container. The included Compose deployment separates the API/control plane from a resource-limited worker container; the worker has no Docker socket, and validation requests go through an authenticated, workspace-scoped control-plane endpoint. A local review page shows reports, diffs, validation, tool-audit events, and draft-PR links; a completed attempt's diff can also be exported as an applicable patch, users can answer a `NEEDS_INPUT` question and queue a new attempt, and a failed or cancelled task can be retried as a linked new task. Per-task time and estimated-cost limits are configurable. When explicitly enabled and configured for an allow-listed public GitHub repository, the worker can push a task branch and open a draft pull request after validation. GitHub issue ingestion and private-repository clone authentication are not implemented.
+The project runs a bounded, asynchronous coding-agent workflow: it accepts tasks over REST, persists task and attempt state to PostgreSQL, inspects an authorized repository, asks a configured model provider (local Ollama or any OpenAI-compatible endpoint) for changes through an allow-listed tool loop, applies a patch in a disposable workspace, and validates Maven projects in a separate Docker container. The included Compose deployment separates the API/control plane from a resource-limited worker container; the worker has no Docker socket, and validation requests go through an authenticated, workspace-scoped control-plane endpoint. A local review page shows reports, diffs, validation, tool-audit events, and draft-PR links; a completed attempt's diff can also be exported as an applicable patch, users can answer a `NEEDS_INPUT` question and queue a new attempt, a reviewer can confirm a validated attempt whose model report left criteria unverified, and a failed or cancelled task can be retried as a linked new task. Per-task time and estimated-cost limits are configurable. When explicitly enabled and configured for an allow-listed public GitHub repository, the worker can push a task branch and open a draft pull request after validation. GitHub issue ingestion and private-repository clone authentication are not implemented.
 
 > **Repository guides.** For an agent-oriented operating guide — build/test commands, the layer and
 > port/adapter map, conventions, invariants, and known pitfalls — see [`AGENTS.md`](AGENTS.md). The
@@ -93,6 +93,7 @@ policy and verification substrate around the model. What has and has not been me
 | `GET` | `/api/tasks/{id}/history` | Return ordered, append-only status history, including the initial `QUEUED` entry. |
 | `GET` | `/api/tasks/{id}/attempts` | Return attempts in attempt-number order, with status, report, and failure summary. |
 | `GET` | `/api/tasks/{id}/attempts/{attemptId}` | Return one attempt and its structured execution report. |
+| `POST` | `/api/tasks/{id}/attempts/{attemptId}/confirm` | Confirm a validated `NEEDS_INPUT` attempt as a human reviewer: record the reviewer and evidence, replace the acceptance checks with human evidence (preserving the model's original checks), complete the task and attempt, and enable patch export; return `400` for invalid input, `404` for an unknown task/attempt, and `409` when the machine checks do not permit confirmation. |
 | `GET` | `/api/tasks/{id}/attempts/{attemptId}/patch` | Return the attempt's patch as `text/x-patch` when it is safe to apply locally; return `409` with the reason when it is not, and `404` for an unknown task or attempt. |
 | `GET` | `/api/tasks/{id}/attempts/{attemptId}/tool-executions` | Return redacted, ordered tool audit events, including events recorded before an attempt finishes. |
 
@@ -108,7 +109,7 @@ Pacing complements retrying. One shared budget spans every turn of every task: `
 
 Pacing cannot help when a single request is already too large, because providers cap one request as well as the rate: Groq's free tier answers a request above its per-minute token limit with HTTP 413 rather than throttling it. The loop appends one tool result per call, so over a real repository the conversation grows until every request is rejected — the first live task against a third-party Maven repository failed exactly there, after thirteen tool calls. `AGENT_MAX_HISTORY_CHARACTERS` (default `24000`, `disabled` to keep everything) bounds the tool history a request may carry. The system prompt and the task prompt (which holds the repository map) are never dropped and are not counted against the budget, because they are bounded separately and a large repository map must not shrink the set of files the model can hold at once. When the budget is exceeded the oldest tool exchanges are removed and one note is inserted that names the calls whose results were dropped (for example `read_file(src/main/.../EnumTest.java)`) and says to re-read only the lines still needed; naming them matters because a live run re-read the same test file up to five times after it had been dropped, and the old note told the model not to re-read content it no longer had. A tool result is never separated from the assistant call it answers, because an orphaned `tool` message is invalid for OpenAI-compatible APIs. The distinction between prompt and history is not academic: with a smaller budget the two files this task needed could not both fit, the model re-read whichever file had just been dropped, and it exhausted its tool-call limit without ever proposing a patch. Set the budget so a task's working set fits at once while prompt plus history stays under the provider's per-request cap; the rate-limit figure above is in tokens, so at roughly four characters per token Groq's 8000-token tier leaves room for about `24000` characters of history beside a bounded prompt. Truncation is reported on the worker log, not silently hidden.
 
-Models also differ in how they mark up changes, so `apply_patch` accepts both a complete git unified diff and the Codex envelope (`*** Begin Patch`, `*** Update File:` / `*** Add File:` / `*** Delete File:`, `*** End Patch`) that OpenAI's open-weight `gpt-oss` family emits. The envelope is normalized to a unified diff before anything runs, and normalization is deliberately strict: every hunk must match the file on disk exactly, the normalized result still passes the same path, size and file-count checks, and a hunk that cannot be placed is reported back to the model rather than guessed at. `*** Move to:` is rejected (express a move as an add plus a delete). With Groq, `qwen/qwen3.8-27b` applied a two-file change with a single unified-diff patch and passed Docker validation; `openai/gpt-oss-120b` made the same change by sending two Codex envelopes, both normalized and applied with zero patch failures, and also passed validation. Both runs used the same small local fixture, so neither is evidence for a large third-party repository; a first real task against `stleary/JSON-java` (issue #838) has not completed on the free tier, where both hosted models exhausted their tool budget exploring rather than patching. The platform reported every one of those failures honestly, and the findings and the fixes they produced are recorded in [docs/live-testing-findings.md](docs/live-testing-findings.md).
+Models also differ in how they mark up changes, so `apply_patch` accepts both a complete git unified diff and the Codex envelope (`*** Begin Patch`, `*** Update File:` / `*** Add File:` / `*** Delete File:`, `*** End Patch`) that OpenAI's open-weight `gpt-oss` family emits. The envelope is normalized to a unified diff before anything runs, and normalization is deliberately strict: every hunk must match the file on disk exactly, the normalized result still passes the same path, size and file-count checks, and a hunk that cannot be placed is reported back to the model rather than guessed at. The first update hunk may start directly with content because the Codex grammar makes its `@@` marker optional; exact-match placement still decides. `*** Move to:` is rejected (express a move as an add plus a delete). With Groq, `qwen/qwen3.8-27b` applied a two-file change with a single unified-diff patch and passed Docker validation; `openai/gpt-oss-120b` made the same change by sending two Codex envelopes, both normalized and applied with zero patch failures, and also passed validation. Both runs used the same small local fixture, so neither is evidence for a large third-party repository; a first real task against `stleary/JSON-java` (issue #838) has not completed on the free tier, where both hosted models exhausted their tool budget exploring rather than patching. The platform reported every one of those failures honestly, and the findings and the fixes they produced are recorded in [docs/live-testing-findings.md](docs/live-testing-findings.md).
 
 The current local default is Ollama with `qwen3:8b`. If needed, install it with `ollama pull qwen3:8b`, then check it appears in `ollama list`. Ollama must be running at the configured base URL. Setting `AGENT_MODEL_PROVIDER=openai-compatible` switches to the hosted/OpenAI-compatible adapter instead; see the example in `.env.example`.
 
@@ -147,7 +148,7 @@ For this deployment, use public GitHub HTTPS repository URLs; local host paths a
 
 ### Local review page
 
-Open <http://localhost:8081/> to list tasks and inspect the latest attempt, report, diff, validation checks, persisted tool-audit events, open questions, and draft-PR link. Tool events are loaded from their own endpoint rather than only from the final report, so events from an unfinished attempt remain visible. For a `NEEDS_INPUT` task, submit a clarification there; the task is requeued and the worker starts another attempt. This is a local operator view, not an embedded GitHub review client. Protect the app from untrusted network access because the API and page are unauthenticated.
+Open <http://localhost:8081/> to list tasks and inspect the latest attempt, report, diff, validation checks, persisted tool-audit events, open questions, and draft-PR link. Tool events are loaded from their own endpoint rather than only from the final report, so events from an unfinished attempt remain visible. For a `NEEDS_INPUT` task, submit a clarification there; the task is requeued and the worker starts another attempt. A reviewer can instead confirm the existing attempt when its diff and validation are sound: the page asks for reviewer and evidence, and the server enforces the machine checks before completing the task and enabling patch export. A completed attempt with an untruncated diff offers a patch download. This is a local operator view, not an embedded GitHub review client. Protect the app from untrusted network access because the API and page are unauthenticated.
 
 Allowed transitions:
 
@@ -162,9 +163,10 @@ QUEUED ──→ RUNNING ──→ VALIDATING ──→ COMPLETED
    └──→ CANCELLED
 
 NEEDS_INPUT ──(answer)──→ QUEUED
+NEEDS_INPUT ──(confirm acceptance)──→ COMPLETED
 ```
 
-`COMPLETED`, `FAILED`, and `CANCELLED` are terminal. `NEEDS_INPUT` can transition to `QUEUED` only through the answer endpoint, which prepends the clarification to the task prompt and starts another attempt. Other invalid and repeated transitions are rejected without changing task state or writing history.
+`COMPLETED`, `FAILED`, and `CANCELLED` are terminal. `NEEDS_INPUT` can transition to `QUEUED` only through the answer endpoint, which prepends the clarification to the task prompt and starts another attempt. The supported path from `NEEDS_INPUT` to `COMPLETED` is the attempt confirmation endpoint, which records human evidence and requires the attempt to have a changed workspace, passing supported validation, a complete diff, no failed criterion, and no blocking model question. The generic administrative `PATCH /api/tasks/{id}/status` can change a task's status directly, but it does not update the attempt or make a patch exportable, so it cannot stand in for confirmation. Other invalid and repeated transitions are rejected without changing task state or writing history.
 
 ### From task to change: the execution flow
 
@@ -209,7 +211,10 @@ After a patch, `related_tests` answers "what else does this touch?" without a bu
 attempt COMPLETED (workspace changed AND supported validation passed)?
 │
 ├─ no ─► FAILED       ─► open a new task (the report explains why)
-│         NEEDS_INPUT ─► POST /api/tasks/{id}/answer ─► QUEUED ─► new attempt
+│         NEEDS_INPUT ─┬► POST /api/tasks/{id}/answer ─► QUEUED ─► new attempt
+│                      └► POST …/attempts/{attemptId}/confirm ─► COMPLETED
+│                            only when the stored diff and validation are sound;
+│                            the patch becomes exportable through route B
 │
 └─ yes ─► choose a route
           │
@@ -233,6 +238,26 @@ attempt COMPLETED (workspace changed AND supported validation passed)?
 | C · report | `GET …/attempts/{attemptId}` | none | a person, reading or porting |
 
 The export policy lives in `TaskAttemptService.exportablePatch`, so no client re-implements it. When the stored diff is too large it is flagged `patchDiffTruncated`, and Route B refuses it (`409`) rather than return text `git apply` would reject; for such a change, Route A is the reproducible path.
+
+#### Confirming a validated attempt that ended NEEDS_INPUT
+
+A run can produce the correct, validated change and still end `NEEDS_INPUT` because the model left one or more acceptance criteria unevidenced. If you have reviewed the stored diff and validation, confirm the existing attempt instead of starting over:
+
+```powershell
+$taskId = '<task-id>'
+$attemptId = '<attempt-id>'
+$confirmation = @{
+  reviewer = 'Daniel'
+  evidence = 'Reviewed the diff: the null guard returns Hello guest and the new test asserts it; Maven tests passed.'
+} | ConvertTo-Json
+Invoke-RestMethod -Method Post `
+  -Uri "http://localhost:8081/api/tasks/$taskId/attempts/$attemptId/confirm" `
+  -ContentType 'application/json' -Body $confirmation
+```
+
+The endpoint is not a bypass. It returns `409` unless the task and attempt are `NEEDS_INPUT`, the attempt changed files, every supported validation check passed, the stored diff is present and untruncated, no criterion was reported `FAILED`, and no blocking model question remains. It records the reviewer, evidence, and timestamp in `report.review`, replaces `acceptanceChecks` with the human-confirmed evidence, preserves the model's original checks under `modelAcceptanceChecks`, removes the synthetic "Acceptance criteria were not verified" question, and writes a `REVIEWER` status transition. The patch endpoint then works under Route B.
+
+Manual confirmation does not publish a draft pull request: the worker has already finished, so the platform does not push a branch. The change is yours to export and review. The generic `PATCH /api/tasks/{id}/status` remains an administrative status override; it does not update the attempt or make a patch exportable.
 
 #### Applying a completed attempt's patch (Route B)
 
@@ -389,8 +414,8 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 
 - `api/TaskResource.kt` — REST routes, input validation, HTTP status codes.
 - `api/InternalExecutionResource.kt` — bearer-authenticated validation gateway restricted to the shared workspace root.
-- `api/dto/TaskDtos.kt` — API data transfer objects: `CreateTaskRequest`, `TransitionTaskRequest`, `TaskStatusTransitionResponse`, `TaskAttemptResponse`, `ApiError`.
-- `src/main/resources/META-INF/resources/index.html` — local task/PR review page (shows the stored diff and labels it when truncated) and `NEEDS_INPUT` answer form.
+- `api/dto/TaskDtos.kt` — API data transfer objects: `CreateTaskRequest`, `TransitionTaskRequest`, `AnswerTaskRequest`, `ConfirmAttemptRequest`, `TaskStatusTransitionResponse`, `TaskAttemptResponse`, `ApiError`.
+- `src/main/resources/META-INF/resources/index.html` — local task/PR review page (stored diff, truncation label, patch download), `NEEDS_INPUT` answer form, and human acceptance-confirmation form.
 
 #### `dev.agentplatform.domain` — Core business logic (no framework dependencies)
 
@@ -399,15 +424,15 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `domain/model/TaskStatusTransition.kt` — Append-only status history entity.
 - `domain/model/TaskLifecycle.kt` — State machine policy: allowed transitions and `InvalidTaskTransitionException`.
 - `domain/model/TaskAttempt.kt` — Attempt entity and `AttemptStatus` enum.
-- `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `ToolExecutionAudit`, `ToolExecutionOutcome`, `AgentDecision`, `AgentQuestion`, `AcceptanceCheck`, `ModelUsage`, `PullRequestReference`, `ValidationCheck`, `CheckOutcome`.
+- `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `HumanReview`, `ToolExecutionAudit`, `ToolExecutionOutcome`, `AgentDecision`, `AgentQuestion`, `AcceptanceCheck`, `ModelUsage`, `PullRequestReference`, `ValidationCheck`, `CheckOutcome`; `review` and `modelAcceptanceChecks` preserve human-confirmation provenance.
 - `domain/model/ToolExecutionEvent.kt` — Durable per-call audit entity linked to its task and attempt.
 - `domain/port/CodingModelProvider.kt` — Provider-neutral LLM chat/tool-calling SPI (messages, tool definitions, tool calls, turns).
 - `domain/port/ExecutionPorts.kt` — Outbound port interfaces: `TaskExecutionState`, `AttemptOperations`, `RepositoryWorkspaceFactory`, `RepositoryWorkspace`, `CommandExecutor`, `CommandResult`, `ValidationRunner`, `PullRequestPublisher`, `ToolExecutionResult`.
 
 #### `dev.agentplatform.application` — Use cases and orchestration
 
-- `application/service/TaskService.kt` — Task CRUD and transition use cases; implements `TaskExecutionState` port.
-- `application/service/TaskAttemptService.kt` — Attempt lifecycle, report serialization; implements `AttemptOperations` port.
+- `application/service/TaskService.kt` — Task CRUD and transition use cases, including the reviewer completion transition; implements `TaskExecutionState` port.
+- `application/service/TaskAttemptService.kt` — Attempt lifecycle, report serialization, human acceptance confirmation, and patch-export policy; implements `AttemptOperations` port.
 - `application/worker/TaskExecutionWorker.kt` — Scheduled task claim, bounded model/tool reasoning loop, report generation.
 - `application/worker/TaskExecutionFinalizer.kt` — Terminal attempt and task state updates after execution.
 
@@ -443,8 +468,8 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `api/TaskResourceTest.kt` — Quarkus REST and PostgreSQL integration tests, including patch-export responses.
 - `api/InternalExecutionResourceTest.kt` — Validation-gateway authentication, workspace-root, invalid-path, and unavailable-configuration tests.
 - `domain/model/TaskLifecycleTest.kt` — State machine transition-policy unit tests.
-- `application/service/TaskServiceTest.kt` — Task service integration tests.
-- `application/service/TaskAttemptTest.kt` — Attempt lifecycle, export-policy, and orphan-recovery query tests.
+- `application/service/TaskServiceTest.kt` — Task service integration tests, including reviewer completion.
+- `application/service/TaskAttemptTest.kt` — Attempt lifecycle, human-confirmation guards, export-policy, and orphan-recovery query tests.
 - `application/worker/TaskExecutionWorkerTest.kt` — Worker, model/tool loop, budget, and orphan-reaping tests.
 - `application/worker/TaskExecutionFinalizerTest.kt` — Finalizer state-update and orphan-failure tests.
 - `infrastructure/ollama/OllamaCodingModelProviderTest.kt` — Ollama adapter mock-HTTP tests.
@@ -644,7 +669,7 @@ Treat these as architecture guidance, not commitments to add every component now
 
 Given an authorized repository and a task with acceptance criteria, the agent should inspect relevant code, identify related tests, make a focused patch in an isolated working copy, update the tests that assert the behavior it changes (and add a regression test when none covers it), run relevant validation, and return a reviewable report. The report explains what changed, why important implementation choices were made, alternatives considered where useful, unresolved questions, changed files, and the actual validation outcomes. If an unresolved question blocks safe progress, the attempt should finish as `NEEDS_INPUT` with the question and its impact; it must not claim completion. A failed or unavailable check must be reported as such, never as a pass.
 
-"Completed" means execution produced a patch and an honest validation report. It does not mean the patch was approved, merged, or deployed. Keep human review as the gate for later pull-request or release actions.
+"Completed" means execution produced a patch and an honest validation report, or a reviewer explicitly confirmed a validated attempt that ended `NEEDS_INPUT` because its report left criteria unevidenced. It does not mean the patch was approved, merged, or deployed. Keep human review as the gate for later pull-request or release actions.
 
 ## Recommended roadmap
 
@@ -656,7 +681,7 @@ Run the v2 smoke suite and expand it to 15–30 varied Kotlin/JVM maintenance ta
 
 ### 2. Harden completion and worker reliability
 
-The worker already requires a non-empty patch and successful supported validation, but acceptance criteria are still model-authored assessments, not independent verification. Preserve that distinction in API/report wording and never treat arbitrary model evidence as machine proof. Add tests for no-op patches, failed final validation, missing/duplicate criterion results, unsupported validation, and malformed patches. Attempts left running by a crashed worker are now failed after a stale timeout; next add leases/heartbeats so recovery is faster and safe with several workers, plus bounded task retries/backoff, cancellation, and concurrency controls. **Exit gate:** none of those failure cases can reach `COMPLETED`, and recovery cannot execute duplicate work. Keep worker logic separate from REST resources; do not add RabbitMQ until a concrete scaling need justifies it.
+The worker already requires a non-empty patch and successful supported validation, but acceptance criteria are still model-authored assessments, not independent verification. A human confirmation can resolve a validated attempt that ended `NEEDS_INPUT`, but it is an explicit reviewer assessment with recorded evidence, not machine proof. Preserve that distinction in API/report wording and never treat arbitrary model evidence as machine proof. Add tests for no-op patches, failed final validation, missing/duplicate criterion results, unsupported validation, and malformed patches. Attempts left running by a crashed worker are now failed after a stale timeout; next add leases/heartbeats so recovery is faster and safe with several workers, plus bounded task retries/backoff, cancellation, and concurrency controls. **Exit gate:** none of those failure cases can reach `COMPLETED`, and recovery cannot execute duplicate work. Keep worker logic separate from REST resources; do not add RabbitMQ until a concrete scaling need justifies it.
 
 ### 3. Make execution reviewable and close isolation gaps
 
@@ -699,7 +724,7 @@ These choices can be discussed while implementing the worker; they do not need t
 ## Status and handoff for the next coding session
 
 - The model provider is runtime-selectable: local Ollama (default) or any OpenAI-compatible endpoint, both behind one SPI with mock-HTTP coverage. Run the versioned benchmark before making model-quality claims.
-- The scheduled worker, fail-closed local repository-root configuration, tool allowlist, disposable repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, server-side patch export with truncation refusal, answer-and-requeue flow, local review page, durable per-tool audit events, cumulative task time/cost guardrails, bounded reconciliation of attempts orphaned by a crashed worker, container-separated worker/control-plane deployment, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. GitHub issue intake, private-repository clone authentication, strict egress controls, least-privilege worker database roles, and durable recovery from partial publication are not implemented. The Compose topology still needs execution and containment testing on the deployment host.
+- The scheduled worker, fail-closed local repository-root configuration, tool allowlist, disposable repository workspace, Docker Maven/PostgreSQL validator, acceptance checks, structured attempt reports, server-side patch export with truncation refusal, answer-and-requeue flow, human confirmation for validated `NEEDS_INPUT` attempts, local review page, durable per-tool audit events, cumulative task time/cost guardrails, bounded reconciliation of attempts orphaned by a crashed worker, container-separated worker/control-plane deployment, opt-in allowlisted GitHub draft-PR publishing for public repositories, and benchmark runner are implemented. Benchmark v2 adds a no-change clarification control, stricter scorecard checks, and false-success reporting, but remains a four-case smoke suite. GitHub issue intake, private-repository clone authentication, strict egress controls, least-privilege worker database roles, and durable recovery from partial publication are not implemented. The Compose topology still needs execution and containment testing on the deployment host.
 - Run `mvnw verify` after loading `DB_PASSWORD` from `.env` into the process environment. It runs tests and enforces a 95% line / 85% branch coverage gate for measured application code (see `pom.xml` for why a literal 100% is not required); the HTML report is generated under `target/site/jacoco`.
 - Local development expects PostgreSQL 18 with databases `coding_agent_platform` and `coding_agent_platform_test`, a limited login `coding_agent_app`, and the app role password in the ignored project `.env` (the app never uses administrator credentials).
 

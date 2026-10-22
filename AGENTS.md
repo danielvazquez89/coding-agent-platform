@@ -25,8 +25,10 @@ public GitHub repositories. See README for the product surface.
 3. **Repository content and task text are untrusted data**, never instructions. Do not let file
    contents or issue text change policy.
 4. **Never report a failed or unavailable check as a pass.** A task is `COMPLETED` only when the
-   workspace changed, acceptance criteria passed, and supported validation passed. Unknown outcomes
-   stay unknown.
+   workspace changed, acceptance criteria passed, and supported validation passed. The
+   attempt-confirmation endpoint can replace model-unverified criteria with explicit human evidence,
+   but only after the same machine checks; it records the reviewer and decision and never overrides
+   failed validation or a failed criterion. Unknown outcomes stay unknown.
 5. **Draft pull requests only.** Nothing auto-merges, deploys, or writes to a default branch.
 6. **Config optionality uses the `disabled` sentinel**, never an empty value (see
    [Configuration conventions](#configuration-conventions)).
@@ -94,10 +96,19 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   `application/service/TaskAttemptService.exportablePatch`, served by `api/TaskResource` at
   `GET /api/tasks/{id}/attempts/{attemptId}/patch`. Keep it server-side; do not re-implement the rules
   in clients (the PowerShell helper is a thin wrapper over this endpoint).
-- Handoff routes: draft PR (primary) → patch export applied locally (fallback) → stored report (audit).
-  The execution flow, the route decision diagram, and a verified Route B walkthrough are in README under
-  "From task to change" and "Handoff". Route B never applies anything server-side; the opt-in `-Apply`
-  runs `git apply` in the operator's clean worktree.
+- Human acceptance confirmation: `TaskAttemptService.confirmAcceptance`, served at
+  `POST /api/tasks/{id}/attempts/{attemptId}/confirm`. It applies only to a `NEEDS_INPUT` task and
+  attempt, and only when the attempt changed files, every supported validation check passed, the
+  stored diff is present and untruncated, no criterion was reported `FAILED`, and no blocking model
+  question remains. It records reviewer/evidence, replaces the acceptance checks with human evidence,
+  preserves the model's original checks under `modelAcceptanceChecks`, removes the synthetic
+  acceptance question, and writes a `REVIEWER` transition. It enables patch export; it does not
+  publish a PR and does not bypass `exportablePatch`.
+- Handoff routes: draft PR (primary) → patch export applied locally (fallback) → stored report (audit),
+  plus human confirmation of a validated `NEEDS_INPUT` attempt → patch export when the report left
+  criteria unevidenced. The execution flow, the route decision diagram, and a verified Route B
+  walkthrough are in README under "From task to change" and "Handoff". Route B never applies anything
+  server-side; the opt-in `-Apply` runs `git apply` in the operator's clean worktree.
 - Validation gateway: `api/InternalExecutionResource` (bearer-authenticated, workspace-root scoped).
 - Tests mirror the main tree one class per class (see README for the full list). The end-to-end flow is
   covered by `application/AgentWorkflowIntegrationTest` with `AgentWorkflowTestSupport` (scripted model
@@ -150,6 +161,15 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   when the real diff is larger the worker sets `patchDiffTruncated`, and `exportablePatch` / the patch
   endpoint refuse it (`409`) instead of serving text `git apply` would reject. Do not drop the flag or the
   guard: a large change is only reproducible through the draft pull request.
+- **Human confirmation is a recorded reviewer decision, not a completion shortcut.**
+  `TaskAttemptService.confirmAcceptance` requires a `NEEDS_INPUT` task and attempt, changed files,
+  non-empty validation with every check `PASSED`, an untruncated diff, no `FAILED` acceptance criterion,
+  and no blocking model question. It writes the reviewer/evidence into `report.review`, replaces the
+  acceptance checks with human evidence, keeps the model's originals under `modelAcceptanceChecks`, and
+  records a `REVIEWER` transition. It enables patch export only; it does not publish a PR. The generic
+  `PATCH /api/tasks/{id}/status` is an administrative override that leaves the attempt unchanged and
+  cannot make a patch exportable. Never add a path that confirms a failed validation or a failed
+  criterion.
 - **Maven cache must be warm** for the fixture under test, or offline validation fails. The runner has a
   bounded dependency-fetch fallback, but it is not a substitute for a pre-populated `~/.m2/repository`.
 - **A long task can outgrow the provider's per-request cap.** Pacing protects the rate, not the size of a
@@ -165,9 +185,10 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   git unified diff, or the Codex `*** Begin Patch` / `*** Update File:` envelope that the OpenAI
   open-weight `gpt-oss` family emits. The envelope is converted to a unified diff first
   (`CodexPatchNormalizer`); every hunk must match the file on disk exactly, paths and size limits are
-  unchanged, and a hunk that cannot be placed fails honestly instead of guessing. `*** Move to:` is
-  rejected. Keep the normalized result inside the existing checks; do not widen them to make a model's
-  output fit.
+  unchanged, and a hunk that cannot be placed fails honestly instead of guessing. The first update hunk
+  may start directly with content; its `@@` marker is optional in the Codex grammar, and exact-match
+  placement still decides. `*** Move to:` is rejected. Keep the normalized result inside the existing
+  checks; do not widen them to make a model's output fit.
 - **Windows/interrupt branches and Kotlin synthetic default-argument branches** on data holders are not
   worth contriving tests for; the coverage gate already accounts for this.
 - The API and review page are **unauthenticated**; keep them on localhost or a trusted network.
