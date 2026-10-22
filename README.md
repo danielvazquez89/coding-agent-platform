@@ -64,7 +64,10 @@ The conservatism is deliberate:
   were not updated; that is the case this nudge addresses. When the patch applied and validation passed
   but the report leaves a supplied criterion without an evidence-bearing assessment, the worker asks for
   the missing assessments at most twice, citing the change and the passing run already in the
-  conversation; a blocking question from the model is accepted as a legitimate `NEEDS_INPUT` stop. A
+  conversation; a changed test that calls the changed code and asserts the required result is valid
+  evidence when that test ran in the passing validation, and the model must cite the test method and
+  assertion. A test name alone proves only that the test exists, and Maven alone does not prove the
+  behavior. A blocking question from the model is accepted as a legitimate `NEEDS_INPUT` stop. A
   small-fixture run applied the correct null check and test and passed Docker validation, yet left one
   criterion `UNVERIFIED` and ended `NEEDS_INPUT`; that is the case this second nudge addresses. A failed
   supported validation is a known negative result, not an open question: unless the model asked a

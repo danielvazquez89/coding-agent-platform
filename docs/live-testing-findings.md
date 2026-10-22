@@ -676,6 +676,57 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   `PATCH /status` remains an administrative override; only the confirmation endpoint updates both the
   attempt and the task and enables export.
 
+### 31. Eight rejected patches leave no change; the loop fails honestly
+
+- **Setup.** W8 (`28a2fb5a-9d64-4c74-9db3-a9e103e6dcf6`, attempt
+  `ddbc7275-2f4c-4875-a460-5e420e24d229`) ran the same null-handling task on `small-java`
+  (`6187794`) with the jar rebuilt after the acceptance-evidence prompt change and before the
+  applied-patch fix. Same local `qwen2.5-coder:14b`, context 8192 and Docker validator.
+- **What the model did.** Seventeen tool calls: `find_symbol(greet)`, reads of the source and test,
+  and eight `apply_patch` attempts (894/905/905/905/564/564/564/564 characters). The first patch
+  failed at `Greeting.java:6` and `GreetingTest.java:15`; later attempts failed at the test's line 15
+  or 16, then at `Greeting.java:13`, and four byte-identical resends were refused by the duplicate
+  guard in a few milliseconds. It re-read the same ranges between attempts but never produced a patch
+  that matched the file.
+- **No change reached the workspace.** `changedFiles=[]` and `patchDiff=null`. The model still called
+  `run_validation`, which passed the **unchanged 2-test suite**. Its narrative claimed it had applied a
+  source patch and added `greetsNullNameAsGuest`, but the machine report recorded no diff and left all
+  three criteria `UNVERIFIED`. The attempt ended `FAILED` ("The agent did not produce a repository
+  change") after 22 model calls, 2,105,268 ms of model time and 2,160,423 ms total (36m00s).
+- **What this shows.** The duplicate guard and the no-change rule held: a baseline validation pass
+  cannot turn an untouched repository into a completed task, and the model's prose cannot either.
+  The eight failures are a patch-generation problem, not a safety problem, and the new
+  test-assertion evidence guidance was not exercised because no test changed.
+
+### 32. One applied patch survives eight failures, but the worker forgot it
+
+- **Setup.** W8b (`6ff90389-348c-4dfb-8d83-16d14e891340`, attempt
+  `a03cdff8-3efb-4218-bc1f-6dd8e71123c6`) ran the same task and fixture with the same jar.
+- **What the model did.** Fifteen tool calls: `find_symbol`, read `Greeting.java:7-12`, three rejected
+  source patches (a corrupt patch at line 13, a context failure at line 7, and a duplicate), then a
+  **467-character source patch applied**. It searched for the test, read `GreetingTest.java:7-13`,
+  and sent a 562-character test patch that failed at line 7; two duplicates followed, a repeated
+  source patch failed because the source was already changed, and a final duplicate test patch was
+  refused before `run_validation` **PASSED** the old 2-test suite.
+- **The stored diff is one correct line, but the test was never added.** The untruncated diff changes
+  `src/main/java/example/Greeting.java` from `if (name.isBlank())` to
+  `if (name == null || name.isBlank())`; `changedFiles` contains only that file. Criterion 1 (the
+  behavior) was `UNVERIFIED`; criteria 2 and 3 were `UNVERIFIED` with "Patch application failed,
+  changes not made." The blocking question "Why is the patch failing to apply?" made the attempt
+  `NEEDS_INPUT` after 20 model calls, 1,897,185 ms of model time and 1,925,451 ms total (32m05s).
+- **The applied-patch state was reset by a later failure.** After the successful source patch,
+  `patchApplied` was true; the rejected test patch set it back to false. The worker's no-patch check
+  therefore treated the workspace as unchanged on the final turns and could say "you have not applied
+  a patch" even though `Greeting.java` was already changed. The regression test
+  `keeps an applied patch when a later patch is rejected` sends one applied patch, one stale patch and
+  a final report, then asserts that the applied file remains and no false no-patch nudge appears. The
+  fix (`fa7c789`) sets the fact on success only; a rejected patch no longer clears it.
+- **What this shows.** The attempt ended honestly: one source-only change, an unverified test
+  criterion and a blocking question, so it stayed `NEEDS_INPUT` and no patch was exported. The test
+  patch failure is still a model limitation. W8b did not exercise the changed-test evidence guidance
+  because the test never changed; it did expose and fix a worker-state bug that would otherwise
+  misreport a partly changed workspace.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -764,6 +815,8 @@ test exists, the suite passes).
 | W5 `74feed0b` attempt `141c76c0` | same, jar `3d9ce1b` (both status rules) | 5 calls: read the source and test, read the source again after a nudge, baseline validation PASSED; no patch was ever attempted, 4 prose turns (two five minutes long), 8 model calls / 19m05s; `changedFiles=[]`, criterion 2 falsely PASSED with a claimed test, criterion 3 PASSED on the baseline suite, criterion 1 UNVERIFIED -> **FAILED** ("The agent did not produce a repository change"), no synthetic question (finding 28) |
 | W6 `c8775b02` attempt `cde00335` | same, jar `dcfdc31` (anti-anchoring nudge) | 8 calls: source patch applied (432 chars), `create_file` rejected, first test patch rejected, re-read the test, test patch applied (509 chars), validation **PASSED**; the diff is the correct null guard plus `greetsNullNameAsGuest`; `changedFiles=2`, all criteria UNVERIFIED with empty evidence, two acceptance nudges did not help -> `NEEDS_INPUT`; 12 calls / 16m49s (finding 29) |
 | W7 `5e5b7731` attempt `bff28ad1` | same, jar `b3673c1` (concrete acceptance nudge) | 8 calls: `find_symbol`, two reads, a 891-char implicit-hunk rejection, a 972-char context rejection, an identical-resend rejection, a corrected 1,034-char patch applied, validation **PASSED**; criteria 2-3 PASSED with evidence, criterion 1 UNVERIFIED -> `NEEDS_INPUT`; 12 calls / 25m46s. Reviewer confirmation -> **COMPLETED**; exported 1,037-byte patch applied to a fresh `6187794` clone, `mvn -B -o test` 3/3 (finding 30) |
+| W8 `28a2fb5a` attempt `ddbc7275` | same, jar with the acceptance-evidence prompt, before the applied-patch fix | 17 calls: eight rejected patches, no change; baseline Maven PASSED 2/2, all criteria UNVERIFIED -> **FAILED** ("did not produce a repository change"); 22 model calls / 36m00s (finding 31) |
+| W8b `6ff90389` attempt `a03cdff8` | same | 15 calls: one source patch applied, eight rejected including the test patch; Maven PASSED 2/2 on the old suite, one changed file, all criteria UNVERIFIED and a blocking question -> **NEEDS_INPUT**; 20 model calls / 32m05s (finding 32) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
 validation; the remaining gap is the report's acceptance assessment (finding 24). W6 repeated it with
@@ -772,7 +825,10 @@ change in `NEEDS_INPUT` (finding 29). W7, with the concrete nudge, evidenced two
 the stored diff and validation were sound, so an explicit reviewer confirmation completed the task and
 the exported patch passed the suite outside the platform (finding 30). The human path is an audited
 fallback, not an automated completion, and the remaining automation gap is the local model's report
-discipline.
+discipline. W8 and W8b did not exercise the changed-test evidence guidance: W8 never applied a patch,
+and W8b never changed the test. W8 correctly failed an unchanged task; W8b correctly stayed
+`NEEDS_INPUT` with one source-only change and exposed the applied-patch reset fixed in `fa7c789`.
+Neither run was confirmed.
 
 ## Repository selection (the gate, in practice)
 
