@@ -88,8 +88,9 @@ open class DockerValidationRunner @Inject constructor(
         var timedOut = false
         val startedAt = System.nanoTime()
         try {
+            // `docker network create` and `docker run -d` print opaque 64-hex IDs on success; they
+            // are not validation evidence and would push Maven's verdict down the bounded details.
             val networkResult = commands.run(listOf("docker", "network", "create", "--internal", network), timeout = Duration.ofSeconds(30))
-            appendOutput(output, networkResult.output)
             checkCommand(networkResult, "Could not create private Docker network")
 
             val databaseResult = commands.run(
@@ -101,7 +102,6 @@ open class DockerValidationRunner @Inject constructor(
                 ),
                 timeout = Duration.ofMinutes(3)
             )
-            appendOutput(output, databaseResult.output)
             checkCommand(databaseResult, "Could not start temporary PostgreSQL container")
             waitForDatabase(database, output)
 

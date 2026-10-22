@@ -4,6 +4,7 @@ import dev.agentplatform.domain.model.CheckOutcome
 import dev.agentplatform.domain.port.CommandExecutor
 import dev.agentplatform.domain.port.CommandResult
 import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
@@ -218,6 +219,8 @@ class DockerValidationRunnerTest {
         assertEquals(0, result.exitCode)
         assertEquals(2, readyCalls.get())
         assertTrue(result.details!!.contains("Tests passed"))
+        assertFalse(result.details!!.contains("private-net"), result.details)
+        assertFalse(result.details!!.contains("postgres-id"), result.details)
         assertTrue(result.durationMillis!! >= 0)
     }
 
