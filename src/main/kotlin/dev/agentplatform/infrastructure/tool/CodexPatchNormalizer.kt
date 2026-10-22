@@ -12,9 +12,10 @@ import java.nio.file.Path
  * removed lines against the file on disk. When a hunk cannot be located exactly the normalizer fails
  * instead of guessing: a patch that cannot be placed is reported, never half-applied.
  *
- * Supported directives: `*** Add File:`, `*** Delete File:`, `*** Update File:`, `@@` hunks and the
- * `*** End of File` marker. `*** Move to:` is rejected: a move must be expressed as an add plus a
- * delete so it cannot silently rewrite a path the model did not name.
+ * Supported directives: `*** Add File:`, `*** Delete File:`, `*** Update File:`, `@@` hunk
+ * separators (the first hunk may start directly with content) and the `*** End of File` marker.
+ * `*** Move to:` is rejected: a move must be expressed as an add plus a delete so it cannot silently
+ * rewrite a path the model did not name.
  */
 class CodexPatchNormalizer {
 
@@ -115,7 +116,10 @@ class CodexPatchNormalizer {
     }
 
     private fun StringBuilder.appendUpdate(section: Update, workspace: Path) {
-        require(section.hunks.isNotEmpty()) { "Updated file '${section.path}' must contain at least one '@@' hunk" }
+        require(section.hunks.isNotEmpty()) {
+            "Updated file '${section.path}' must contain at least one hunk: an '@@' marker or " +
+                "context/change lines"
+        }
         val existing = readLines(workspace, section.path)
         val placed = mutableListOf<PlacedHunk>()
         var searchFrom = 0
@@ -242,9 +246,7 @@ class CodexPatchNormalizer {
     private fun Section.accept(raw: String) {
         when (this) {
             is Add -> lines += if (raw.startsWith("+")) raw.substring(1) else raw
-            is Update -> (hunks.lastOrNull() ?: throw IllegalArgumentException(
-                "Content line for '${path}' appears before its first '@@' hunk"
-            )).accept(raw)
+            is Update -> (hunks.lastOrNull() ?: Hunk().also { hunks += it }).accept(raw)
             is Delete -> throw IllegalArgumentException("'$DELETE' section for '${path}' must not contain content")
         }
     }

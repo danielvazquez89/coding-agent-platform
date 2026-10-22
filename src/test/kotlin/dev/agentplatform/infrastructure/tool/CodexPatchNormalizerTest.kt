@@ -71,6 +71,28 @@ class CodexPatchNormalizerTest {
     }
 
     @Test
+    fun `accepts an update section whose first hunk starts without an explicit marker`() {
+        Files.writeString(workspace.resolve("Hello.kt"), "package sample\n\nval greeting = \"old\"\n")
+
+        val diff = normalizer.normalize(
+            """
+            |*** Begin Patch
+            |*** Update File: Hello.kt
+            | package sample
+            |
+            |-val greeting = "old"
+            |+val greeting = "new"
+            |*** End Patch
+            |""".trimMargin(),
+            workspace
+        )
+
+        assertNotNull(diff)
+        apply(diff!!)
+        assertEquals("package sample\n\nval greeting = \"new\"\n", Files.readString(workspace.resolve("Hello.kt")))
+    }
+
+    @Test
     fun `adds and deletes files in one envelope`() {
         Files.writeString(workspace.resolve("Old.kt"), "one\ntwo\n")
 
@@ -190,6 +212,12 @@ class CodexPatchNormalizerTest {
         val noContext = "*** Begin Patch\n*** Update File: README.md\n@@\n+appended\n*** End Patch"
         assertTrue(
             assertThrows(IllegalArgumentException::class.java) { normalizer.normalize(noContext, workspace) }
+                .message.orEmpty().contains("ambiguous")
+        )
+
+        val implicitNoContext = "*** Begin Patch\n*** Update File: README.md\n+appended\n*** End Patch"
+        assertTrue(
+            assertThrows(IllegalArgumentException::class.java) { normalizer.normalize(implicitNoContext, workspace) }
                 .message.orEmpty().contains("ambiguous")
         )
     }
