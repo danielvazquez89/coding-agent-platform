@@ -607,6 +607,31 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   a claim: the no-change guard prevents `COMPLETED` here, but the report still marks a fabricated test
   `PASSED`.
 
+### 29. A correct, validated change is stranded by a report with no acceptance evidence
+
+- **Setup.** W6 (`c8775b02`, attempt `cde00335`) ran the same null-handling task with the jar that
+  includes the anti-anchoring nudge (`dcfdc31`), before the concrete acceptance-evidence nudge.
+- **What the model did.** Eight tool calls: `find_symbol(greet)`, read `Greeting.java:5-12`, a
+  **successful 432-character source patch**; a `create_file` attempt on the existing test was rejected;
+  a first test patch was rejected at `GreetingTest.java:11`; it read the test at lines 7-17 and sent a
+  **successful 509-character test patch**; `run_validation` **PASSED**.
+- **The diff is the requested change.** It adds `if (name == null) { return "Hello guest"; }` before the
+  blank check and a `greetsNullNameAsGuest` test that asserts `Greeting.greet(null)` returns
+  `"Hello guest"`. `changedFiles` contains both files; the stored diff is not truncated.
+- **The report blocked completion.** The narrative correctly described both changes, but
+  `acceptanceChecks` left all three criteria `UNVERIFIED` with empty evidence. The acceptance nudge
+  fired twice; the model repeated the empty report. The attempt ended `NEEDS_INPUT` with the synthetic
+  "Acceptance criteria were not verified" question after 12 model calls (16m22s of model time, 16m49s
+  total).
+- **What this shows.** The anti-anchoring nudge is consistent with the first run since W3 that applied a
+  patch and passed validation — including recovering from a rejected test patch after re-reading the
+  file — but one run is not a controlled comparison. The platform was right not to mark evidence-free
+  criteria `PASSED`, yet a correct validated change is now stranded: it cannot be exported because the
+  export policy requires `COMPLETED`, and a new attempt starts from a fresh workspace. The following
+  commit makes the acceptance nudge concrete (changed files, validation result, one example entry); if
+  a live run still cannot produce evidence, the next step is a human confirmation path rather than
+  trusting model prose.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -693,9 +718,12 @@ test exists, the suite passes).
 | W3 `05466bf5` attempt `374af846` | same, jar `9ef4ef5` (validation details without setup IDs) | 6 calls: read the source and test, applied a 568-character **test-only** patch (`greetsTrimmedName`), validation **PASSED**; both criteria PASSED with evidence -> **COMPLETED**. Export returned 200 (`text/x-patch`, 569 bytes); on a fresh clone `git apply --check` and `git apply` succeeded, and `mvn -B -o test` passed 3/3 outside the platform (finding 26) |
 | W4 `b4f1a8db` attempt `c1b3f59a` | same, jar `fa6513f` (before the failed-validation/no-change status rules) | 8 calls: read the source, a 436-character patch was rejected at line 7; the model resent the identical patch three times (duplicate guard) and re-read the file, then resent it again; baseline validation PASSED, `changedFiles=[]`, criterion 2 falsely PASSED with a claimed test, criteria 1/3 UNVERIFIED -> `NEEDS_INPUT` under the old rule; the new rule makes it `FAILED` (finding 27) |
 | W5 `74feed0b` attempt `141c76c0` | same, jar `3d9ce1b` (both status rules) | 5 calls: read the source and test, read the source again after a nudge, baseline validation PASSED; no patch was ever attempted, 4 prose turns (two five minutes long), 8 model calls / 19m05s; `changedFiles=[]`, criterion 2 falsely PASSED with a claimed test, criterion 3 PASSED on the baseline suite, criterion 1 UNVERIFIED -> **FAILED** ("The agent did not produce a repository change"), no synthetic question (finding 28) |
+| W6 `c8775b02` attempt `cde00335` | same, jar `dcfdc31` (anti-anchoring nudge) | 8 calls: source patch applied (432 chars), `create_file` rejected, first test patch rejected, re-read the test, test patch applied (509 chars), validation **PASSED**; the diff is the correct null guard plus `greetsNullNameAsGuest`; `changedFiles=2`, all criteria UNVERIFIED with empty evidence, two acceptance nudges did not help -> `NEEDS_INPUT`; 12 calls / 16m49s (finding 29) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
-validation; the remaining gap is the report's acceptance assessment (finding 24).
+validation; the remaining gap is the report's acceptance assessment (finding 24). W6 repeated it with
+the source and test change and a green suite, but an empty acceptance report stranded the validated
+change in `NEEDS_INPUT` (finding 29).
 
 ## Repository selection (the gate, in practice)
 
