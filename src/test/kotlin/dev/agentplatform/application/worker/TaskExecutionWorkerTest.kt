@@ -561,6 +561,16 @@ class TaskExecutionWorkerTest {
                 it.role == "user" && it.content.contains("does not assess every supplied acceptance criterion")
             }
         )
+        val nudge = provider.messages.single {
+            it.role == "user" && it.content.contains("does not assess every supplied acceptance criterion")
+        }
+        assertTrue(nudge.content.contains("changed files are src/main/Example.kt"), nudge.content)
+        assertTrue(nudge.content.contains("validation is Maven tests PASSED"), nudge.content)
+        assertTrue(nudge.content.contains("""{"criterion":"$criterion","outcome":"PASSED","evidence":"""), nudge.content)
+        assertTrue(
+            provider.messages.none { it.role == "assistant" && it.content == unverified },
+            provider.messages.filter { it.role == "assistant" }.joinToString(" | ") { it.content }
+        )
         val check = attempts.finishedReport!!.acceptanceChecks.single()
         assertEquals(AcceptanceOutcome.PASSED, check.outcome)
         assertTrue(check.evidence!!.contains("Maven tests passed"))

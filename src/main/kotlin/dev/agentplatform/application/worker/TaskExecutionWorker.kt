@@ -171,7 +171,7 @@ class TaskExecutionWorker @Inject constructor(
                 log.warnf(failure, "Task %s could not build a repository map; continuing without it", task.id)
                 ""
             }
-            val finalText = runModelLoop(task, workspace.root, validation, trace, repositoryMap)
+            val finalText = runModelLoop(task, workspace, validation, trace, repositoryMap)
             if (validation.isEmpty()) {
                 validation += executeAuditedTool(
                     "run_validation", objectMapper.createObjectNode(), workspace.root, trace
@@ -357,11 +357,12 @@ class TaskExecutionWorker @Inject constructor(
 
     private fun runModelLoop(
         task: CodingTask,
-        root: Path,
+        workspace: RepositoryWorkspace,
         validation: MutableList<ValidationCheck>,
         trace: ExecutionTrace,
         repositoryMap: String
     ): String {
+        val root = workspace.root
         val definitions = tools.definitions()
         val messages = mutableListOf(
             ModelMessage("system", systemPrompt(definitions.map { it.name })),
@@ -489,12 +490,27 @@ class TaskExecutionWorker @Inject constructor(
                     acceptanceFixRetries < MAX_ACCEPTANCE_FIX_RETRIES
                 ) {
                     acceptanceFixRetries++
-                    messages += ModelMessage("assistant", response)
+                    // The rejected report is not context: W6 repeated its empty acceptanceChecks
+                    // after each nudge, and replaying the report anchored it to the same shape.
+                    // Give the model the machine facts it can cite and a concrete JSON shape.
+                    val acceptanceValidation = validation.last()
+                    val changed = workspace.changedFiles()
+                    val exampleCriterion = unassessed.first().criterion.take(200).replace("\"", "'")
                     messages += ModelMessage(
                         "user",
-                        "Your patch applied and the last validation passed, but the report does not assess every supplied acceptance criterion with evidence: ${
-                            unassessed.joinToString("; ") { "'${it.criterion.take(200)}'" }
-                        }. The tool conversation already contains the change and the passing validation. Resend the same JSON report with exactly one acceptanceChecks entry per supplied criterion; mark a criterion PASSED only with concrete evidence (the changed file and line, a test name, or the validation result), or FAILED/UNVERIFIED with the reason. Do not claim a pass you cannot evidence."
+                        buildString {
+                            append("Your patch applied and the last validation passed, but the report does not assess every supplied acceptance criterion with evidence: ")
+                            append(unassessed.joinToString("; ") { "'${it.criterion.take(200)}'" })
+                            append(". The change is in the workspace: changed files are ")
+                            append(changed.joinToString(", "))
+                            append("; validation is ")
+                            append(acceptanceValidation.name)
+                            append(" ")
+                            append(acceptanceValidation.outcome)
+                            append(". Return a new single JSON object with summary, implementation, decisions, openQuestions and exactly one acceptanceChecks entry per supplied criterion, for example ")
+                            append("""{"criterion":"$exampleCriterion","outcome":"PASSED","evidence":"<changed file and line, a test name, or the validation result>"}""")
+                            append(". Mark a criterion PASSED only with concrete evidence from the tool results above; otherwise mark it FAILED or UNVERIFIED with the reason. Do not invent a file, test, or validation result, and do not resend the previous report unchanged.")
+                        }
                     )
                     return@repeat
                 }
