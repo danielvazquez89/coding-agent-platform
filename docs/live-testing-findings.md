@@ -582,6 +582,31 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   narrative as unverified and the reviewer sees the evidence, but a claim can still name a test that
   does not exist. A future check could cross-reference cited identifiers against the changed tree.
 
+### 28. The no-change rule holds live, but the model fabricates a test and never patches
+
+- **Setup.** W5 (`74feed0b`, attempt `141c76c0`) ran the same null-handling task on `small-java` with
+  the jar rebuilt after both status rules (`3d9ce1b`). Same model, context and Docker.
+- **What the model did.** Five tool calls: `find_symbol(greet)`, read `Greeting.java:7-12`, read
+  `GreetingTest.java`, read the source again after a nudge, then `run_validation` on the unchanged
+  tree (PASSED baseline). It **never attempted a patch**. It spent four turns writing prose, two of
+  them five minutes long, and produced a final report after 8 model calls (18m42s of model time,
+  19m05s total).
+- **The report.** `changedFiles=[]`, `patchDiff=null`. The narrative still claimed `Greeting.greet` was
+  changed and `greetsNullNameAsGuest` was added to `GreetingTest`. Criterion 1 was `UNVERIFIED`;
+  criterion 2 was `PASSED` citing the non-existent test; criterion 3 was `PASSED` citing the baseline
+  suite. The last two are false as evidence of the claimed change.
+- **The outcome.** `FAILED` with "The agent did not produce a repository change", and **no** synthetic
+  acceptance question (`openQuestions=0`). This is the first live verification of the no-change
+  precedence: the old rules would have returned `NEEDS_INPUT` with "Acceptance criteria could not be
+  verified".
+- **What this shows.** The status rule works, but the nudge did not: after the first prose turn the
+  worker said "call read_file ... then apply_patch", and the model read the same source again. The
+  worker also replayed each rejected report as assistant context, anchoring the next turn to repeat
+  the claim. The nudge change committed after this run removes the replayed report and tells the model
+  not to re-read an already-read file; W6 tests that change. The model's acceptance evidence remains
+  a claim: the no-change guard prevents `COMPLETED` here, but the report still marks a fabricated test
+  `PASSED`.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -667,6 +692,7 @@ test exists, the suite passes).
 | W2 `165b5c36` attempt `c7ef6bf2` | same, jar with the acceptance nudge (`93b973e`) | 6 calls: baseline validation before any change (the premature-final nudge corrected that), then a test-only 618-character patch and a **failed** validation (the source still NPEs); two validation nudges produced two 0-call prose turns of 5+ minutes instead of a source fix; `NEEDS_INPUT`, test-only change, all criteria UNVERIFIED, export 409 (finding 25) |
 | W3 `05466bf5` attempt `374af846` | same, jar `9ef4ef5` (validation details without setup IDs) | 6 calls: read the source and test, applied a 568-character **test-only** patch (`greetsTrimmedName`), validation **PASSED**; both criteria PASSED with evidence -> **COMPLETED**. Export returned 200 (`text/x-patch`, 569 bytes); on a fresh clone `git apply --check` and `git apply` succeeded, and `mvn -B -o test` passed 3/3 outside the platform (finding 26) |
 | W4 `b4f1a8db` attempt `c1b3f59a` | same, jar `fa6513f` (before the failed-validation/no-change status rules) | 8 calls: read the source, a 436-character patch was rejected at line 7; the model resent the identical patch three times (duplicate guard) and re-read the file, then resent it again; baseline validation PASSED, `changedFiles=[]`, criterion 2 falsely PASSED with a claimed test, criteria 1/3 UNVERIFIED -> `NEEDS_INPUT` under the old rule; the new rule makes it `FAILED` (finding 27) |
+| W5 `74feed0b` attempt `141c76c0` | same, jar `3d9ce1b` (both status rules) | 5 calls: read the source and test, read the source again after a nudge, baseline validation PASSED; no patch was ever attempted, 4 prose turns (two five minutes long), 8 model calls / 19m05s; `changedFiles=[]`, criterion 2 falsely PASSED with a claimed test, criterion 3 PASSED on the baseline suite, criterion 1 UNVERIFIED -> **FAILED** ("The agent did not produce a repository change"), no synthetic question (finding 28) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
 validation; the remaining gap is the report's acceptance assessment (finding 24).
