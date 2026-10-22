@@ -744,11 +744,33 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   patch` applies a source patch, rejects a test patch, then returns a report claiming both criteria
   passed against a passing validation. It asserts `NEEDS_INPUT`, all criteria still `PASSED` in the
   stored model assessment, one recorded patch failure, and an unchanged test file. The earlier
-  `keeps an applied patch when a later patch is rejected` test now expects `NEEDS_INPUT` while keeping
-  its no-false-no-patch-nudge assertion. The failure-then-success tests still complete.
+  `keeps an applied patch but blocks completion when a later patch stays rejected` test now expects
+  `NEEDS_INPUT` while keeping its no-false-no-patch-nudge assertion. The failure-then-success tests
+  still complete.
 - **What this shows.** The report field was not a status input; the guard prevents a false completion
   even when the model's narrative is confident. This is a code-review finding from W8b, not a new live
   run: W8b remains unconfirmed `NEEDS_INPUT`.
+
+### 34. A created file is a workspace change, not a missing patch
+
+- **The gap.** The worker's changed-workspace fact (formerly `patchApplied`) was set only by a
+  successful `apply_patch`. A successful `create_file` changed the tree but did not count: the worker
+  could tell the model it had not changed the workspace and could skip the pre-final validation that a
+  patch triggers. The message also named only `apply_patch`, so a model that legitimately created a new
+  file was pushed toward a redundant patch.
+- **Fix.** A successful `create_file` now sets the workspace-changed fact and invalidates earlier
+  validation, just like a successful patch. Validation runs before a final report is accepted. The
+  nudge says "you have not changed the workspace" and names both `create_file` (new files) and
+  `apply_patch` (existing files).
+- **Regression coverage.** `treats a created file as a workspace change` runs validation, creates
+  `NewTest.java`, returns a final report, and asserts the file exists, the task completes, validation
+  passed again (`run_validation`, `create_file`, `run_validation`), and no no-change nudge was sent.
+  The applied-patch tests still assert that a later rejected patch does not reset the
+  workspace-changed fact.
+- **What this shows.** This is a code-review finding from the `create_file` path W6 exercised (its
+  attempt was rejected because the test file already existed); no live run has completed a
+  create-only change. The check covers successful creation, not a failed `create_file` after another
+  change; whether that failure should also be treated as unresolved remains a separate question.
 
 ## Where this stands after the real-repository runs
 

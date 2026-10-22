@@ -391,7 +391,7 @@ class TaskExecutionWorkerTest {
         assertEquals(1, attempts.finishedReport!!.patchFailures.size)
         assertTrue(attempts.finishedReport!!.implementation.contains("Patch application still failed"))
         assertTrue(
-            provider.messages.none { it.role == "user" && it.content.contains("you have not applied a patch") },
+            provider.messages.none { it.role == "user" && it.content.contains("you have not changed the workspace") },
             provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
         )
         // The nudge still clears its one-shot state, so one rejected patch earns one correction
@@ -457,7 +457,41 @@ class TaskExecutionWorkerTest {
         assertEquals("Hello guest\n", Files.readString(temporary.resolve("Greeting.java")))
         assertEquals("class GreetingTest {}\n", Files.readString(temporary.resolve("GreetingTest.java")))
         assertTrue(
-            provider.messages.none { it.role == "user" && it.content.contains("you have not applied a patch") },
+            provider.messages.none { it.role == "user" && it.content.contains("you have not changed the workspace") },
+            provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
+        )
+    }
+
+    @Test
+    fun `treats a created file as a workspace change`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("run_validation", "{}")), "tool_calls", null, null),
+            ModelTurn(
+                null,
+                listOf(call("create_file", """{"path":"NewTest.java","content":"class NewTest {}\n"}""")),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                """{"summary":"Added a test","implementation":"Created NewTest.java."}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("NewTest.java"))).execute(task.id)
+
+        assertEquals("class NewTest {}\n", Files.readString(temporary.resolve("NewTest.java")))
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(AttemptStatus.COMPLETED, attempts.finished?.status)
+        val report = attempts.finishedReport!!
+        assertEquals(CheckOutcome.PASSED, report.validation.single().outcome)
+        assertEquals(
+            listOf("run_validation", "create_file", "run_validation"),
+            report.toolExecutions.map { it.toolName }
+        )
+        assertTrue(
+            provider.messages.none { it.role == "user" && it.content.contains("you have not changed the workspace") },
             provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
         )
     }

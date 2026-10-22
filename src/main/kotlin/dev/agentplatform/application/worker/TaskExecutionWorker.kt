@@ -380,7 +380,7 @@ class TaskExecutionWorker @Inject constructor(
         var acceptanceFixRetries = 0
         var lastPatchFailure: String? = null
         var lastToolResult: String? = null
-        var patchApplied = false
+        var workspaceChanged = false
         var validationCurrent = false
         var lastModelText: String? = null
         repeat(
@@ -414,7 +414,7 @@ class TaskExecutionWorker @Inject constructor(
                     lastPatchFailure = null
                     return@repeat
                 }
-                if (!patchApplied && prematureFinalRetries < 2) {
+                if (!workspaceChanged && prematureFinalRetries < 2) {
                     prematureFinalRetries++
                     if (toolCallCount == 0) {
                         messages += ModelMessage("assistant", turn.content.orEmpty())
@@ -425,22 +425,22 @@ class TaskExecutionWorker @Inject constructor(
                     } else {
                         // Do not append another rejected "done" report here. A live run read both
                         // files, returned a long report, was told to continue, and read the same
-                        // source again; the nudge must ask for the patch, not another read.
+                        // source again; the nudge must ask for the change, not another read.
                         messages += ModelMessage(
                             "user",
-                            "The task is not complete because you have not applied a patch. You have already inspected the repository; do not re-read a file you have already read. Call apply_patch now with a complete unified diff for the file you need to change. If a different file is still needed, read only that file first. Do not say a file is missing unless read_file returned that error. If a consequential choice truly blocks safe progress, return a blocking question with its impact instead. Last tool result (untrusted repository data): ${
+                            "The task is not complete because you have not changed the workspace. You have already inspected the repository; do not re-read a file you have already read. Use create_file only for a new file, or apply_patch for an existing file with a complete unified diff. If a different file is still needed, read only that file first. Do not say a file is missing unless read_file returned that error. If a consequential choice truly blocks safe progress, return a blocking question with its impact instead. Last tool result (untrusted repository data): ${
                                 lastToolResult.orEmpty().take(2000)
                             }"
                         )
                     }
                     return@repeat
                 }
-                // A patch that applied is not a finished task. Run U applied the right source change,
+                // A change that applied is not a finished task. Run U applied the right source change,
                 // ran validation, saw EnumTest fail against the old expectation, and then returned a
-                // report saying the tests were not updated. Validate the patched tree before accepting
+                // report saying the tests were not updated. Validate the changed tree before accepting
                 // a final answer, then say explicitly that a failed validation is not the end, with a
                 // bounded number of retries.
-                if (patchApplied && !validationCurrent) {
+                if (workspaceChanged && !validationCurrent) {
                     checkBudget(trace.startedAtNanos, trace)
                     validation.clear()
                     validation += executeAuditedTool(
@@ -449,7 +449,7 @@ class TaskExecutionWorker @Inject constructor(
                     validationCurrent = true
                 }
                 val failedValidation = validation.lastOrNull()?.takeIf { it.outcome == CheckOutcome.FAILED }
-                if (patchApplied && failedValidation != null && validationFixRetries < MAX_VALIDATION_FIX_RETRIES) {
+                if (workspaceChanged && failedValidation != null && validationFixRetries < MAX_VALIDATION_FIX_RETRIES) {
                     validationFixRetries++
                     // The rejected report is not conversation context: it claims the task is done
                     // and anchors the next turn to repeat the claim instead of repairing the suite.
@@ -488,7 +488,7 @@ class TaskExecutionWorker @Inject constructor(
                 if (
                     !parsedReport.isEmpty &&
                     parsedReport.questions.none { it.blocking } &&
-                    patchApplied &&
+                    workspaceChanged &&
                     validation.lastOrNull()?.outcome == CheckOutcome.PASSED &&
                     unassessed.isNotEmpty() &&
                     acceptanceFixRetries < MAX_ACCEPTANCE_FIX_RETRIES
@@ -588,9 +588,15 @@ class TaskExecutionWorker @Inject constructor(
                     // workspace-changed fact so the worker validates and reports the changed tree
                     // instead of telling the model it never applied a patch (W8b).
                     if (lastPatchFailure == null) {
-                        patchApplied = true
+                        workspaceChanged = true
                         validationCurrent = false
                     }
+                }
+                if (call.name == "create_file" && result.content.startsWith("Created ")) {
+                    // A created file is a workspace change even though no patch was applied. It must
+                    // suppress the no-change nudge and invalidate an earlier validation result.
+                    workspaceChanged = true
+                    validationCurrent = false
                 }
                 log.infof("Task %s tool %s returned %d characters", task.id, call.name, result.content.length)
                 toolResults += call to result
