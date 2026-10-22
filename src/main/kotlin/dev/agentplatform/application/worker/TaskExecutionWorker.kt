@@ -206,7 +206,7 @@ class TaskExecutionWorker @Inject constructor(
                     acceptanceChecks.any { it.outcome == AcceptanceOutcome.UNVERIFIED } &&
                     blockingQuestions.isEmpty() ->
                     modelQuestions + AgentQuestion(
-                        "Acceptance criteria were not verified",
+                        UNVERIFIED_ACCEPTANCE_QUESTION,
                         acceptanceChecks.filter { it.outcome == AcceptanceOutcome.UNVERIFIED }
                             .joinToString("; ") { it.criterion },
                         true

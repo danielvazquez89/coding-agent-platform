@@ -12,7 +12,9 @@
     .layout { align-items: flex-start; }
     aside { flex: 0 0 280px; }
     main { flex: 1; min-width: 0; }
-    button, textarea { font: inherit; }
+    button, textarea, input { font: inherit; }
+    label { display: block; margin-top: 8px; }
+    input { box-sizing: border-box; width: 100%; }
     button { cursor: pointer; }
     .task-list { display: grid; gap: 8px; }
     .task-list button { padding: 10px; text-align: left; }
@@ -34,7 +36,7 @@
     <h1>Coding Agent Review</h1>
     <button id="refresh" type="button">Refresh tasks</button>
   </header>
-  <p class="muted">Review task reports, validation evidence, diffs, and draft pull requests. This page does not approve or merge PRs.</p>
+  <p class="muted">Review task reports, validation evidence, diffs, and draft pull requests. This page does not merge PRs; it can record a human confirmation for a validated attempt.</p>
   <div id="message" role="status" aria-live="polite"></div>
   <div class="layout">
     <aside>
@@ -133,14 +135,29 @@
           }
           if (report?.patchDiff) {
             const truncated = report.patchDiffTruncated === true;
-            detailsElement.append(section(
+            const patchPanel = section(
               truncated
                 ? "Patch diff (truncated — larger than the stored limit, not appliable; use the draft pull request)"
                 : "Patch diff",
               report.patchDiff
-            ));
+            );
+            if (!truncated && task.status === "COMPLETED") {
+              const link = document.createElement("a");
+              link.href = `/api/tasks/${id}/attempts/${latest.id}/patch`;
+              link.download = `task-${id}.patch`;
+              link.textContent = "Download patch";
+              patchPanel.append(link);
+            }
+            detailsElement.append(patchPanel);
           }
           if (report?.validation) detailsElement.append(section("Validation", report.validation));
+          if (report?.review) {
+            detailsElement.append(section("Human confirmation", {
+              reviewer: report.review.reviewer,
+              confirmedAt: report.review.confirmedAt,
+              evidence: report.review.evidence
+            }));
+          }
           if (toolEvents.length) detailsElement.append(section("Tool execution audit", toolEvents));
           if (report?.pullRequestError) detailsElement.append(section("Pull-request publication error", report.pullRequestError));
         }
@@ -181,14 +198,58 @@
                 method: "POST",
                 body: JSON.stringify({ answer: answer.value })
               });
-              messageElement.textContent = "Clarification saved; task queued for another attempt.";
               await loadTasks(id);
+              messageElement.textContent = "Clarification saved; task queued for another attempt.";
             } catch (error) {
               messageElement.textContent = error.message;
               submit.disabled = false;
             }
           });
           detailsElement.append(form);
+
+          if (latest && latest.status === "NEEDS_INPUT") {
+            const confirmation = document.createElement("form");
+            confirmation.className = "panel needs-input";
+            const heading = document.createElement("h3");
+            heading.textContent = "Confirm acceptance of the existing attempt";
+            const note = document.createElement("p");
+            note.textContent = "Only confirm after reviewing the diff and validation above. This records your human assessment; it does not merge a pull request. The server rejects confirmation if the attempt has no change, missing or failed validation, a truncated diff, a failed criterion, or a blocking agent question.";
+            const reviewerLabel = document.createElement("label");
+            reviewerLabel.textContent = "Reviewer";
+            reviewerLabel.htmlFor = "confirmation-reviewer";
+            const reviewer = document.createElement("input");
+            reviewer.id = "confirmation-reviewer";
+            reviewer.maxLength = 100;
+            reviewer.placeholder = "Your name";
+            const evidenceLabel = document.createElement("label");
+            evidenceLabel.textContent = "Evidence";
+            evidenceLabel.htmlFor = "confirmation-evidence";
+            const evidence = document.createElement("textarea");
+            evidence.id = "confirmation-evidence";
+            evidence.required = true;
+            evidence.maxLength = 2000;
+            evidence.placeholder = "What did you verify? Cite the diff, test, or validation result.";
+            const confirm = document.createElement("button");
+            confirm.type = "submit";
+            confirm.textContent = "Confirm and complete";
+            confirmation.append(heading, note, reviewerLabel, reviewer, evidenceLabel, evidence, confirm);
+            confirmation.addEventListener("submit", async event => {
+              event.preventDefault();
+              confirm.disabled = true;
+              try {
+                await api(`/api/tasks/${id}/attempts/${latest.id}/confirm`, {
+                  method: "POST",
+                  body: JSON.stringify({ reviewer: reviewer.value, evidence: evidence.value })
+                });
+                await loadTasks(id);
+                messageElement.textContent = "Acceptance confirmed; task completed. The patch is now exportable.";
+              } catch (error) {
+                messageElement.textContent = error.message;
+                confirm.disabled = false;
+              }
+            });
+            detailsElement.append(confirmation);
+          }
         } else if (task.status === "FAILED" || task.status === "CANCELLED") {
           const form = document.createElement("form");
           form.className = "panel";

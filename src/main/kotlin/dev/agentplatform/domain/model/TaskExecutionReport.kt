@@ -1,5 +1,10 @@
 package dev.agentplatform.domain.model
 
+import java.time.Instant
+
+/** The platform's synthetic question for an attempt whose criteria could not be evidenced. */
+const val UNVERIFIED_ACCEPTANCE_QUESTION = "Acceptance criteria were not verified"
+
 data class AgentDecision(
     val topic: String,
     val choice: String,
@@ -30,6 +35,17 @@ data class AcceptanceCheck(
     val criterion: String,
     val outcome: AcceptanceOutcome,
     val evidence: String? = null
+)
+
+/**
+ * A human's explicit acceptance of an attempt whose machine checks passed but whose model report
+ * left one or more criteria unverified. The reviewer and evidence are stored in the report so the
+ * completion can be audited; the model's original acceptance checks are kept separately.
+ */
+data class HumanReview(
+    val reviewer: String,
+    val evidence: String,
+    val confirmedAt: Instant
 )
 
 data class ModelUsage(
@@ -84,5 +100,12 @@ data class TaskExecutionReport(
     val maxEstimatedCostUsd: Double? = null,
     val executionBudgetExceeded: String? = null,
     val totalTaskExecutionDurationMillis: Long? = null,
-    val totalEstimatedCostUsd: Double? = null
+    val totalEstimatedCostUsd: Double? = null,
+    /**
+     * Set only when a human confirmed the acceptance criteria after reviewing a validated attempt.
+     * The top-level [acceptanceChecks] then carry the human evidence; the model's original checks
+     * are preserved in [modelAcceptanceChecks].
+     */
+    val review: HumanReview? = null,
+    val modelAcceptanceChecks: List<AcceptanceCheck>? = null
 )

@@ -20,6 +20,15 @@ data class TransitionTaskRequest(
 
 data class AnswerTaskRequest(val answer: String)
 
+/**
+ * A human reviewer's explicit acceptance of a validated attempt that ended NEEDS_INPUT. The
+ * evidence is stored on every confirmed criterion and in the report's review object.
+ */
+data class ConfirmAttemptRequest(
+    val evidence: String,
+    val reviewer: String? = null
+)
+
 data class TaskStatusTransitionResponse(
     val sequenceNumber: Int,
     val taskId: UUID,

@@ -2,14 +2,17 @@ package dev.agentplatform.application.service
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.agentplatform.api.dto.TaskAttemptResponse
+import dev.agentplatform.domain.model.AcceptanceCheck
 import dev.agentplatform.domain.model.AcceptanceOutcome
 import dev.agentplatform.domain.model.AttemptStatus
 import dev.agentplatform.domain.model.CheckOutcome
+import dev.agentplatform.domain.model.HumanReview
 import dev.agentplatform.domain.model.TaskAttempt
 import dev.agentplatform.domain.model.TaskExecutionReport
 import dev.agentplatform.domain.model.TaskStatus
 import dev.agentplatform.domain.model.ToolExecutionAudit
 import dev.agentplatform.domain.model.ToolExecutionEvent
+import dev.agentplatform.domain.model.UNVERIFIED_ACCEPTANCE_QUESTION
 import dev.agentplatform.domain.port.AttemptOperations
 import dev.agentplatform.domain.port.TaskBudgetUsage
 import dev.agentplatform.infrastructure.persistence.TaskAttemptRepository
@@ -25,7 +28,8 @@ class TaskAttemptService(
     private val taskRepository: TaskRepository,
     private val attemptRepository: TaskAttemptRepository,
     private val toolExecutionEventRepository: ToolExecutionEventRepository,
-    private val objectMapper: ObjectMapper
+    private val objectMapper: ObjectMapper,
+    private val taskService: TaskService
 ) : AttemptOperations {
     @Transactional
     override fun priorBudgetUsage(taskId: UUID): TaskBudgetUsage {
@@ -158,6 +162,84 @@ class TaskAttemptService(
     }
 
     /**
+     * Completes a NEEDS_INPUT attempt after a human reviewed the stored diff and validation and
+     * explicitly confirmed the acceptance criteria. Machine checks are not bypassed: the attempt
+     * must have changed files, every supported validation check must have passed, the stored diff
+     * must be complete, no criterion may have been reported FAILED, and no model blocking question
+     * may remain. The top-level acceptance checks become the human's evidence; the model's original
+     * checks are kept under `modelAcceptanceChecks` for audit.
+     *
+     * Returns null when the task or attempt does not exist. Throws [IllegalStateException] when the
+     * attempt is not eligible, which the API surfaces as HTTP 409.
+     */
+    @Transactional
+    fun confirmAcceptance(
+        taskId: UUID,
+        attemptId: UUID,
+        evidence: String,
+        reviewer: String?
+    ): TaskAttemptResponse? {
+        val normalizedEvidence = evidence.trim()
+        require(normalizedEvidence.isNotEmpty()) { "evidence must not be blank" }
+        require(normalizedEvidence.length <= MAX_CONFIRMATION_EVIDENCE_LENGTH) {
+            "evidence must be $MAX_CONFIRMATION_EVIDENCE_LENGTH characters or fewer"
+        }
+        val normalizedReviewer = (reviewer?.trim()?.takeIf(String::isNotEmpty) ?: "operator")
+            .take(MAX_REVIEWER_LENGTH)
+
+        val task = taskRepository.findById(taskId) ?: return null
+        val attempt = attemptRepository.findForUpdate(attemptId)?.takeIf { it.taskId == taskId }
+            ?: return null
+        check(attempt.status == AttemptStatus.NEEDS_INPUT) {
+            "Attempt $attemptId is ${attempt.status}; only a NEEDS_INPUT attempt can be confirmed"
+        }
+        check(task.status == TaskStatus.NEEDS_INPUT) {
+            "Task $taskId is ${task.status}; only a NEEDS_INPUT task can be confirmed"
+        }
+        val report = attempt.reportJson?.let { objectMapper.readValue(it, TaskExecutionReport::class.java) }
+            ?: throw IllegalStateException("Attempt $attemptId has no execution report to confirm")
+        check(report.changedFiles.isNotEmpty()) {
+            "Attempt $attemptId did not change any files; there is nothing to confirm"
+        }
+        check(report.validation.isNotEmpty()) {
+            "Attempt $attemptId has no validation checks; a patch cannot be confirmed without them"
+        }
+        check(report.validation.all { it.outcome == CheckOutcome.PASSED }) {
+            "Every validation check must have passed before a human can confirm the attempt"
+        }
+        check(!report.patchDiff.isNullOrBlank()) {
+            "Attempt $attemptId has no patch diff to confirm"
+        }
+        check(!report.patchDiffTruncated) {
+            "Attempt $attemptId produced a truncated patch diff, so it cannot be confirmed for local " +
+                "application; use the stored report or retry the task"
+        }
+        check(report.acceptanceChecks.none { it.outcome == AcceptanceOutcome.FAILED }) {
+            "One or more acceptance criteria were reported as not met; retry the task instead"
+        }
+        check(report.openQuestions.none { it.blocking && it.question != UNVERIFIED_ACCEPTANCE_QUESTION }) {
+            "The attempt has a blocking question; answer it instead of confirming acceptance"
+        }
+
+        val humanEvidence = "Human confirmation: $normalizedEvidence"
+        val confirmed = report.copy(
+            acceptanceChecks = task.acceptanceCriteria.map {
+                AcceptanceCheck(it, AcceptanceOutcome.PASSED, humanEvidence)
+            },
+            modelAcceptanceChecks = report.acceptanceChecks,
+            openQuestions = report.openQuestions.filterNot { it.question == UNVERIFIED_ACCEPTANCE_QUESTION },
+            review = HumanReview(normalizedReviewer, normalizedEvidence, Instant.now())
+        )
+        attempt.status = AttemptStatus.COMPLETED
+        attempt.errorSummary = null
+        attempt.reportJson = objectMapper.writeValueAsString(confirmed)
+        attemptRepository.flush()
+
+        taskService.completeAfterReview(taskId, normalizedReviewer, normalizedEvidence)
+        return toResponse(attempt)
+    }
+
+    /**
      * Returns the patch diff an attempt produced when it is safe to apply locally, or null when the
      * task or attempt does not exist. The "safe to export" rules live here (not in a client) so every
      * consumer is guarded identically: the task and attempt must be COMPLETED, every validation check
@@ -232,4 +314,9 @@ class TaskAttemptService(
         errorSummary = attempt.errorSummary,
         report = attempt.reportJson?.let(objectMapper::readTree)
     )
+
+    private companion object {
+        const val MAX_CONFIRMATION_EVIDENCE_LENGTH = 2000
+        const val MAX_REVIEWER_LENGTH = 100
+    }
 }

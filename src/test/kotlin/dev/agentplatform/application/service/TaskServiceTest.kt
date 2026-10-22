@@ -142,6 +142,41 @@ class TaskServiceTest {
     }
 
     @Test
+    fun `a human can complete a needs-input task after reviewing the attempt`() {
+        val task = taskService.create(CreateTaskRequest("Review", "Confirm the validated change"))
+        taskService.transition(task.id, TaskStatus.RUNNING, null)
+        taskService.transition(task.id, TaskStatus.NEEDS_INPUT, "Acceptance criteria could not be verified")
+
+        val completed = taskService.completeAfterReview(
+            task.id,
+            "Daniel",
+            "Reviewed the stored diff and the passing Maven result"
+        )
+
+        assertEquals(TaskStatus.COMPLETED, completed.status)
+        assertEquals(TaskStatus.COMPLETED, taskService.findById(task.id)!!.status)
+        val history = taskService.history(task.id).last()
+        assertEquals(TaskStatus.NEEDS_INPUT, history.fromStatus)
+        assertEquals(TaskStatus.COMPLETED, history.toStatus)
+        assertEquals("REVIEWER", history.actor)
+        assertTrue(history.reason!!.contains("Daniel"))
+        assertTrue(history.reason!!.contains("Reviewed the stored diff"))
+    }
+
+    @Test
+    fun `human review completion requires an existing needs-input task`() {
+        assertThrows(IllegalStateException::class.java) {
+            taskService.completeAfterReview(UUID.randomUUID(), "Daniel", "Reviewed the diff")
+        }
+
+        val queued = taskService.create(CreateTaskRequest("Queued", "Not ready for review"))
+        assertThrows(IllegalStateException::class.java) {
+            taskService.completeAfterReview(queued.id, "Daniel", "Reviewed the diff")
+        }
+        assertEquals(TaskStatus.QUEUED, taskService.findById(queued.id)!!.status)
+    }
+
+    @Test
     fun `worker claims queued tasks once and records the worker transition`() {
         taskService.findAll().filter { it.status == TaskStatus.QUEUED }
             .forEach { taskService.transition(it.id, TaskStatus.CANCELLED, "test cleanup") }

@@ -109,6 +109,42 @@ class TaskResource @Inject constructor(
     ): TaskAttemptResponse = attemptService.find(id, attemptId)
         ?: throw NotFoundException("Attempt $attemptId was not found for task $id")
 
+    /**
+     * Completes an attempt that ended NEEDS_INPUT after a human reviewed its diff and validation and
+     * explicitly confirmed the criteria the model left unverified. The server still enforces the
+     * machine checks (changed files, all validation passed, a complete diff, no failed criterion and
+     * no blocking model question); this endpoint records the human decision, it does not bypass them.
+     */
+    @POST
+    @Path("/{id}/attempts/{attemptId}/confirm")
+    fun confirm(
+        @PathParam("id") id: UUID,
+        @PathParam("attemptId") attemptId: UUID,
+        request: ConfirmAttemptRequest
+    ): Response {
+        if ((request.reviewer?.trim()?.length ?: 0) > MAX_REVIEWER_LENGTH) {
+            return Response.status(Response.Status.BAD_REQUEST)
+                .type(MediaType.APPLICATION_JSON)
+                .entity(ApiError("reviewer must be $MAX_REVIEWER_LENGTH characters or fewer"))
+                .build()
+        }
+        return try {
+            val attempt = attemptService.confirmAcceptance(id, attemptId, request.evidence, request.reviewer)
+                ?: throw NotFoundException("Attempt $attemptId was not found for task $id")
+            Response.ok(attempt).build()
+        } catch (failure: IllegalArgumentException) {
+            Response.status(Response.Status.BAD_REQUEST)
+                .type(MediaType.APPLICATION_JSON)
+                .entity(ApiError(failure.message ?: "The confirmation request is invalid"))
+                .build()
+        } catch (failure: IllegalStateException) {
+            Response.status(Response.Status.CONFLICT)
+                .type(MediaType.APPLICATION_JSON)
+                .entity(ApiError(failure.message ?: "Attempt $attemptId cannot be confirmed"))
+                .build()
+        }
+    }
+
     @GET
     @Path("/{id}/attempts/{attemptId}/patch")
     @Produces(PATCH_MEDIA_TYPE)
@@ -146,6 +182,7 @@ class TaskResource @Inject constructor(
         const val MAX_ACCEPTANCE_CRITERIA = 30
         const val MAX_ACCEPTANCE_CRITERION_LENGTH = 1000
         const val MAX_ANSWER_LENGTH = 5000
+        const val MAX_REVIEWER_LENGTH = 100
         const val PATCH_MEDIA_TYPE = "text/x-patch"
     }
 }

@@ -125,6 +125,23 @@ class TaskService(
 
     fun findAll(): List<CodingTask> = taskRepository.listNewestFirst()
 
+    /**
+     * Completes a NEEDS_INPUT task after a human reviewed the stored diff and validation and
+     * explicitly confirmed the acceptance criteria. The attempt report and evidence are updated by
+     * the caller; this transition is recorded with actor REVIEWER so the manual decision is
+     * distinguishable from a worker completion.
+     */
+    @Transactional
+    fun completeAfterReview(id: UUID, reviewer: String, evidence: String): CodingTask {
+        val task = taskRepository.findForUpdate(id)
+            ?: throw IllegalStateException("Task $id was not found")
+        check(task.status == TaskStatus.NEEDS_INPUT) {
+            "Task $id is ${task.status}; only a NEEDS_INPUT task can be confirmed by a human"
+        }
+        val reason = "Acceptance confirmed by ${reviewer.take(MAX_REVIEWER_LENGTH)}: ${evidence.take(MAX_CONFIRMATION_EVIDENCE_IN_REASON)}"
+        return recordTransition(task, TaskStatus.COMPLETED, reason, "REVIEWER")
+    }
+
     override fun findById(id: UUID): CodingTask? = taskRepository.findById(id)
 
     @Transactional
@@ -190,6 +207,8 @@ class TaskService(
     private companion object {
         const val MAX_ANSWER_LENGTH = 5000
         const val MAX_DESCRIPTION_LENGTH = 50_000
+        const val MAX_REVIEWER_LENGTH = 100
+        const val MAX_CONFIRMATION_EVIDENCE_IN_REASON = 500
         const val CLARIFICATION_MARKER = "\n\nUser clarification:\n"
     }
 }

@@ -7,7 +7,8 @@ object TaskLifecycle {
         TaskStatus.VALIDATING to setOf(TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.NEEDS_INPUT, TaskStatus.CANCELLED),
         TaskStatus.COMPLETED to emptySet(),
         TaskStatus.FAILED to emptySet(),
-        TaskStatus.NEEDS_INPUT to setOf(TaskStatus.QUEUED),
+        // A reviewer can answer and requeue, or confirm an already validated change and complete it.
+        TaskStatus.NEEDS_INPUT to setOf(TaskStatus.QUEUED, TaskStatus.COMPLETED),
         TaskStatus.CANCELLED to emptySet()
     )
 

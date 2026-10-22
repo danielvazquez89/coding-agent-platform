@@ -317,6 +317,8 @@ class TaskAttemptTest {
         assertEquals(emptyList<String>(), CreateTaskRequest("Title", "Description").acceptanceCriteria)
         assertNull(TransitionTaskRequest(TaskStatus.QUEUED).reason)
         assertEquals(emptyList<AgentDecision>(), TaskExecutionReport("Summary", "Implementation").decisions)
+        assertNull(TaskExecutionReport("Summary", "Implementation").review)
+        assertNull(TaskExecutionReport("Summary", "Implementation").modelAcceptanceChecks)
         assertEquals(emptyList<String>(), AgentDecision("Topic", "Choice", "Reason").alternatives)
         assertNull(ValidationCheck("Tests", outcome = CheckOutcome.SKIPPED).command)
     }
@@ -425,6 +427,240 @@ class TaskAttemptTest {
             validReport.copy(acceptanceChecks = listOf(AcceptanceCheck(criterion, AcceptanceOutcome.PASSED, " "))),
             "has no evidence"
         )
+    }
+
+    @Test
+    fun `a human can confirm a validated needs-input attempt and export its patch`() {
+        val criteria = listOf("Null returns guest", "Test covers null")
+        val report = needsInputReport(criteria)
+        val (taskId, attemptId) = needsInputAttempt(criteria, report)
+        val evidence =
+            "Reviewed the diff: the null guard returns Hello guest and greetsNullNameAsGuest asserts it; Maven tests passed."
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("reviewer" to "Daniel", "evidence" to evidence))
+            .`when`().post("/api/tasks/$taskId/attempts/$attemptId/confirm")
+            .then()
+            .statusCode(200)
+            .body("status", equalTo("COMPLETED"))
+            .body("report.acceptanceChecks.size()", equalTo(2))
+            .body("report.acceptanceChecks[0].outcome", equalTo("PASSED"))
+            .body("report.acceptanceChecks[0].evidence", equalTo("Human confirmation: $evidence"))
+            .body("report.acceptanceChecks[1].evidence", equalTo("Human confirmation: $evidence"))
+            .body("report.modelAcceptanceChecks[0].outcome", equalTo("UNVERIFIED"))
+            .body("report.modelAcceptanceChecks[1].evidence", equalTo("GreetingTest.greetsNullNameAsGuest"))
+            .body("report.review.reviewer", equalTo("Daniel"))
+            .body("report.review.evidence", equalTo(evidence))
+            .body("report.openQuestions.size()", equalTo(1))
+            .body("report.openQuestions[0].question", equalTo("Should greetings be localized?"))
+
+        given()
+            .`when`().get("/api/tasks/$taskId")
+            .then().statusCode(200).body("status", equalTo("COMPLETED"))
+
+        val history = taskService.history(taskId).last()
+        assertEquals(TaskStatus.NEEDS_INPUT, history.fromStatus)
+        assertEquals(TaskStatus.COMPLETED, history.toStatus)
+        assertEquals("REVIEWER", history.actor)
+        assertTrue(history.reason!!.contains(evidence))
+
+        val patch = given()
+            .`when`().get("/api/tasks/$taskId/attempts/$attemptId/patch")
+            .then().statusCode(200)
+            .extract().asString()
+        assertEquals(report.patchDiff, patch)
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("evidence" to "Confirm again"))
+            .`when`().post("/api/tasks/$taskId/attempts/$attemptId/confirm")
+            .then().statusCode(409)
+            .body("message", equalTo("Attempt $attemptId is COMPLETED; only a NEEDS_INPUT attempt can be confirmed"))
+    }
+
+    @Test
+    fun `human confirmation defaults a missing reviewer and trims the evidence`() {
+        val criteria = listOf("Criterion")
+        val report = needsInputReport(criteria)
+
+        val (nullReviewerTask, nullReviewerAttempt) = needsInputAttempt(criteria, report)
+        val nullReviewer = attemptService.confirmAcceptance(
+            nullReviewerTask,
+            nullReviewerAttempt,
+            "Reviewed the diff",
+            null
+        )!!
+        assertEquals("operator", nullReviewer.report!!.path("review").path("reviewer").asText())
+        assertEquals("Reviewed the diff", nullReviewer.report!!.path("review").path("evidence").asText())
+
+        val (blankReviewerTask, blankReviewerAttempt) = needsInputAttempt(criteria, report)
+        val blankReviewer = attemptService.confirmAcceptance(
+            blankReviewerTask,
+            blankReviewerAttempt,
+            "  Reviewed the diff and tests  ",
+            "   "
+        )!!
+        assertEquals("operator", blankReviewer.report!!.path("review").path("reviewer").asText())
+        assertEquals("Reviewed the diff and tests", blankReviewer.report!!.path("review").path("evidence").asText())
+        assertEquals(
+            "Human confirmation: Reviewed the diff and tests",
+            blankReviewer.report!!.path("acceptanceChecks")[0].path("evidence").asText()
+        )
+    }
+
+    @Test
+    fun `human confirmation rejects an attempt without machine-verifiable evidence`() {
+        val criteria = listOf("Criterion")
+        val report = needsInputReport(criteria)
+
+        assertConfirmRejected(criteria, report.copy(changedFiles = emptyList()), "did not change any files")
+        assertConfirmRejected(criteria, report.copy(validation = emptyList()), "no validation checks")
+        assertConfirmRejected(
+            criteria,
+            report.copy(
+                validation = listOf(ValidationCheck("Maven", outcome = CheckOutcome.FAILED, exitCode = 1))
+            ),
+            "must have passed"
+        )
+        assertConfirmRejected(criteria, report.copy(patchDiff = null), "no patch diff")
+        assertConfirmRejected(criteria, report.copy(patchDiffTruncated = true), "truncated patch diff")
+        assertConfirmRejected(
+            criteria,
+            report.copy(
+                acceptanceChecks = listOf(
+                    AcceptanceCheck(criteria.first(), AcceptanceOutcome.FAILED, "test failed")
+                )
+            ),
+            "not met"
+        )
+    }
+
+    @Test
+    fun `human confirmation rejects model questions and the wrong task or attempt status`() {
+        val criteria = listOf("Criterion")
+        val report = needsInputReport(criteria)
+
+        assertConfirmRejected(
+            criteria,
+            report.copy(
+                openQuestions = listOf(
+                    AgentQuestion("Which API?", "The API choice changes the patch.", true)
+                )
+            ),
+            "blocking question"
+        )
+        assertConfirmRejected(criteria, null, "no execution report")
+        assertConfirmRejected(criteria, report, "only a NEEDS_INPUT task", taskStatus = TaskStatus.RUNNING)
+        assertConfirmRejected(
+            criteria,
+            report,
+            "only a NEEDS_INPUT attempt",
+            attemptStatus = AttemptStatus.COMPLETED
+        )
+    }
+
+    @Test
+    fun `confirmation request validation and missing attempts return client errors`() {
+        val criteria = listOf("Criterion")
+        val (taskId, attemptId) = needsInputAttempt(criteria, needsInputReport(criteria))
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("evidence" to "   "))
+            .`when`().post("/api/tasks/$taskId/attempts/$attemptId/confirm")
+            .then().statusCode(400)
+            .body("message", equalTo("evidence must not be blank"))
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("evidence" to "x".repeat(2001)))
+            .`when`().post("/api/tasks/$taskId/attempts/$attemptId/confirm")
+            .then().statusCode(400)
+            .body("message", equalTo("evidence must be 2000 characters or fewer"))
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("evidence" to "Reviewed", "reviewer" to "x".repeat(101)))
+            .`when`().post("/api/tasks/$taskId/attempts/$attemptId/confirm")
+            .then().statusCode(400)
+            .body("message", equalTo("reviewer must be 100 characters or fewer"))
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("evidence" to "Reviewed"))
+            .`when`().post("/api/tasks/${UUID.randomUUID()}/attempts/$attemptId/confirm")
+            .then().statusCode(404)
+
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("evidence" to "Reviewed"))
+            .`when`().post("/api/tasks/$taskId/attempts/${UUID.randomUUID()}/confirm")
+            .then().statusCode(404)
+
+        val otherTaskId = createTask(criteria)
+        given()
+            .contentType(ContentType.JSON)
+            .body(mapOf("evidence" to "Reviewed"))
+            .`when`().post("/api/tasks/$otherTaskId/attempts/$attemptId/confirm")
+            .then().statusCode(404)
+    }
+
+    private fun needsInputReport(criteria: List<String>): TaskExecutionReport =
+        TaskExecutionReport(
+            summary = "Execution needs a user decision or additional verification before completion.",
+            implementation = "The patch applied and Maven validation passed.",
+            changedFiles = listOf(
+                "src/main/java/example/Greeting.java",
+                "src/test/java/example/GreetingTest.java"
+            ),
+            validation = listOf(
+                ValidationCheck("Maven tests", "mvn test", CheckOutcome.PASSED, 0, "3 tests passed", 1200)
+            ),
+            patchDiff = "diff --git a/src/main/java/example/Greeting.java b/src/main/java/example/Greeting.java",
+            acceptanceChecks = criteria.mapIndexed { index, criterion ->
+                if (index == 0) {
+                    AcceptanceCheck(criterion, AcceptanceOutcome.UNVERIFIED)
+                } else {
+                    AcceptanceCheck(criterion, AcceptanceOutcome.PASSED, "GreetingTest.greetsNullNameAsGuest")
+                }
+            },
+            openQuestions = listOf(
+                AgentQuestion(UNVERIFIED_ACCEPTANCE_QUESTION, criteria.first(), true),
+                AgentQuestion("Should greetings be localized?", "Not required for this change.", false)
+            )
+        )
+
+    private fun needsInputAttempt(
+        criteria: List<String>,
+        report: TaskExecutionReport?,
+        taskStatus: TaskStatus = TaskStatus.NEEDS_INPUT,
+        attemptStatus: AttemptStatus = AttemptStatus.NEEDS_INPUT
+    ): Pair<UUID, UUID> {
+        val taskId = createTask(criteria)
+        taskService.transition(taskId, TaskStatus.RUNNING, "Worker claimed task")
+        val attempt = attemptService.start(taskId)!!
+        attemptService.finish(taskId, attempt.id, attemptStatus, report)
+        if (taskStatus == TaskStatus.NEEDS_INPUT) {
+            taskService.transition(taskId, TaskStatus.NEEDS_INPUT, "Acceptance criteria could not be verified")
+        }
+        return taskId to attempt.id
+    }
+
+    private fun assertConfirmRejected(
+        criteria: List<String>,
+        report: TaskExecutionReport?,
+        messagePart: String,
+        taskStatus: TaskStatus = TaskStatus.NEEDS_INPUT,
+        attemptStatus: AttemptStatus = AttemptStatus.NEEDS_INPUT
+    ) {
+        val (taskId, attemptId) = needsInputAttempt(criteria, report, taskStatus, attemptStatus)
+        val failure = assertThrows(IllegalStateException::class.java) {
+            attemptService.confirmAcceptance(taskId, attemptId, "Reviewed the diff and tests", "Daniel")
+        }
+        assertTrue(failure.message!!.contains(messagePart)) {
+            "Expected '${failure.message}' to contain '$messagePart'"
+        }
     }
 
     private fun completedAttempt(
