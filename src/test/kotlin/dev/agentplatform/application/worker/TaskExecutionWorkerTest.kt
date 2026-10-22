@@ -539,7 +539,7 @@ class TaskExecutionWorkerTest {
         val unverified =
             """{"summary":"Applied","implementation":"Null is handled.","acceptanceChecks":[{"criterion":"$criterion","outcome":"UNVERIFIED","evidence":""}]}"""
         val evidenced =
-            """{"summary":"Applied","implementation":"Null is handled.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"Maven tests passed after the patch to Greeting.java."}]}"""
+            """{"summary":"Applied","implementation":"Null is handled.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"greetsNullNameAsGuest asserts the guest fallback; Maven tests passed."}]}"""
         val provider = ScriptedProvider(
             ModelTurn(
                 null,
@@ -567,13 +567,21 @@ class TaskExecutionWorkerTest {
         assertTrue(nudge.content.contains("changed files are src/main/Example.kt"), nudge.content)
         assertTrue(nudge.content.contains("validation is Maven tests PASSED"), nudge.content)
         assertTrue(nudge.content.contains("""{"criterion":"$criterion","outcome":"PASSED","evidence":"""), nudge.content)
+        assertTrue(nudge.content.contains("test method plus the assertion it makes"), nudge.content)
+        assertTrue(nudge.content.contains("If a changed test calls the changed code"), nudge.content)
+        assertTrue(nudge.content.contains("cite that test method and assertion as evidence for the behavior criterion"), nudge.content)
+        assertTrue(nudge.content.contains("A test name alone proves only that the test exists"), nudge.content)
+        assertTrue(nudge.content.contains("do not mark it PASSED from Maven alone"), nudge.content)
+        val taskPrompt = provider.messages.first { it.role == "user" }.content
+        assertTrue(taskPrompt.contains("For a behavior criterion, a changed test that calls the changed code"), taskPrompt)
+        assertTrue(taskPrompt.contains("cite the test method and assertion, not just its name"), taskPrompt)
         assertTrue(
             provider.messages.none { it.role == "assistant" && it.content == unverified },
             provider.messages.filter { it.role == "assistant" }.joinToString(" | ") { it.content }
         )
         val check = attempts.finishedReport!!.acceptanceChecks.single()
         assertEquals(AcceptanceOutcome.PASSED, check.outcome)
-        assertTrue(check.evidence!!.contains("Maven tests passed"))
+        assertTrue(check.evidence!!.contains("greetsNullNameAsGuest"))
     }
 
     @Test
