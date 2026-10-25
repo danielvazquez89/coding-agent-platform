@@ -940,6 +940,43 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   and says nothing about larger repositories or other task classes; the next step is a measurable
   baseline or a second task class.
 
+### 40. A stale report after the repair patch blocks a correct completion
+
+- **Setup.** W12 (`a354a70f-7274-4a91-b47c-c4184bc210ca`, attempt
+  `5339de70-1985-4784-95d2-2a12f936af13`) ran a second task class on `small-java` at `6187794`
+  with the same jar built from `47a780b` and the same local model and settings: change the named
+  greeting prefix from "Hello " to "Hi " and update the existing test. 16 model calls, 15 tool calls,
+  707.7 seconds (~11m45s); 54,348 prompt / 1,675 completion tokens.
+- **The final workspace was correct.** The model updated the test with `replace_text`, validated too
+  early (the source still said "Hello "), then applied the source change with a 289-character
+  `apply_patch`; the automatic validation passed 3/3. Changed files were `Greeting.java` and
+  `GreetingTest.java`; the 881-character diff was untruncated and exactly the intended two-line
+  change. The audit shows three rejected `replace_text` calls ("oldText occurs more than once"), one
+  rejected patch, then the successful writes.
+- **The report was stale.** After the failed validation, the model returned a report marking the two
+  change criteria and the suite `FAILED`, the guest criterion `UNVERIFIED`, and asking "Why did the
+  patch not apply cleanly...". The failed-validation nudge correctly asked for a repair instead of
+  accepting it. The model repaired the source and then sent an **empty final turn**. The worker's
+  fallback reused the earlier report, whose facts were now false, so the task ended `NEEDS_INPUT`
+  ("Agent needs a user decision") with a correct, passing workspace. `confirmAcceptance` could not
+  help: it requires no `FAILED` criterion and no blocking question, and W12 had both.
+- **Fix: reuse a report only while no tool has run since it was produced.** `lastModelText` now records
+  the tool-call count at capture, and the empty-turn fallback is used only when that count still
+  matches. A later write or validation may change the facts, so an empty turn after it is a missing
+  report: the format nudge asks for a new JSON report, or the criteria stay unverified. The worker
+  also avoids appending an empty assistant message for that nudge. Failure paths with no intervening
+  tool keep their narrative, which is why this is a guard rather than a removal.
+- **Regression coverage.** `does not reuse a report from before the repair patch and passing
+  validation` reproduces the sequence — failed validation, `FAILED` report with a blocking question,
+  repair patch, empty turn, automatic passing validation — and asserts `COMPLETED`, the fresh
+  evidence, no open questions, and the request for a new report. With the guard disabled, the same
+  test reproduces W12 exactly: `expected <COMPLETED> but was <NEEDS_INPUT>`. Worker suite 57 tests;
+  the full gate is 299 tests with the coverage checks met.
+- **What this shows and does not.** W12 is a second task class, and its change/test coordination is
+  harder than the null-handling shape, but the failure was in report state rather than the model's
+  edit: the diff and validation were right, only the report was stale. W12 remains an unconfirmed
+  `NEEDS_INPUT`; a rerun on the fixed jar is the next experiment.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -1015,7 +1052,8 @@ The JSON-java task carries the whole repository and a 24-call budget; this fixtu
 model's report discipline. `small-java` is a 30-line Maven project (JUnit 4.13.2, compiler 3.11.0).
 W1/W2 fix a null-handling bug in `Greeting.greet` (three criteria: null returns "Hello guest", a test
 covers it, the suite passes); W3 adds a test for surrounding-whitespace trimming (two criteria: the
-test exists, the suite passes).
+test exists, the suite passes); W12 changes the named greeting prefix from "Hello " to "Hi " and
+updates the existing test (four criteria), the second task class.
 
 | Run | Model | Outcome |
 | --- | --- | --- |
@@ -1033,6 +1071,7 @@ test exists, the suite passes).
 | W9 `6246c9d6` attempt `2034440d` | same, jar `ccec354` (`replace_text`; before the cited-method check) | 6 tool calls: `find_symbol`, `read_file`, one `replace_text` source edit (the correct null guard), `find_symbol`, `read_file`, `run_validation` **PASSED** 2/2; only `Greeting.java` changed, 467-byte untruncated diff. The report falsely marked the test criterion PASSED with `greetsNullNameAsGuest` in `GreetingTest.java`, which was never written; criterion 1 UNVERIFIED on a quote-only mismatch, criterion 3 PASSED -> **NEEDS_INPUT**, export 409; 9 model calls / 10m41s (finding 37) |
 | W10 `d0516b53` attempt `350f0a74` | same, jar `47a780b` (cited-method check, quote normalization, missing-test nudge) | 6 tool calls: 2 `find_symbol`, 2 `read_file`, one 896-char `apply_patch` (null guard plus `greetsNullNameAsGuest`), `run_validation` **PASSED** 3/3; both files changed, all three criteria PASSED with real evidence -> **COMPLETED**; export 200, 1,025-byte patch applied to a fresh `6187794` clone, `mvn -B -o test` 3/3 outside; 7 model calls / 10m51s (finding 38) |
 | W11 `38885077` attempt `179bed06` | same, jar `47a780b` | 7 tool calls: `find_symbol`, `read_file`, `replace_text` (source null guard), `find_symbol`, `read_file`, `apply_patch` (test), `run_validation` **PASSED** 3/3; both files changed, all three criteria PASSED -> **COMPLETED**; export 200, 1,037-byte patch applied to a fresh `6187794` clone, `mvn -B -o test` 3/3 outside; 8 model calls / 7m45s (finding 39) |
+| W12 `a354a70f` attempt `5339de70` | second task class: change the named prefix to "Hi " and update the existing test; same jar `47a780b` | 15 tool calls: 3 rejected `replace_text` (ambiguous "Hello "), 1 rejected patch, a successful test `replace_text`, a failed validation, a successful source `apply_patch`, automatic validation **PASSED** 3/3; both files changed, 881-byte untruncated diff. The model then sent an empty turn and the worker reused its earlier FAILED report and blocking question -> **NEEDS_INPUT**; 16 model calls / 11m45s (finding 40) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
 validation; the remaining gap is the report's acceptance assessment (finding 24). W6 repeated it with
@@ -1053,6 +1092,11 @@ passed the suite on a fresh clone. W11 (finding 39) repeated it with a different
 (`replace_text` for the source, `apply_patch` for the test), passed 3/3, and its patch also passed on
 a fresh clone. The narrow task class is now reproducible at 2/2 on the current rules, but that is a
 30-line fixture and two runs; it is not a benchmark result and says nothing about larger repositories.
+W12 (finding 40) tried the second task class: the model coordinated a test edit and a source edit
+through three rejected ambiguous replacements and still produced the correct two-file diff and a
+passing 3/3 validation, but an empty final turn reused a report from before the repair. The worker now
+reuses an earlier report only while no tool has run since it was produced; W12 remains an unconfirmed
+`NEEDS_INPUT`, and a rerun on the fixed jar is the next experiment.
 
 ## Repository selection (the gate, in practice)
 

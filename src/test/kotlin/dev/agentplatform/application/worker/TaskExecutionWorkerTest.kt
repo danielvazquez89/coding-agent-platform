@@ -1110,6 +1110,91 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `does not reuse a report from before the repair patch and passing validation`() {
+        // W12: the model changed the test, validation failed, and it returned a FAILED report with a
+        // blocking question. The failed-validation nudge asked for a repair instead of accepting it.
+        // The model then fixed the source with a patch and sent an empty turn. Reusing the earlier
+        // report ended a correct change as NEEDS_INPUT, so an empty turn must ask for a new report.
+        val criterion = "The project description is updated"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val state = FakeState(task)
+        val attempts = FakeAttempts()
+        val workspace = FakeWorkspace(temporary, listOf("README.md"))
+        Files.writeString(temporary.resolve("README.md"), "project context\n")
+        val firstPatch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-project context",
+            "+stale context"
+        ).joinToString("\n", postfix = "\n")
+        val repairPatch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-stale context",
+            "+fixed context"
+        ).joinToString("\n", postfix = "\n")
+        val staleReport =
+            """{"summary":"Not finished","implementation":"The test still fails.","openQuestions":[{"question":"Why did the patch not apply cleanly?","impact":"The change may be wrong.","blocking":true}],"acceptanceChecks":[{"criterion":"$criterion","outcome":"FAILED","evidence":"The Maven test suite failed."}]}"""
+        val freshReport =
+            """{"summary":"Fixed","implementation":"Repaired the file and reran validation.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"README.md now contains the fixed context and the Maven test suite passed."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to firstPatch)))),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn(null, listOf(call("run_validation", "{}")), "tool_calls", 1, 1),
+            ModelTurn(staleReport, emptyList(), "stop", 1, 1),
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to repairPatch)))),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn("", emptyList(), "stop", 1, 1),
+            ModelTurn(freshReport, emptyList(), "stop", 1, 1)
+        )
+        var runs = 0
+        val validationRunner = object : ValidationRunner {
+            override fun validate(workspace: Path): ValidationCheck {
+                runs++
+                return if (runs == 1) {
+                    ValidationCheck(
+                        "Maven tests",
+                        outcome = CheckOutcome.FAILED,
+                        details = "GreetingTest expected the old prefix"
+                    )
+                } else {
+                    ValidationCheck("Maven tests", outcome = CheckOutcome.PASSED)
+                }
+            }
+        }
+
+        assertTrue(worker(state, attempts, provider, workspace, validationRunner = validationRunner).execute(task.id))
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        val report = attempts.finishedReport!!
+        assertEquals(AcceptanceOutcome.PASSED, report.acceptanceChecks.single().outcome)
+        assertEquals(
+            "README.md now contains the fixed context and the Maven test suite passed.",
+            report.acceptanceChecks.single().evidence
+        )
+        assertTrue(report.openQuestions.isEmpty(), report.openQuestions.toString())
+        assertEquals(6, provider.calls)
+        assertTrue(
+            provider.messages.any { it.role == "user" && it.content.contains("not the required report") },
+            provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
+        )
+    }
+
+    @Test
     fun `nudges the model to assess a criterion left unverified after validation passed`() {
         val criterion = "Greeting.greet(null) returns Hello guest"
         val task = task(acceptanceCriteria = listOf(criterion))

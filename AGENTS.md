@@ -214,6 +214,13 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   unresolved patch or write failure. A cited method that already exists is left alone, because a fix
   may legitimately be validated by an existing regression test. Criterion matching normalizes
   whitespace and quote style, so a quote-only difference in a copied criterion does not block it.
+- **A report produced before the last tool call is stale.** A final turn with empty content may reuse the
+  previous text only while no tool has run since it was produced (`lastModelTextToolCalls ==
+  toolCallCount`). A later write or validation changes the facts the report describes: W12 applied the
+  correct source patch and passed validation 3/3 after the model had returned a `FAILED` report with a
+  blocking question, and the empty final turn reused that report, ending a correct change `NEEDS_INPUT`.
+  An empty turn after a tool call is a missing report; ask for a new one. Do not replace the count guard
+  with an unconditional fallback just to preserve a failure-path narrative.
 - **Patch format differs by model family, and both common formats are accepted.** `apply_patch` takes a
   git unified diff, or the Codex `*** Begin Patch` / `*** Update File:` envelope that the OpenAI
   open-weight `gpt-oss` family emits. The envelope is converted to a unified diff first

@@ -390,6 +390,7 @@ class TaskExecutionWorker @Inject constructor(
         var workspaceChanged = false
         var validationCurrent = false
         var lastModelText: String? = null
+        var lastModelTextToolCalls = 0
         repeat(
             maxToolCalls + MAX_PATCH_FAILURE_RETRIES + MAX_REPORT_FORMAT_RETRIES + MAX_VALIDATION_FIX_RETRIES +
                 MAX_ACCEPTANCE_FIX_RETRIES + MAX_MISSING_TEST_RETRIES + 4
@@ -407,7 +408,10 @@ class TaskExecutionWorker @Inject constructor(
             checkBudget(trace.startedAtNanos, trace)
             log.infof("Task %s model turn returned %d tool call(s)", task.id, turn.toolCalls.size)
             if (turn.toolCalls.isEmpty()) {
-                turn.content?.takeIf(String::isNotBlank)?.let { lastModelText = it }
+                turn.content?.takeIf(String::isNotBlank)?.let {
+                    lastModelText = it
+                    lastModelTextToolCalls = toolCallCount
+                }
                 val patchFailure = lastPatchFailure
                 if (patchFailure != null && patchFailureRetries < MAX_PATCH_FAILURE_RETRIES) {
                     patchFailureRetries++
@@ -468,7 +472,14 @@ class TaskExecutionWorker @Inject constructor(
                     )
                     return@repeat
                 }
-                val response = (turn.content?.takeIf(String::isNotBlank) ?: lastModelText).orEmpty()
+                // Reuse an earlier turn's text only while no tool has run since it was produced. A
+                // tool call can change the workspace or the validation state the text describes, so
+                // W12's FAILED report (and its blocking question) was stale after the repair patch
+                // and a passing validation, and reusing it turned a correct change into NEEDS_INPUT.
+                // An empty turn after a tool call is a missing report, not the previous one.
+                val response = (turn.content?.takeIf(String::isNotBlank)
+                    ?: lastModelText?.takeIf { lastModelTextToolCalls == toolCallCount })
+                    .orEmpty()
                 val parsedReport = parseReport(response)
                 if (
                     lastPatchFailure == null &&
@@ -477,7 +488,9 @@ class TaskExecutionWorker @Inject constructor(
                     parsedReport.isEmpty
                 ) {
                     reportFormatRetries++
-                    messages += ModelMessage("assistant", response)
+                    // An empty turn has no assistant content to echo; appending it would put a blank
+                    // assistant message in the conversation for no benefit.
+                    if (response.isNotBlank()) messages += ModelMessage("assistant", response)
                     messages += ModelMessage(
                         "user",
                         "That final answer is not the required report: it must be a single valid JSON object with summary, implementation, decisions, openQuestions and acceptanceChecks, and every acceptance criterion must be copied verbatim. Resend only the corrected JSON object. Do not wrap it in prose, Markdown fences, function-call tags, or a second object. A report that still cannot be parsed leaves the criteria unverified."
