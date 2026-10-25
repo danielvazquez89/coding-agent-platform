@@ -1019,6 +1019,44 @@ characterize the task class, and the third run's failure is a model behavior the
 correctly; repeating it would not change the code or the safety story. The baseline should carry the
 model-side no-tool-call failure as a known outcome, not average it away.
 
+### 42. The v2 smoke baseline is 2/4 with no false successes
+
+- **Setup.** Ran the four-case `benchmarks/v2/cases.json` suite against `benchmarks/v1/fixture` on the
+  jar built from `e97a440`, with local `qwen2.5-coder:14b`, context 8192, repository map 1,200 tokens,
+  history budget 48,000 characters, and a 7,200-second task limit. The runner submitted each case
+  through the API and evaluated the last validation, exact criterion text, the expected changed-file
+  set, and the diff. Results are in the gitignored `benchmarks/v2/results-v2.json`.
+- **Result.** 2/4 successes, **0 false successes**, completion validation pass rate 1.0, 4 patch
+  failures, mean 840 seconds. The two completed cases changed both expected files and their updated
+  tests passed in Docker:
+
+  | Case | Status | Calls | Elapsed | Tokens (prompt/completion) | What happened |
+  | --- | --- | --- | --- | --- | --- |
+  | `greeting-message` | **COMPLETED** | 9 | 6m59s | 25,412 / 917 | One source `replace_text`, an early validation failure before the test edit, then the test edit and a passing 1/1 run; 871-byte diff. |
+  | `greeting-name` | **FAILED** | 18 | **40m33s** | 82,723 / 5,680 | Four rejected patches (two byte-identical resends), then three identical `replace_text` calls with a 69-character `oldText` that never matched; the source was read three more times, validation passed on the unchanged tree, and every criterion stayed `UNVERIFIED`. Error: "The agent did not produce a repository change". |
+  | `greeting-punctuation` | **COMPLETED** | 7 | 4m58s | 17,439 / 813 | Source and test `replace_text`, then a passing 1/1 run; 857-byte diff. |
+  | `greeting-needs-approval` | **FAILED** | 5 | 3m31s | 11,915 / 658 | No change and no blocking question. The criterion was `UNVERIFIED` with "The product owner-approved greeting is not provided", so the unchanged-task rule failed it. The task had asked for a blocking clarification. |
+
+- **The completed cases are real.** `greeting-message` changed `return "Hello"` to
+  `return "Hello, world!"` and the test assertion to match; `greeting-punctuation` did the same for
+  `"Hello!"`. Both reported exactly the two expected files, an untruncated diff, and a passing Maven
+  run. The acceptance evidence cites the text edit rather than a test method, but the diff and the
+  validation that ran it are concrete.
+- **The two failures are different.** `greeting-name` is the platform-relevant one: the model could
+  not construct a matching edit, then repeated a rejected `replace_text` three times despite reading
+  the file in between. The tool's refusal says "pass an exact contiguous snippet" but does not show
+  the current lines, unlike `apply_patch`, which prints the file around the failed hunk. The 40-minute
+  runtime is mostly model latency around those retries. `greeting-needs-approval` is a model behavior
+  miss: the platform would have returned `NEEDS_INPUT` for a blocking question, and the worker's
+  no-change rule failed an attempt that never asked one. Neither failure is a false success.
+- **What this shows and does not.** The safety rules held on the negative control and on both failed
+  attempts: no change was reported as a pass, and the expected non-completion was not upgraded to
+  `COMPLETED`. The sample is four cases, one model, and one run, so 2/4 is a smoke baseline, not a
+  model-quality claim. The immediate platform gap is edit feedback for `replace_text`; the next slice
+  is to show the actual lines around the closest anchor when a snippet does not match, then rerun the
+  failed completion case. The clarification control stays a model-behavior finding, not a reason to
+  weaken the unchanged-task rule.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`

@@ -577,10 +577,14 @@ The first run initializes and commits the benchmark fixture locally; later runs 
 
 The scorecard uses the **last** validation result, requires exactly one evidence-bearing passing assessment for each supplied criterion, can require an exact changed-file set, and checks that a clarification case produced neither changed files nor a diff. It reports false-success count/rate for expected non-completion cases, per-case patch failures, elapsed time, model usage, and validation outcomes. The diff/file checks are lightweight benchmark oracles, not proof of behavior; acceptance assessments remain model-authored. The prompt version is currently marked `unversioned`, and four cases are still only a smoke suite. Expand the suite with independently tested outcomes and diverse maintenance tasks before making quality claims.
 
+The first measured v2 baseline (2026-10-25, local `qwen2.5-coder:14b`, jar `e97a440`) ran all four cases: **2/4 successes, 0 false successes**, with both completed cases passing Docker validation and exactly the expected two-file diff. One completion case failed after four rejected patches and three identical `replace_text` retries, finishing unchanged after 40 minutes; the clarification control ended `FAILED` because the model never asked a blocking question. The sample is four cases and one run, so this is a smoke baseline, not a model-quality claim. The next slice is to make a failed `replace_text` show the actual file lines around the closest anchor, then rerun the failed case.
+
 #### What the numbers do and do not say
 
-There is **no published success rate yet**, and that is a deliberate limitation rather than an oversight:
-three and four smoke cases are not enough evidence to claim the agent is useful on real repositories.
+There is **no published model-quality success rate yet**, and that is a deliberate limitation rather
+than an oversight: four smoke cases and one run are not enough evidence to claim the agent is useful on
+real repositories. The first v2 baseline (2/4, 0 false successes) is a smoke measurement, not that
+number.
 
 - **Measured today:** task status, the last Maven validation outcome, evidence-bearing acceptance
   assessments (exactly one per criterion), expected changed-file sets and diff fragments, elapsed time,
@@ -704,7 +708,7 @@ Target a small Java/Maven bug fix on a disposable repository: locate the exact c
 
 ### 2. Establish a measurable baseline
 
-Run the v2 smoke suite and expand it to 15–30 varied Kotlin/JVM maintenance tasks. Include independently checked bug fixes and regressions, no-op and malformed patches, ambiguous requests, and explicit refusal/clarification controls. Keep evaluator oracles outside the workspace the agent can edit. Version the benchmark, system prompt, tool policy, and model; record final validation, changed files, false-successes, patch retries, human acceptance, cost, and elapsed time. **Exit gate:** reproducible runs and no false successes in the known negative controls. The four-case v2 suite is only a first slice of this phase.
+Run the v2 smoke suite and expand it to 15–30 varied Kotlin/JVM maintenance tasks. Include independently checked bug fixes and regressions, no-op and malformed patches, ambiguous requests, and explicit refusal/clarification controls. Keep evaluator oracles outside the workspace the agent can edit. Version the benchmark, system prompt, tool policy, and model; record final validation, changed files, false-successes, patch retries, human acceptance, cost, and elapsed time. **Exit gate:** reproducible runs and no false successes in the known negative controls. The four-case v2 suite is only a first slice of this phase. The first run is 2/4 with no false successes (finding 42); the completion gap is a rejected `replace_text` that the model repeated. Fix the edit feedback and rerun the failed case before expanding the suite.
 
 ### 3. Harden completion and worker reliability
 
