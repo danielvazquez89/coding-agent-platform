@@ -40,7 +40,8 @@ class WorkspaceToolExecutor(
         tool("search_code", "Search repository text line by line. The query is a literal unless regex is true. The path may be a file or a directory. Results are paginated with offset and maxResults.", """{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example **/*.kt."},"regex":{"type":"boolean","description":"Treat the query as a Java regular expression. Invalid expressions are rejected."},"ignoreCase":{"type":"boolean","description":"Defaults to true."},"offset":{"type":"integer","minimum":0,"description":"Number of matches to skip. Defaults to 0."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 25, capped at 200."}},"required":["query"],"additionalProperties":false}"""),
         tool("find_symbol", "Locate where a class, interface, enum, record, method, function or field is declared. Use this first when the task names an identifier or when the repository map points at a file: it returns path:line for declarations before other occurrences, so you can read only the surrounding lines. The path may be a file or a directory. A bounded line scan, not a compiler; confirm the line before editing.", """{"type":"object","properties":{"name":{"type":"string","description":"A single identifier, for example writeValue or JSONObject."},"path":{"type":"string"},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example src/**/*.java."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 25, capped at 200."}},"required":["name"],"additionalProperties":false}"""),
         tool("read_file", "Read a UTF-8 text file, optionally a 1-based inclusive line range. A whole-file read is limited to 50 KB; larger files require a range. Output is capped at 12,000 characters.", """{"type":"object","properties":{"path":{"type":"string"},"startLine":{"type":"integer","minimum":1},"endLine":{"type":"integer","minimum":1}},"required":["path"],"additionalProperties":false}"""),
-        tool("create_file", "Create a new UTF-8 text file with exactly the content given. Parent directories are created. Fails if the file already exists; use apply_patch to modify an existing file. The path must stay inside the repository.", """{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Exact file content. Include the trailing newline if the file should end with one."}},"required":["path","content"],"additionalProperties":false}"""),
+        tool("create_file", "Create a new UTF-8 text file with exactly the content given. Parent directories are created. Fails if the file already exists; use replace_text or apply_patch to modify an existing file. The path must stay inside the repository.", """{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string","description":"Exact file content. Include the trailing newline if the file should end with one."}},"required":["path","content"],"additionalProperties":false}"""),
+        tool("replace_text", "Replace exactly one occurrence of oldText in an existing UTF-8 text file with newText. oldText must match the file exactly, including leading whitespace, and must occur only once; copy it from read_file. This is the preferred tool for a small edit to an existing file. Use create_file for a new file, or apply_patch for a multi-file or multi-hunk change. The path must stay inside the repository.", """{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string","description":"Exact text to replace; must occur exactly once in the file."},"newText":{"type":"string","description":"Replacement text. Empty deletes oldText."}},"required":["path","oldText","newText"],"additionalProperties":false}"""),
         tool("related_tests", "List the test files that reference types declared in the given paths, using a bounded reference graph. Omit paths to use the files changed in the workspace.", """{"type":"object","properties":{"paths":{"type":"array","items":{"type":"string"},"description":"Repository-relative paths. Omit to use git status."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 10, capped at 50."}},"additionalProperties":false}"""),
         tool("apply_patch", "Apply a patch to repository files. Use either a complete git-compatible unified diff (diff --git, --- and +++ headers, valid hunk ranges) or the Codex envelope (*** Begin Patch, *** Update File:/*** Add File:/*** Delete File:, @@ hunks, *** End Patch). Do not include Markdown fences. Patch paths must stay inside the repository.", """{"type":"object","properties":{"patch":{"type":"string","description":"A git-compatible unified diff or a Codex *** Begin Patch envelope; no Markdown fences."}},"required":["patch"],"additionalProperties":false}"""),
         tool("run_validation", "Run the repository's Maven tests in a disposable, resource-limited Docker container.", """{"type":"object","properties":{},"additionalProperties":false}""")
@@ -101,6 +102,14 @@ class WorkspaceToolExecutor(
         )
         "create_file" -> ToolExecutionResult(
             createFile(workspace, requiredText(arguments, "path"), textArgument(arguments, "content"))
+        )
+        "replace_text" -> ToolExecutionResult(
+            replaceText(
+                workspace,
+                requiredText(arguments, "path"),
+                requiredText(arguments, "oldText"),
+                textArgument(arguments, "newText")
+            )
         )
         "related_tests" -> ToolExecutionResult(
             relatedTests(
@@ -226,11 +235,11 @@ class WorkspaceToolExecutor(
         } else {
             ""
         }
-        // The declaration line is trimmed and only a hint: a patch must reproduce the file's exact
-        // content, so point the model at read_file before it edits.
+        // The declaration line is trimmed and only a hint: an edit must reproduce the file's exact
+        // content, so point the model at read_file before it changes anything.
         val next = "\nNext: read the lines around a declaration with read_file (startLine/endLine) and copy " +
-            "them exactly, including leading whitespace, when you write the patch. A method's block can " +
-            "extend well past its declaration, so read to the reported block end."
+            "them exactly, including leading whitespace, into replace_text or apply_patch. A method's block " +
+            "can extend well past its declaration, so read to the reported block end."
         return (header + "\n" + body + footer + next).take(TOOL_OUTPUT_LIMIT)
     }
 
@@ -396,11 +405,64 @@ class WorkspaceToolExecutor(
         require('\u0000' !in content) { "Binary content cannot be created through create_file" }
         val file = resolve(workspace, relative)
         require(!Files.exists(file, LinkOption.NOFOLLOW_LINKS)) {
-            "File '$relative' already exists; use apply_patch to change it"
+            "File '$relative' already exists; use replace_text or apply_patch to change it"
         }
         Files.createDirectories(file.parent)
         Files.writeString(file, content)
         return "Created $relative (${content.length} characters)."
+    }
+
+    /**
+     * A local model can copy an exact snippet from `read_file` far more reliably than it can build a
+     * unified diff whose hunk headers and context lines all match. This tool still leaves every
+     * decision to the application: the path is checked, the match is literal, exactly one occurrence
+     * is required, and a missing or ambiguous snippet changes nothing. Line endings are preserved so
+     * a small edit does not rewrite a whole file.
+     */
+    private fun replaceText(workspace: Path, relative: String, oldText: String, newText: String): String {
+        require(oldText.length <= EDIT_TEXT_LIMIT) { "oldText exceeds the ${EDIT_TEXT_LIMIT / 1024} KB limit" }
+        require(newText.length <= EDIT_TEXT_LIMIT) { "newText exceeds the ${EDIT_TEXT_LIMIT / 1024} KB limit" }
+        require(oldText != newText) { "oldText and newText are identical; nothing would change" }
+        require('\u0000' !in oldText && '\u0000' !in newText) {
+            "Binary content cannot be written through replace_text"
+        }
+        val file = resolve(workspace, relative)
+        require(Files.isRegularFile(file, LinkOption.NOFOLLOW_LINKS)) {
+            "File '$relative' does not exist; use create_file for a new file or list_files to find the right path"
+        }
+        require(Files.size(file) <= EDIT_FILE_SIZE_LIMIT) {
+            "File '$relative' exceeds the ${EDIT_FILE_SIZE_LIMIT / (1024 * 1024)} MB limit for replace_text; " +
+                "use apply_patch for a local hunk"
+        }
+        val content = try {
+            Files.readString(file)
+        } catch (_: IOException) {
+            throw IllegalArgumentException("File '$relative' is not readable UTF-8 text")
+        }
+        val windowsLineEndings = "\r\n" in content
+        val normalizedContent = content.replace("\r\n", "\n")
+        val normalizedOld = oldText.replace("\r\n", "\n")
+        val normalizedNew = newText.replace("\r\n", "\n")
+        require(normalizedOld != normalizedNew) { "oldText and newText are identical; nothing would change" }
+        val first = normalizedContent.indexOf(normalizedOld)
+        require(first >= 0) {
+            "The exact oldText was not found in '$relative'. Read the file with read_file and pass an exact " +
+                "contiguous snippet, including leading whitespace; nothing was changed."
+        }
+        val second = normalizedContent.indexOf(normalizedOld, first + 1)
+        require(second < 0) {
+            "oldText occurs more than once in '$relative'. Include more surrounding text so it identifies exactly " +
+                "one location; nothing was changed."
+        }
+        val updated = normalizedContent.replaceRange(first, first + normalizedOld.length, normalizedNew)
+        val output = if (windowsLineEndings) updated.replace("\n", "\r\n") else updated
+        require(output.toByteArray(Charsets.UTF_8).size.toLong() <= EDIT_FILE_SIZE_LIMIT) {
+            "The edited file would exceed the ${EDIT_FILE_SIZE_LIMIT / (1024 * 1024)} MB limit; " +
+                "use apply_patch for a local hunk"
+        }
+        Files.writeString(file, output)
+        return "Updated $relative: replaced one occurrence " +
+            "(${normalizedOld.length} characters with ${normalizedNew.length})."
     }
 
     private fun relatedTests(workspace: Path, paths: List<String>, maxResults: Int): String {
@@ -737,6 +799,8 @@ class WorkspaceToolExecutor(
         const val READ_FILE_SIZE_LIMIT = 50_000L
         const val READ_FILE_MAX_BYTES = 10L * 1024 * 1024
         const val CREATE_FILE_SIZE_LIMIT = 64_000
+        const val EDIT_TEXT_LIMIT = 64_000
+        const val EDIT_FILE_SIZE_LIMIT = 2_000_000L
         const val PATCH_CONTEXT_LINES = 6
         const val BLOCK_HEADER_LOOKAHEAD = 20
         const val PATCH_CONTEXT_HINT_LIMIT = 2_500

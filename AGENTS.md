@@ -89,8 +89,8 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   heuristic, labelled as such in the prompt, bounded by file count/bytes, and fail-soft: a failure to
   build it must never fail a task.
 - Tool policy and path/patch checks: `infrastructure/tool/WorkspaceToolExecutor` (`list_files`,
-  `search_code`, `find_symbol`, `read_file`, `create_file`, `related_tests`, `apply_patch`,
-  `run_validation`).
+  `search_code`, `find_symbol`, `read_file`, `create_file`, `replace_text`, `related_tests`,
+  `apply_patch`, `run_validation`).
 - Patch export policy (task/attempt `COMPLETED`, all validation passed, one matching passing evidenced
   acceptance check per criterion, and the stored diff not truncated):
   `application/service/TaskAttemptService.exportablePatch`, served by `api/TaskResource` at
@@ -183,18 +183,24 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   assistant call.
 - **An unresolved patch failure blocks `COMPLETED`.** The worker tracks the latest `apply_patch`
   outcome separately from the one-shot correction nudge. A failed patch stays unresolved until a later
-  patch applies successfully to every file it named. A malformed patch that names no files is cleared by
-  any later successful patch, because there is nothing to match; a successful patch to a different file
+  successful write touches every file it named. A malformed patch that names no files is cleared by
+  any later successful write, because there is nothing to match; a successful write to a different file
   is not a correction. While it is unresolved, even a final report that claims every criterion passed
   and a passing validation ends `NEEDS_INPUT` (the attempt reason is "A patch failed and was not
-  corrected"). A failure followed by a successful patch to its named files still completes. Do not
-  treat a rejected patch as applied because the model's narrative says so.
-- **A rejected `create_file` is also unresolved until that path is written.** The worker records the
-  failure under its normalized repository path. A later successful `create_file` for that path or an
-  `apply_patch` whose reported path list includes it clears the failure; while any remains, even a
-  report claiming every criterion passed and a passing validation ends `NEEDS_INPUT` (the attempt reason
-  is "A file creation failed and was not corrected"). The report's implementation records the failure.
-  A missing file must not be treated as created because the model says so.
+  corrected"). A failure followed by a successful patch or exact text replacement touching its named
+  files still completes. Do not treat a rejected patch as applied because the model's narrative says so.
+- **A rejected file write is unresolved until that path is written.** The worker records a failed
+  `create_file` or `replace_text` under its normalized repository path. A later successful
+  `create_file` or `replace_text` for that path, or an `apply_patch` whose reported path list includes
+  it, clears the failure; while any remains, even a report claiming every criterion passed and a
+  passing validation ends `NEEDS_INPUT` (the attempt reason is "A file write failed and was not
+  corrected"). The report's implementation records "File write still failed". A missing file or an
+  unapplied edit must not be treated as done because the model says so.
+- **`replace_text` matches literally and exactly once.** It reads the file as UTF-8, requires `oldText`
+  to occur exactly once, allows an empty `newText` to delete, preserves CRLF when the file uses it, and
+  rejects text over 64,000 characters, files or results over 2 MB, binary content, and missing or
+  ambiguous matches without writing. It is not a fuzzy editor; do not widen it to make a model's output
+  fit.
 - **Patch format differs by model family, and both common formats are accepted.** `apply_patch` takes a
   git unified diff, or the Codex `*** Begin Patch` / `*** Update File:` envelope that the OpenAI
   open-weight `gpt-oss` family emits. The envelope is converted to a unified diff first

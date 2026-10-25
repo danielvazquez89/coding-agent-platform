@@ -41,8 +41,8 @@ class WorkspaceToolExecutorTest {
         val tools = executor().definitions()
         assertEquals(
             listOf(
-                "list_files", "search_code", "find_symbol", "read_file", "create_file", "related_tests",
-                "apply_patch", "run_validation"
+                "list_files", "search_code", "find_symbol", "read_file", "create_file", "replace_text",
+                "related_tests", "apply_patch", "run_validation"
             ),
             tools.map { it.name }
         )
@@ -305,6 +305,115 @@ class WorkspaceToolExecutorTest {
         }
         assertThrows(IllegalArgumentException::class.java) {
             tools.execute("create_file", mapper.createObjectNode().put("content", "orphan"), root)
+        }
+    }
+
+    @Test
+    fun `replaces exactly one exact snippet and preserves line endings`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src"))
+        Files.writeString(
+            root.resolve("src/Hello.java"),
+            "class Hello {\r\n    String value() { return \"old\"; }\r\n}\r\n"
+        )
+        val tools = executor()
+
+        val result = tools.execute(
+            "replace_text",
+            mapper.createObjectNode()
+                .put("path", "src/Hello.java")
+                .put("oldText", "class Hello {\n    String value() { return \"old\"; }")
+                .put("newText", "class Hello {\n    String value() { return \"new\"; }"),
+            root
+        )
+
+        assertTrue(result.content.contains("Updated src/Hello.java"), result.content)
+        assertEquals(
+            "class Hello {\r\n    String value() { return \"new\"; }\r\n}\r\n",
+            Files.readString(root.resolve("src/Hello.java"))
+        )
+
+        // An empty newText deletes exactly the matched text, and the file's CRLF endings survive.
+        val deletion = tools.execute(
+            "replace_text",
+            mapper.createObjectNode()
+                .put("path", "src/Hello.java")
+                .put("oldText", "    String value() { return \"new\"; }\r\n")
+                .put("newText", ""),
+            root
+        )
+        assertTrue(deletion.content.contains("Updated src/Hello.java"), deletion.content)
+        assertEquals("class Hello {\r\n}\r\n", Files.readString(root.resolve("src/Hello.java")))
+    }
+
+    @Test
+    fun `rejects missing ambiguous or unbounded text replacements`() {
+        val root = repository()
+        Files.writeString(root.resolve("README.md"), "same\nsame\n")
+        val tools = executor()
+
+        fun edit(path: String, oldText: String, newText: String) = tools.execute(
+            "replace_text",
+            mapper.createObjectNode().put("path", path).put("oldText", oldText).put("newText", newText),
+            root
+        )
+
+        val ambiguous = assertThrows(IllegalArgumentException::class.java) {
+            edit("README.md", "same", "different")
+        }
+        assertTrue(ambiguous.message!!.contains("more than once"), ambiguous.message)
+        assertEquals("same\nsame\n", Files.readString(root.resolve("README.md")))
+
+        val missing = assertThrows(IllegalArgumentException::class.java) {
+            edit("README.md", "absent", "different")
+        }
+        assertTrue(missing.message!!.contains("was not found"), missing.message)
+        assertTrue(missing.message!!.contains("nothing was changed"), missing.message)
+
+        val identical = assertThrows(IllegalArgumentException::class.java) {
+            edit("README.md", "same\nsame", "same\nsame")
+        }
+        assertTrue(identical.message!!.contains("identical"), identical.message)
+
+        val missingFile = assertThrows(IllegalArgumentException::class.java) {
+            edit("missing.txt", "a", "b")
+        }
+        assertTrue(missingFile.message!!.contains("create_file"), missingFile.message)
+        assertThrows(IllegalArgumentException::class.java) { edit("../outside.txt", "a", "b") }
+        assertTrue(
+            assertThrows(IllegalArgumentException::class.java) {
+                edit("README.md", "x".repeat(64_001), "y")
+            }.message!!.contains("oldText exceeds")
+        )
+        assertTrue(
+            assertThrows(IllegalArgumentException::class.java) {
+                edit("README.md", "same", "y".repeat(64_001))
+            }.message!!.contains("newText exceeds")
+        )
+        assertTrue(
+            assertThrows(IllegalArgumentException::class.java) {
+                edit("README.md", "same", "a\u0000b")
+            }.message!!.contains("Binary content")
+        )
+
+        Files.write(root.resolve("large.txt"), ByteArray(2_000_001) { 'a'.code.toByte() })
+        assertTrue(
+            assertThrows(IllegalArgumentException::class.java) {
+                edit("large.txt", "a", "b")
+            }.message!!.contains("limit for replace_text")
+        )
+        Files.writeString(root.resolve("near-limit.txt"), "x".repeat(1_999_997) + "end")
+        assertTrue(
+            assertThrows(IllegalArgumentException::class.java) {
+                edit("near-limit.txt", "end", "y".repeat(10))
+            }.message!!.contains("edited file would exceed")
+        )
+
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("replace_text", mapper.createObjectNode().put("path", "README.md"), root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("replace_text", mapper.createObjectNode().put("path", "README.md").put("oldText", "same"), root)
         }
     }
 

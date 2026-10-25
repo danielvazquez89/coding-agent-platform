@@ -783,11 +783,11 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   suite, and a final report claiming both criteria `PASSED` would have satisfied the old completion
   rule. This is the same shape as finding 33, through a different write tool.
 - **Fix.** The worker records a failed creation by normalized repository path. While any path remains
-  unresolved, the task ends `NEEDS_INPUT` with the reason "A file creation failed and was not
-  corrected", even when the report claims the file exists and validation passed. A later successful
-  `create_file` for that path, or an `apply_patch` whose reported path list includes that path, clears
-  the failure; a source-only patch does not. The report's implementation records "File creation still
-  failed".
+  unresolved, the task ends `NEEDS_INPUT`, even when the report claims the file exists and validation
+  passed. A later successful `create_file` for that path, or an `apply_patch` whose reported path list
+  includes that path, clears the failure; a source-only patch does not. At the time, the reason was
+  "A file creation failed and was not corrected" and the report said "File creation still failed".
+  Finding 36 generalizes the rule to every failed write and renames those strings.
 - **Regression coverage.** `does not complete when the final report claims a failed file creation
   succeeded` applies the source patch, rejects a `create_file` for the existing test, and returns a
   report claiming both criteria passed against a passing validation; it asserts `NEEDS_INPUT`, the
@@ -797,6 +797,45 @@ a committed document; the day-to-day roadmap and open questions live in the unco
 - **What this shows.** A failed creation is a known negative, not an invisible no-op. The path match
   keeps a valid recovery unblocked; a failure for a path no later write touches remains unresolved
   for human review. This is a code-review finding, not a live run.
+
+### 36. An exact text edit removes the unified-diff hunk bottleneck
+
+- **The evidence.** W8 and W8b (findings 31 and 32) both read the exact source and test lines, then
+  still failed to produce a unified diff whose context and hunk ranges matched. W8 tried eight patches
+  and changed nothing; W8b applied one source patch but never applied the test patch and ended
+  `NEEDS_INPUT` with a blocking question. Four byte-identical resends were refused by the duplicate
+  guard. The repeated failure was patch construction, not localization or validation.
+- **The change.** `WorkspaceToolExecutor` now offers `replace_text` for an existing UTF-8 file. It takes
+  `path`, `oldText`, and `newText`; `oldText` must match literally and occur exactly once, and `newText`
+  may be empty to delete. It rejects a missing file, an outside path, binary content, identical old and
+  new text, missing or ambiguous snippets, text over 64,000 characters, and a file or result over 2 MB;
+  each refusal says nothing was changed and how to proceed. It preserves CRLF when the file uses it.
+  This is still a proposal the application authorizes: it has no shell, network, or
+  arbitrary-command path, and `apply_patch` / `create_file` remain available for multi-file,
+  multi-hunk, and new-file changes.
+- **Worker state.** A successful `replace_text` is a workspace change: it suppresses the no-change
+  nudge, invalidates an earlier validation, and forces validation before a final report. A failed
+  replacement is recorded by normalized path, and completion stays blocked until a later successful
+  write touches that path. A successful replacement can also clear a rejected patch when it writes
+  every path that patch named. The completion reason and report wording now cover both creation and
+  replacement ("A file write failed and was not corrected", "File write still failed").
+- **Prompts and audit.** The system and task prompts and the no-change, patch-failure, and
+  validation-failure nudges point to `replace_text` for a localized edit and keep `apply_patch` for
+  larger changes. The tool audit records the path and `oldCharacters` / `newCharacters`, not the
+  replacement text.
+- **Regression coverage.** `replaces exactly one exact snippet and preserves line endings` covers an
+  exact edit, deletion, and CRLF preservation. `rejects missing ambiguous or unbounded text
+  replacements` covers missing, ambiguous, identical, outside-path, missing-file, oversized text,
+  oversized file/result, binary, and missing-argument cases. `treats a text replacement as a workspace
+  change and forces revalidation` covers the change/validation rule. `does not complete when a failed
+  text replacement is not corrected`, `clears a failed text replacement when a later replacement
+  succeeds`, and `clears a failed patch when a later text replacement changes every named file` cover
+  unresolved-write and recovery behavior. The two focused suites pass 80/80.
+- **What this shows and what it does not.** The tool removes exact unified-diff hunk construction as a
+  failure mode for a localized edit, but no live run has exercised it yet. Whether
+  `qwen2.5-coder:14b` uses it, still over-reads, or still leaves criteria unevidenced is an empirical
+  question for W9; it must not be reported as an improvement until a live attempt completes. W8 and
+  W8b remain unconfirmed, and their `FAILED` / `NEEDS_INPUT` outcomes stand.
 
 ## Where this stands after the real-repository runs
 
@@ -899,7 +938,8 @@ fallback, not an automated completion, and the remaining automation gap is the l
 discipline. W8 and W8b did not exercise the changed-test evidence guidance: W8 never applied a patch,
 and W8b never changed the test. W8 correctly failed an unchanged task; W8b correctly stayed
 `NEEDS_INPUT` with one source-only change and exposed the applied-patch reset fixed in `fa7c789`.
-Neither run was confirmed.
+Neither run was confirmed. The `replace_text` response in finding 36 is the next local experiment;
+until W9 runs, the small-fixture path has no completed automated attempt on the current jar.
 
 ## Repository selection (the gate, in practice)
 

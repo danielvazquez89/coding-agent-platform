@@ -573,6 +573,238 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `treats a text replacement as a workspace change and forces revalidation`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("README.md"), "project context\n")
+        val provider = ScriptedProvider(
+            ModelTurn(null, listOf(call("run_validation", "{}")), "tool_calls", null, null),
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "replace_text",
+                        mapper.writeValueAsString(
+                            mapOf(
+                                "path" to "README.md",
+                                "oldText" to "project context",
+                                "newText" to "updated context"
+                            )
+                        )
+                    )
+                ),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                """{"summary":"Updated","implementation":"Replaced the context."}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("README.md"))).execute(task.id)
+
+        assertEquals("updated context\n", Files.readString(temporary.resolve("README.md")))
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(AttemptStatus.COMPLETED, attempts.finished?.status)
+        val report = attempts.finishedReport!!
+        assertEquals(
+            listOf("run_validation", "replace_text", "run_validation"),
+            report.toolExecutions.map { it.toolName }
+        )
+        val write = report.toolExecutions.single { it.toolName == "replace_text" }
+        assertEquals("path=README.md, oldCharacters=15, newCharacters=15", write.argumentsSummary)
+        assertFalse(write.argumentsSummary.contains("project context"))
+        assertTrue(
+            provider.messages.none { it.role == "user" && it.content.contains("you have not changed the workspace") },
+            provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
+        )
+    }
+
+    @Test
+    fun `does not complete when a failed text replacement is not corrected`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello guest\n")
+        Files.writeString(temporary.resolve("GreetingTest.java"), "class GreetingTest {}\n")
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "replace_text",
+                        mapper.writeValueAsString(
+                            mapOf(
+                                "path" to "Greeting.java",
+                                "oldText" to "Hello guest",
+                                "newText" to "Hello guest!"
+                            )
+                        )
+                    )
+                ),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "replace_text",
+                        mapper.writeValueAsString(
+                            mapOf(
+                                "path" to "GreetingTest.java",
+                                "oldText" to "class OldGreetingTest {}",
+                                "newText" to "class GreetingTest { void greetsNullNameAsGuest() {} }"
+                            )
+                        )
+                    )
+                ),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                """{"summary":"Applied","implementation":"Changed the greeting and added the test."}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("Greeting.java"))).execute(task.id)
+
+        // The greeting changed, but the test write was rejected. The final narrative still claims the
+        // test was added, so the machine must leave that failed write unresolved.
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        assertEquals(AttemptStatus.NEEDS_INPUT, attempts.finished?.status)
+        assertEquals("A file write failed and was not corrected", attempts.finished?.errorSummary)
+        val stored = attempts.finishedReport!!
+        assertTrue(stored.implementation.contains("File write still failed"), stored.implementation)
+        assertTrue(stored.openQuestions.isEmpty(), stored.openQuestions.toString())
+        assertEquals(
+            listOf("replace_text", "replace_text", "run_validation"),
+            stored.toolExecutions.map { it.toolName }
+        )
+        assertEquals("Hello guest!\n", Files.readString(temporary.resolve("Greeting.java")))
+        assertEquals("class GreetingTest {}\n", Files.readString(temporary.resolve("GreetingTest.java")))
+    }
+
+    @Test
+    fun `clears a failed text replacement when a later replacement succeeds`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("GreetingTest.java"), "class GreetingTest {}\n")
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "replace_text",
+                        mapper.writeValueAsString(
+                            mapOf(
+                                "path" to "GreetingTest.java",
+                                "oldText" to "class OldGreetingTest {}",
+                                "newText" to "class GreetingTest { void greetsNullNameAsGuest() {} }"
+                            )
+                        )
+                    )
+                ),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "replace_text",
+                        mapper.writeValueAsString(
+                            mapOf(
+                                "path" to "GreetingTest.java",
+                                "oldText" to "class GreetingTest {}",
+                                "newText" to "class GreetingTest { void greetsNullNameAsGuest() {} }"
+                            )
+                        )
+                    )
+                ),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                """{"summary":"Added a test","implementation":"Added the test through replace_text."}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("GreetingTest.java"))).execute(task.id)
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(AttemptStatus.COMPLETED, attempts.finished?.status)
+        assertEquals(
+            "class GreetingTest { void greetsNullNameAsGuest() {} }\n",
+            Files.readString(temporary.resolve("GreetingTest.java"))
+        )
+        val report = attempts.finishedReport!!
+        assertFalse(report.implementation.contains("File write still failed"), report.implementation)
+        assertEquals(
+            listOf("replace_text", "replace_text", "run_validation"),
+            report.toolExecutions.map { it.toolName }
+        )
+    }
+
+    @Test
+    fun `clears a failed patch when a later text replacement changes every named file`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("GreetingTest.java"), "class GreetingTest {}\n")
+        val rejected = listOf(
+            "diff --git a/GreetingTest.java b/GreetingTest.java",
+            "--- a/GreetingTest.java",
+            "+++ b/GreetingTest.java",
+            "@@ -1 +1 @@",
+            "-class OldGreetingTest {}",
+            "+class GreetingTest { void greetsNullNameAsGuest() {} }"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to rejected)))),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "replace_text",
+                        mapper.writeValueAsString(
+                            mapOf(
+                                "path" to "GreetingTest.java",
+                                "oldText" to "class GreetingTest {}",
+                                "newText" to "class GreetingTest { void greetsNullNameAsGuest() {} }"
+                            )
+                        )
+                    )
+                ),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                """{"summary":"Added a test","implementation":"Added the test through replace_text."}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("GreetingTest.java"))).execute(task.id)
+
+        // The rejected patch named this file, and the later exact replacement wrote it. That is a
+        // correction; the attempt must not stay blocked on the old patch failure.
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(AttemptStatus.COMPLETED, attempts.finished?.status)
+        val report = attempts.finishedReport!!
+        assertEquals(1, report.patchFailures.size)
+        assertTrue(report.implementation.contains("Patch recovery: 1"), report.implementation)
+        assertFalse(report.implementation.contains("Patch application still failed"), report.implementation)
+        assertEquals(
+            listOf("apply_patch", "replace_text", "run_validation"),
+            report.toolExecutions.map { it.toolName }
+        )
+        assertEquals(
+            "class GreetingTest { void greetsNullNameAsGuest() {} }\n",
+            Files.readString(temporary.resolve("GreetingTest.java"))
+        )
+    }
+
+    @Test
     fun `does not complete when the final report claims a failed file creation succeeded`() {
         val behavior = "Greeting handles a null name"
         val testCriterion = "A test covers the null name"
@@ -630,13 +862,13 @@ class TaskExecutionWorkerTest {
         // the machine must keep the failed creation unresolved.
         assertEquals(TaskStatus.NEEDS_INPUT, task.status)
         assertEquals(AttemptStatus.NEEDS_INPUT, attempts.finished?.status)
-        assertEquals("A file creation failed and was not corrected", attempts.finished?.errorSummary)
+        assertEquals("A file write failed and was not corrected", attempts.finished?.errorSummary)
         val stored = attempts.finishedReport!!
         assertEquals(listOf("Greeting.java"), stored.changedFiles)
         assertEquals(CheckOutcome.PASSED, stored.validation.single().outcome)
         assertTrue(stored.acceptanceChecks.all { it.outcome == AcceptanceOutcome.PASSED })
         assertTrue(stored.openQuestions.isEmpty(), stored.openQuestions.toString())
-        assertTrue(stored.implementation.contains("File creation still failed"))
+        assertTrue(stored.implementation.contains("File write still failed"))
         assertEquals("Hello guest\nWorld guest\n", Files.readString(temporary.resolve("Greeting.java")))
         assertEquals("class GreetingTest {}\n", Files.readString(temporary.resolve("GreetingTest.java")))
         assertEquals(
@@ -690,7 +922,7 @@ class TaskExecutionWorkerTest {
         )
         val report = attempts.finishedReport!!
         assertEquals(CheckOutcome.PASSED, report.validation.single().outcome)
-        assertTrue(!report.implementation.contains("File creation still failed"))
+        assertTrue(!report.implementation.contains("File write still failed"))
         assertEquals(
             listOf("create_file", "apply_patch", "run_validation"),
             report.toolExecutions.map { it.toolName }
