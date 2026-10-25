@@ -977,6 +977,48 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   edit: the diff and validation were right, only the report was stale. W12 remains an unconfirmed
   `NEEDS_INPUT`; a rerun on the fixed jar is the next experiment.
 
+### 41. The prefix task completes twice in three runs; one run makes no tool call
+
+- **Setup.** W13 (`6ceea219-8de9-40b7-a119-2794dea2c94d`, attempt
+  `410966f6-be52-4d4a-8f6e-9f1f3d82ae45`), W14 (`02ce0edd-14d8-4e24-9cec-2783efa8bbe8`, attempt
+  `0e96e8d2-9110-4a38-9d74-9b8208925ee6`) and W15 (`6fd5f061-3c9c-4bd5-9ea8-8fc2178bbcf6`, attempt
+  `88cd9e2e-6ea6-4f4c-a745-14cf16b8db4a`) repeated W12's prefix task on `small-java` at `6187794`,
+  with the same jar built from `e97a440` (the stale-report guard) and the same local
+  `qwen2.5-coder:14b` settings.
+- **W13: completed after a failed validation and several rejected edits.** 24 model calls, 20 tool
+  calls, 1,667 seconds (~27m46s); 93,250 prompt / 3,473 completion tokens. Two `replace_text` calls
+  that tried to replace the bare `"Hello "` were rejected as ambiguous, a 38-character-to-3-character
+  edit left the source incomplete, and validation failed 3/3 after the test edit. The model read the
+  source, had a 30-to-27-character replacement rejected because the text did not match, read it three
+  more times, then replaced the 3-character fragment with the full 35-character line carrying the new
+  prefix. The final validation passed 3/3. All four criteria were `PASSED` with evidence and no
+  question remained; the 881-byte diff was untruncated, and the exported patch applied to a fresh
+  clone and passed `mvn -B -o test` 2/2 outside the platform.
+- **W14: an honest no-change failure.** 4 model calls, **0 tool calls**, 285 seconds (~4m45s); 9,575
+  prompt / 888 completion tokens. The model wrote a plan as prose whose `implementation` contained
+  JSON pseudo tool calls (`find_symbol`, `replace_file`) but never invoked a tool. The worker ran its
+  automatic baseline validation on the unchanged tree (it passed 2/2) and failed the task with "The
+  agent did not produce a repository change". `changedFiles=[]`, the patch was empty, and every
+  criterion stayed `UNVERIFIED`: no false pass.
+- **W15: clean completion.** 8 model calls, 7 tool calls, 646 seconds (~10m45s); 21,723 prompt /
+  2,028 completion tokens. `find_symbol`, `read_file`, `replace_text` (source), `find_symbol`,
+  `read_file` (the whole test), `replace_text` (test), `run_validation` passed 3/3. All four criteria
+  were `PASSED` with evidence and no question remained; the same 881-byte diff was untruncated, and
+  its exported patch also applied and passed 2/2 on a fresh clone.
+- **What this shows and does not.** The second task class is 2/3: two correct, evidenced completions
+  and one model stall that the platform failed honestly. That is not yet the 2/2 of the null-handling
+  class, and another run would refine the estimate rather than change the platform's behavior. W13
+  and W15 also show the task can be reached through different edit paths: a long recovery from
+  ambiguous and malformed replacements, and a clean seven-call sequence. The stale-report guard was
+  not directly exercised by these runs — W13 recovered from its failed validation and produced a
+  fresh report, W14 never called a tool, and W15 never failed validation — so its evidence remains
+  the regression test and W12. W12 stays unconfirmed.
+
+The next slice is the phase-2 baseline rather than another prefix run. The two completions already
+characterize the task class, and the third run's failure is a model behavior the platform handled
+correctly; repeating it would not change the code or the safety story. The baseline should carry the
+model-side no-tool-call failure as a known outcome, not average it away.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -1052,8 +1094,8 @@ The JSON-java task carries the whole repository and a 24-call budget; this fixtu
 model's report discipline. `small-java` is a 30-line Maven project (JUnit 4.13.2, compiler 3.11.0).
 W1/W2 fix a null-handling bug in `Greeting.greet` (three criteria: null returns "Hello guest", a test
 covers it, the suite passes); W3 adds a test for surrounding-whitespace trimming (two criteria: the
-test exists, the suite passes); W12 changes the named greeting prefix from "Hello " to "Hi " and
-updates the existing test (four criteria), the second task class.
+test exists, the suite passes); W12-W15 change the named greeting prefix from "Hello " to "Hi " and
+update the existing test (four criteria), the second task class.
 
 | Run | Model | Outcome |
 | --- | --- | --- |
@@ -1072,6 +1114,9 @@ updates the existing test (four criteria), the second task class.
 | W10 `d0516b53` attempt `350f0a74` | same, jar `47a780b` (cited-method check, quote normalization, missing-test nudge) | 6 tool calls: 2 `find_symbol`, 2 `read_file`, one 896-char `apply_patch` (null guard plus `greetsNullNameAsGuest`), `run_validation` **PASSED** 3/3; both files changed, all three criteria PASSED with real evidence -> **COMPLETED**; export 200, 1,025-byte patch applied to a fresh `6187794` clone, `mvn -B -o test` 3/3 outside; 7 model calls / 10m51s (finding 38) |
 | W11 `38885077` attempt `179bed06` | same, jar `47a780b` | 7 tool calls: `find_symbol`, `read_file`, `replace_text` (source null guard), `find_symbol`, `read_file`, `apply_patch` (test), `run_validation` **PASSED** 3/3; both files changed, all three criteria PASSED -> **COMPLETED**; export 200, 1,037-byte patch applied to a fresh `6187794` clone, `mvn -B -o test` 3/3 outside; 8 model calls / 7m45s (finding 39) |
 | W12 `a354a70f` attempt `5339de70` | second task class: change the named prefix to "Hi " and update the existing test; same jar `47a780b` | 15 tool calls: 3 rejected `replace_text` (ambiguous "Hello "), 1 rejected patch, a successful test `replace_text`, a failed validation, a successful source `apply_patch`, automatic validation **PASSED** 3/3; both files changed, 881-byte untruncated diff. The model then sent an empty turn and the worker reused its earlier FAILED report and blocking question -> **NEEDS_INPUT**; 16 model calls / 11m45s (finding 40) |
+| W13 `6ceea219` attempt `410966f6` | same second task class, jar `e97a440` (stale-report guard) | 20 tool calls: 2 ambiguous `replace_text` rejections, a 38-to-3-character source edit, a test `replace_text`, validation **FAILED** 3/3, a rejected 30-to-27-character replacement, 3 reads, a 3-to-35-character repair, validation **PASSED** 3/3; both files changed, 881-byte untruncated diff, all four criteria PASSED -> **COMPLETED**; export 200, patch applied to a fresh `6187794` clone, `mvn -B -o test` 2/2 outside; 24 model calls / 27m46s (finding 41) |
+| W14 `02ce0edd` attempt `0e96e8d2` | same | 4 model calls, **0 tool calls**: the model narrated pseudo tool calls as prose and made no change; the automatic baseline validation passed 2/2 on the unchanged tree, `changedFiles=[]`, all criteria UNVERIFIED -> **FAILED** ("The agent did not produce a repository change"); 4m45s (finding 41) |
+| W15 `6fd5f061` attempt `88cd9e2e` | same | 7 tool calls: `find_symbol`, `read_file`, `replace_text` (source), `find_symbol`, `read_file`, `replace_text` (test), `run_validation` **PASSED** 3/3; both files changed, 881-byte untruncated diff, all four criteria PASSED -> **COMPLETED**; export 200, patch applied to a fresh `6187794` clone, `mvn -B -o test` 2/2 outside; 8 model calls / 10m45s (finding 41) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
 validation; the remaining gap is the report's acceptance assessment (finding 24). W6 repeated it with
@@ -1095,8 +1140,11 @@ a fresh clone. The narrow task class is now reproducible at 2/2 on the current r
 W12 (finding 40) tried the second task class: the model coordinated a test edit and a source edit
 through three rejected ambiguous replacements and still produced the correct two-file diff and a
 passing 3/3 validation, but an empty final turn reused a report from before the repair. The worker now
-reuses an earlier report only while no tool has run since it was produced; W12 remains an unconfirmed
-`NEEDS_INPUT`, and a rerun on the fixed jar is the next experiment.
+reuses an earlier report only while no tool has run since it was produced, and W13/W15 completed the
+same task on that rule (finding 41). W13 recovered from a failed validation and several rejected
+edits; W15 took a clean seven-call path. W14 made no tool call at all and failed honestly as an
+unchanged task. The second task class is therefore 2/3, not yet the 2/2 of the null-handling class,
+and W12 remains an unconfirmed `NEEDS_INPUT`.
 
 ## Repository selection (the gate, in practice)
 
