@@ -77,7 +77,14 @@ The conservatism is deliberate:
   conversation; a changed test that calls the changed code and asserts the required result is valid
   evidence when that test ran in the passing validation, and the model must cite the test method and
   assertion. A test name alone proves only that the test exists, and Maven alone does not prove the
-  behavior. A blocking question from the model is accepted as a legitimate `NEEDS_INPUT` stop. A
+  behavior. A cited test method is also checked in the final workspace: if the report names a method
+  that is not declared in a test-like file, that check is downgraded to `UNVERIFIED` with the rejection
+  recorded, because a narrative claim is not evidence of a test. When a report marks a test-requiring
+  criterion `PASSED` but no test file changed, the worker asks once for the missing edit before
+  accepting the report; a cited method that already exists is left alone, and build output is not
+  evidence. Criteria are matched after normalizing whitespace and quote style, so a report that copies
+  a criterion with single quotes instead of the task's double quotes still counts. A blocking question
+  from the model is accepted as a legitimate `NEEDS_INPUT` stop. A
   small-fixture run applied the correct null check and test and passed Docker validation, yet left one
   criterion `UNVERIFIED` and ended `NEEDS_INPUT`; that is the case this second nudge addresses. A failed
   supported validation is a known negative result, not an open question: unless the model asked a
@@ -132,7 +139,7 @@ The worker's tool allowlist is `list_files`, `search_code`, `find_symbol`, `read
 
 `NEEDS_INPUT` tasks can be answered through the review page or API. The answer is prepended to the task prompt as a labeled clarification so it remains in the prompt when the original description is long; a status-history entry records the requeue, and a fresh attempt runs against a new workspace. The previous report remains available in attempt history.
 
-When acceptance criteria are supplied, the agent must return one evidence-bearing assessment per criterion. Missing or evidence-free checks prevent completion; failed criteria fail the task, and unverified criteria require input. This is a model assessment, not independent proof: Maven tests and benchmark-specific expected-diff checks provide separate machine-verifiable evidence. A task is completed only when the workspace changed, all supplied criteria are reported as passed, supported validation passed, and no patch or file-write failure remains unresolved. A failed patch, file creation, or text replacement must never be treated as applied just because the final narrative says so.
+When acceptance criteria are supplied, the agent must return one evidence-bearing assessment per criterion. Missing or evidence-free checks prevent completion; failed criteria fail the task, and unverified criteria require input. This is a model assessment, not independent proof: Maven tests and benchmark-specific expected-diff checks provide separate machine-verifiable evidence. A task is completed only when the workspace changed, all supplied criteria are reported as passed, supported validation passed, and no patch or file-write failure remains unresolved. A failed patch, file creation, or text replacement must never be treated as applied just because the final narrative says so. A cited test method is checked against test-like files in the final workspace, with VCS, build-output, dependency, and IDE directories skipped; a method the workspace does not declare downgrades that check to `UNVERIFIED`, so a fabricated test cannot satisfy completion. The check only ever weakens a claim.
 
 #### Draft pull-request publishing
 
@@ -690,7 +697,7 @@ Do these as small vertical slices. Keep the app runnable after each slice and do
 
 ### 1. Make one narrow task class reliable
 
-Target a small Java/Maven bug fix on a disposable repository: locate the exact code, change it, update the test that asserts the old behavior, and pass Docker validation. `replace_text` removes the unified-diff hunk bottleneck for a localized edit while every write remains path-checked and every unresolved write keeps blocking completion. Use the local `qwen2.5-coder:14b` fixture runs to reproduce one complete attempt before widening the task class. **Exit gate:** one reproducible task completes with a changed file, an updated test, passing validation, and evidenced criteria, with no false success on the negative controls. The `replace_text` slice now implements the tool and its completion rules; no live run has exercised it yet.
+Target a small Java/Maven bug fix on a disposable repository: locate the exact code, change it, update the test that asserts the old behavior, and pass Docker validation. `replace_text` removes the unified-diff hunk bottleneck for a localized edit while every write remains path-checked and every unresolved write keeps blocking completion. Use the local `qwen2.5-coder:14b` fixture runs to reproduce one complete attempt before widening the task class. **Exit gate:** one reproducible task completes with a changed file, an updated test, passing validation, and evidenced criteria, with no false success on the negative controls. W9 exercised `replace_text` for the first time: the model fixed the source with one exact edit and passed Docker validation, but never wrote the test it claimed and left the source criterion unverified. The cited-method check and the missing-test nudge are the follow-up; the exit gate still requires a run that changes the test as well.
 
 ### 2. Establish a measurable baseline
 

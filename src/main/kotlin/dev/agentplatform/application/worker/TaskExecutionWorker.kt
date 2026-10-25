@@ -10,7 +10,11 @@ import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
 import org.eclipse.microprofile.config.inject.ConfigProperty
 import org.jboss.logging.Logger
+import java.nio.file.FileVisitResult
+import java.nio.file.Files
 import java.nio.file.Path
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
@@ -183,7 +187,7 @@ class TaskExecutionWorker @Inject constructor(
             val modelQuestions = parsedReport.questions
             val blockingQuestions = modelQuestions.filter(AgentQuestion::blocking)
             val lastValidation = validation.lastOrNull()
-            val acceptanceChecks = acceptanceChecks(task, parsedReport.acceptanceChecks)
+            val acceptanceChecks = acceptanceChecks(task, parsedReport.acceptanceChecks, workspace.root)
             // A failed supported validation or an unchanged workspace is a known negative result,
             // not a missing assessment. The attempt must not become NEEDS_INPUT just because the
             // model also left its criteria UNVERIFIED: there is nothing an answer can verify when
@@ -305,7 +309,7 @@ class TaskExecutionWorker @Inject constructor(
                     )
                 ),
                 validation = validation.toList(),
-                acceptanceChecks = acceptanceChecks(task, emptyList()),
+                acceptanceChecks = unverifiedAcceptanceChecks(task),
                 modelUsage = trace.usage(),
                 executionDurationMillis = elapsedMillis(executionStartedAt),
                 toolExecutions = trace.toolExecutions.toList(),
@@ -340,7 +344,7 @@ class TaskExecutionWorker @Inject constructor(
                 validation = validation.toList(),
                 patchDiff = patch?.diff,
                 patchDiffTruncated = patch?.truncated == true,
-                acceptanceChecks = acceptanceChecks(task, emptyList()),
+                acceptanceChecks = unverifiedAcceptanceChecks(task),
                 patchFailures = trace.patchFailures.toList(),
                 modelUsage = trace.usage(),
                 executionDurationMillis = elapsedMillis(executionStartedAt),
@@ -380,6 +384,7 @@ class TaskExecutionWorker @Inject constructor(
         var reportFormatRetries = 0
         var validationFixRetries = 0
         var acceptanceFixRetries = 0
+        var missingTestRetries = 0
         var lastPatchFailure: String? = null
         var lastToolResult: String? = null
         var workspaceChanged = false
@@ -387,7 +392,7 @@ class TaskExecutionWorker @Inject constructor(
         var lastModelText: String? = null
         repeat(
             maxToolCalls + MAX_PATCH_FAILURE_RETRIES + MAX_REPORT_FORMAT_RETRIES + MAX_VALIDATION_FIX_RETRIES +
-                MAX_ACCEPTANCE_FIX_RETRIES + 4
+                MAX_ACCEPTANCE_FIX_RETRIES + MAX_MISSING_TEST_RETRIES + 4
         ) {
             checkBudget(trace.startedAtNanos, trace)
             val modelCallStartedAt = System.nanoTime()
@@ -479,14 +484,63 @@ class TaskExecutionWorker @Inject constructor(
                     )
                     return@repeat
                 }
+                // W9 applied the source edit with replace_text, read the existing test, then returned
+                // a report claiming it had created that test. No test file had changed. Ask once,
+                // before accepting the report, for the missing test edit. A report that cites a test
+                // method that already exists is left alone: the edit may not be needed.
+                val missingTestClaim = parsedReport.acceptanceChecks.firstOrNull { check ->
+                    check.outcome == AcceptanceOutcome.PASSED &&
+                        check.evidence != null &&
+                        task.acceptanceCriteria.any {
+                            normalizeCriterion(it) == normalizeCriterion(check.criterion)
+                        } &&
+                        missingCitedTestMethod(root, check.evidence) != null
+                }
+                val vagueTestClaim = parsedReport.acceptanceChecks.any { check ->
+                    check.outcome == AcceptanceOutcome.PASSED &&
+                        citedTestMethod(check.evidence.orEmpty()) == null &&
+                        task.acceptanceCriteria.any {
+                            normalizeCriterion(it) == normalizeCriterion(check.criterion) &&
+                                requiresTestChange(it)
+                        }
+                }
+                if (
+                    (missingTestClaim != null || vagueTestClaim) &&
+                    parsedReport.questions.none { it.blocking } &&
+                    workspaceChanged &&
+                    validation.lastOrNull()?.outcome == CheckOutcome.PASSED &&
+                    trace.unresolvedPatchFailure == null &&
+                    trace.unresolvedWriteFailures.isEmpty()
+                ) {
+                    val changed = workspace.changedFiles()
+                    if (changed.none(::looksLikeTestFile) && missingTestRetries < MAX_MISSING_TEST_RETRIES) {
+                        missingTestRetries++
+                        val missingMethod = missingTestClaim?.evidence?.let(::citedTestMethod)
+                        messages += ModelMessage(
+                            "user",
+                            buildString {
+                                append("Your report marks a test PASSED, but no test file changed: the changed files are ")
+                                append(changed.joinToString(", "))
+                                append(". ")
+                                if (missingMethod != null) {
+                                    append("The cited test method '")
+                                    append(missingMethod.take(120))
+                                    append("' is not in the workspace. ")
+                                }
+                                append("If the task requires a test, open the existing test file with read_file and add or update it with replace_text (or apply_patch for a larger edit), then call run_validation again. Do not claim a test that is not in the workspace. If the task does not require a new test, cite an existing test method and its assertion; otherwise mark that criterion UNVERIFIED with the reason, or return a blocking question with its impact.")
+                            }
+                        )
+                        return@repeat
+                    }
+                }
                 // A correct patch and a passing validation are not enough if the report never assessed a
                 // supplied criterion: run W1 applied the right two-file change and passed Docker
                 // validation, yet marked the first criterion UNVERIFIED with no evidence, so the task
                 // ended NEEDS_INPUT with no question to answer. Ask once or twice for the assessment,
                 // with the evidence the conversation already contains; a blocking question is a
                 // legitimate way to stop and is left alone.
-                val unassessed = acceptanceChecks(task, parsedReport.acceptanceChecks)
-                    .filter { it.outcome == AcceptanceOutcome.UNVERIFIED }
+                val assessed = acceptanceChecks(task, parsedReport.acceptanceChecks, root)
+                val unassessed = assessed.filter { it.outcome == AcceptanceOutcome.UNVERIFIED }
                 if (
                     !parsedReport.isEmpty &&
                     parsedReport.questions.none { it.blocking } &&
@@ -515,7 +569,7 @@ class TaskExecutionWorker @Inject constructor(
                             append(acceptanceValidation.outcome)
                             append(". Return a new single JSON object with summary, implementation, decisions, openQuestions and exactly one acceptanceChecks entry per supplied criterion, for example ")
                             append("""{"criterion":"$exampleCriterion","outcome":"PASSED","evidence":"<changed file and line, test method plus the assertion it makes, or the validation result>"}""")
-                            append(". Mark a criterion PASSED only with concrete evidence from the tool results above; otherwise mark it FAILED or UNVERIFIED with the reason. If a changed test calls the changed code and asserts the required result, cite that test method and assertion as evidence for the behavior criterion; the passing validation above shows it ran. The same test can evidence both the behavior criterion and a criterion that requires a test to exist. A test name alone proves only that the test exists. Do not mark a behavior criterion UNVERIFIED merely because its evidence is a test rather than a direct tool output, and do not mark it PASSED from Maven alone. Do not invent a file, test, or validation result, and do not resend the previous report unchanged.")
+                            append(". Mark a criterion PASSED only with concrete evidence from the tool results above; otherwise mark it FAILED or UNVERIFIED with the reason. If a changed test calls the changed code and asserts the required result, cite that test method and assertion as evidence for the behavior criterion; the passing validation above shows it ran. The same test can evidence both the behavior criterion and a criterion that requires a test to exist. A test name alone proves only that the test exists, and a cited test method is checked against the workspace. Do not mark a behavior criterion UNVERIFIED merely because its evidence is a test rather than a direct tool output, and do not mark it PASSED from Maven alone. Do not invent a file, test, or validation result, and do not resend the previous report unchanged.")
                         }
                     )
                     return@repeat
@@ -1116,18 +1170,119 @@ class TaskExecutionWorker @Inject constructor(
         return last
     }
 
-    private fun acceptanceChecks(task: CodingTask, reported: List<AcceptanceCheck>): List<AcceptanceCheck> {
-        val byCriterion = reported.groupBy(AcceptanceCheck::criterion)
+    private fun unverifiedAcceptanceChecks(task: CodingTask): List<AcceptanceCheck> =
+        task.acceptanceCriteria.map { AcceptanceCheck(it, AcceptanceOutcome.UNVERIFIED) }
+
+    private fun acceptanceChecks(
+        task: CodingTask,
+        reported: List<AcceptanceCheck>,
+        workspaceRoot: Path
+    ): List<AcceptanceCheck> {
+        val byCriterion = reported.groupBy { normalizeCriterion(it.criterion) }
         return task.acceptanceCriteria.map { criterion ->
-            val matches = byCriterion[criterion].orEmpty()
+            val matches = byCriterion[normalizeCriterion(criterion)].orEmpty()
             val check = matches.singleOrNull()
+            val evidence = check?.evidence
             when {
                 check == null -> AcceptanceCheck(criterion, AcceptanceOutcome.UNVERIFIED)
-                check.outcome == AcceptanceOutcome.PASSED && check.evidence.isNullOrBlank() ->
-                    check.copy(outcome = AcceptanceOutcome.UNVERIFIED)
-                else -> check
+                check.outcome == AcceptanceOutcome.PASSED && evidence.isNullOrBlank() ->
+                    check.copy(criterion = criterion, outcome = AcceptanceOutcome.UNVERIFIED)
+                check.outcome == AcceptanceOutcome.PASSED && evidence != null -> {
+                    val missing = missingCitedTestMethod(workspaceRoot, evidence)
+                    if (missing == null) check.copy(criterion = criterion) else check.copy(
+                        criterion = criterion,
+                        outcome = AcceptanceOutcome.UNVERIFIED,
+                        evidence = "${evidence.take(400)} (Rejected by the worker: the cited test method " +
+                            "'$missing' was not found in the workspace.)"
+                    )
+                }
+                else -> check.copy(criterion = criterion)
             }
         }
+    }
+
+    /**
+     * Quote style and whitespace are formatting, not meaning: a report may copy a criterion with
+     * different quotes. Canonicalizing quote characters (rather than deleting them) keeps two
+     * criteria that quote different values distinct.
+     */
+    private fun normalizeCriterion(text: String): String =
+        text.replace(Regex("""["'`\u2018\u2019\u201c\u201d]"""), "\"")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    /**
+     * The missing-test nudge is for a report that claims a test exists, not for every report whose
+     * criteria happen to contain the word "test": "the test suite passes" is a validation result, not
+     * a promise that a test file changed.
+     */
+    private fun requiresTestChange(criterion: String): Boolean {
+        val text = normalizeCriterion(criterion)
+        if (TEST_SUITE.containsMatchIn(text)) return false
+        return TEST_REQUIREMENT.containsMatchIn(text)
+    }
+
+    /**
+     * A model can name a test that it never wrote. The report's narrative is not evidence, but the
+     * final workspace is: when the evidence explicitly cites a test method, require that method to
+     * exist in a test file. A missing method downgrades the claim to UNVERIFIED instead of accepting
+     * a fabricated pass. This only ever weakens a claim, never turns an unverified one into a pass.
+     */
+    private fun missingCitedTestMethod(workspaceRoot: Path, evidence: String): String? {
+        val method = citedTestMethod(evidence) ?: return null
+        return if (testMethodExists(workspaceRoot, method)) null else method
+    }
+
+    private fun citedTestMethod(evidence: String): String? {
+        BACKTICKED_TEST_METHOD.find(evidence)?.let { return it.groupValues[1] }
+        return TEST_METHOD.find(evidence)?.groupValues?.get(1)
+    }
+
+    private fun testMethodExists(workspaceRoot: Path, method: String): Boolean {
+        val declaration = Regex("(?<![\\w$])" + Regex.escape(method) + "\\s*\\(")
+        val backticked = Regex("`" + Regex.escape(method) + "`")
+        var found = false
+        var inspected = 0
+        return try {
+            Files.walkFileTree(
+                workspaceRoot,
+                emptySet(),
+                MAX_TEST_EVIDENCE_DEPTH,
+                object : SimpleFileVisitor<Path>() {
+                    override fun preVisitDirectory(dir: Path, attrs: BasicFileAttributes): FileVisitResult {
+                        if (dir != workspaceRoot && dir.fileName.toString().lowercase() in TEST_EVIDENCE_IGNORED_DIRECTORIES) {
+                            return FileVisitResult.SKIP_SUBTREE
+                        }
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                        if (inspected >= MAX_TEST_EVIDENCE_FILES) return FileVisitResult.TERMINATE
+                        val relative = workspaceRoot.relativize(file).toString().replace('\\', '/')
+                        if (!attrs.isRegularFile || !looksLikeTestFile(relative)) return FileVisitResult.CONTINUE
+                        if (attrs.size() > MAX_TEST_EVIDENCE_FILE_BYTES) return FileVisitResult.CONTINUE
+                        val text = Files.readString(file)
+                        inspected++
+                        if (declaration.containsMatchIn(text) || backticked.containsMatchIn(text)) {
+                            found = true
+                            return FileVisitResult.TERMINATE
+                        }
+                        return FileVisitResult.CONTINUE
+                    }
+                }
+            )
+            found
+        } catch (failure: Exception) {
+            log.warnf(failure, "Could not verify cited test method '%s' under %s", method, workspaceRoot)
+            false
+        }
+    }
+
+    private fun looksLikeTestFile(path: String): Boolean {
+        val normalized = path.replace('\\', '/').lowercase()
+        val segments = normalized.split('/')
+        if (segments.dropLast(1).any { it in TEST_DIRECTORY_NAMES }) return true
+        return TEST_FILE_NAME.matches(segments.lastOrNull().orEmpty())
     }
 
     /**
@@ -1283,6 +1438,26 @@ class TaskExecutionWorker @Inject constructor(
         const val MAX_REPORT_FORMAT_RETRIES = 2
         const val MAX_VALIDATION_FIX_RETRIES = 2
         const val MAX_ACCEPTANCE_FIX_RETRIES = 2
+        const val MAX_MISSING_TEST_RETRIES = 1
+        const val MAX_TEST_EVIDENCE_DEPTH = 12
+        const val MAX_TEST_EVIDENCE_FILES = 200
+        const val MAX_TEST_EVIDENCE_FILE_BYTES = 500_000L
+        val TEST_EVIDENCE_IGNORED_DIRECTORIES = setOf(
+            ".git", "target", "build", "out", "dist", ".gradle", ".idea", "node_modules", ".venv", "vendor"
+        )
+        val TEST_DIRECTORY_NAMES = setOf("test", "tests")
+        val TEST_FILE_NAME = Regex(""".*(?:test|tests|spec|it)\.(?:java|kt)$""")
+        val TEST_SUITE = Regex("""(?i)\btests?\s+(?:suite|run|runs|results?|report|reports)\b""")
+        val TEST_REQUIREMENT = Regex(
+            """(?i)(?:\b(?:a|an|the|new|another)\s+(?:(?:new|junit|unit|regression|integration)\s+)*tests?\b)""" +
+                """|(?:\b(?:add|adds|added|create|creates|created|write|writes|wrote|written|update|updates|updated|include|includes|included)\b[^.;\n]{0,30}\btests?\b)""" +
+                """|(?:\btests?\s+(?:method|case|file|coverage|added|created|written)\b)""" +
+                """|(?:\btests?\s+(?:cover|covers|assert|asserts|checks|verifies)\b)"""
+        )
+        val TEST_METHOD =
+            Regex("""(?i)\b(?:new\s+)?test\s+(?:method|case)\s+['"\u2018\u2019\u201c\u201d]?([A-Za-z_$][\w$]*)""")
+        val BACKTICKED_TEST_METHOD =
+            Regex("""(?i)\b(?:new\s+)?test\s+(?:method|case)\s+`([^`\n]{1,120})`""")
         const val DISABLED_SENTINEL = "disabled"
         const val FIXED_MESSAGE_COUNT = 2
         const val TOOL_ROLE = "tool"

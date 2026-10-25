@@ -201,6 +201,19 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   rejects text over 64,000 characters, files or results over 2 MB, binary content, and missing or
   ambiguous matches without writing. It is not a fuzzy editor; do not widen it to make a model's output
   fit.
+- **A cited test method must exist in the final workspace.** A report can name a test it never wrote, as
+  W9 did. `TaskExecutionWorker` scans test-like files (a path segment `test`/`tests`, or a name ending
+  `Test`, `Tests`, `Spec`, or `IT` with `.java`/`.kt`) for a declaration or a backticked name, skipping
+  VCS, build-output, dependency, and IDE directories and bounded to depth 12, 200 files, 500 KB each. A
+  missing method, or a scan failure, downgrades that `PASSED` check to `UNVERIFIED` with the rejection
+  in the evidence. The check can only weaken a claim; never treat the report narrative as proof of a
+  test.
+- **A claimed-but-unwritten test gets one nudge.** When a report marks a test-requiring criterion
+  `PASSED` but no test file changed, the worker asks once for the missing edit before accepting the
+  report. The nudge requires a changed workspace, a passing validation, no blocking question, and no
+  unresolved patch or write failure. A cited method that already exists is left alone, because a fix
+  may legitimately be validated by an existing regression test. Criterion matching normalizes
+  whitespace and quote style, so a quote-only difference in a copied criterion does not block it.
 - **Patch format differs by model family, and both common formats are accepted.** `apply_patch` takes a
   git unified diff, or the Codex `*** Begin Patch` / `*** Update File:` envelope that the OpenAI
   open-weight `gpt-oss` family emits. The envelope is converted to a unified diff first

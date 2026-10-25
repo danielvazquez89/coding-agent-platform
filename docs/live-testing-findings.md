@@ -837,6 +837,52 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   question for W9; it must not be reported as an improvement until a live attempt completes. W8 and
   W8b remain unconfirmed, and their `FAILED` / `NEEDS_INPUT` outcomes stand.
 
+### 37. `replace_text` fixes the source edit; the model invents the test and the report accepts it
+
+- **Setup.** W9 (`6246c9d6-58d1-45be-ab31-074f2f1c1edc`, attempt
+  `2034440d-8c74-4d82-bc9b-a110e0219de0`) ran the null-handling task on `small-java` at `6187794`
+  with local `qwen2.5-coder:14b`, context 8192, and Docker validation. The attempt made 9 model calls
+  and 6 tool calls in about 10m41s (24,737 prompt / 1,933 completion tokens; 643,549 ms of model
+  time).
+- **The source edit worked on the first write.** The tool sequence was `find_symbol`, `read_file`,
+  `replace_text`, `find_symbol`, `read_file`, `run_validation`. The replacement changed
+  `if (name.isBlank())` to `if (name == null || name.isBlank())`; the only changed file was
+  `src/main/java/example/Greeting.java`, and validation passed 2/2. This is the first live use of
+  `replace_text`, and it replaced W8/W8b's repeated rejected unified diffs with one exact edit.
+- **The report fabricated the test.** The model never called `create_file` or `replace_text` for
+  `GreetingTest.java`; the tool audit has no such call. Its report marked the test criterion `PASSED`
+  with the evidence "Test method greetsNullNameAsGuest in GreetingTest.java", but the method did not
+  exist, and validation had run the old two-test suite. Criterion 1 was `UNVERIFIED` only because the
+  model quoted `'Hello guest'` with single quotes while the task used `"Hello guest"`; criterion 3
+  passed. The task ended `NEEDS_INPUT` ("Acceptance criteria could not be verified"), patch export
+  returned `409`, and the stored 467-byte diff was untruncated and correct.
+- **Fix: verify a cited method, and match quote style.** Criterion matching now normalizes whitespace
+  and quote characters, so a report that copies a criterion with different quotes still matches while
+  two criteria that quote different values remain distinct. A `PASSED` check that explicitly cites a
+  test method is checked against the final workspace: test-like files (a path segment `test`/`tests`,
+  or a name ending `Test`, `Tests`, `Spec`, or `IT` with `.java`/`.kt`) are scanned for a declaration
+  or a backticked name, bounded to depth 12, 200 files and 500 KB per file, skipping VCS, build
+  output, dependency and IDE directories. A missing method, or a scan failure, downgrades the check to
+  `UNVERIFIED` and records the rejection. The check can only ever weaken a claim.
+- **Nudge.** When a report marks a test-requiring criterion `PASSED` but no test file changed, the
+  worker asks once for the missing edit, and only when the workspace changed, validation passed, no
+  blocking question remains, and no patch or write failure is unresolved. A cited method that already
+  exists is left alone, so a fix validated by an existing regression test is not asked to add another.
+  The prompt now tells the model that a cited test method is checked against the workspace.
+- **Regression coverage.** `rejects a cited test method that is absent from the final workspace` also
+  places a matching declaration in `target/` and an oversized `HugeTest.java` to prove build output
+  and the size bound are skipped. `matches a criterion that differs only in quote style` covers the
+  W9 mismatch, and `nudges once when the report claims a test but no test file changed` covers the
+  nudge and the recovery write; `does not treat a test-suite validation criterion as a missing test`
+  covers the suite exclusion. The worker suite is 56 tests; the full gate is 298 tests with the
+  coverage checks met.
+- **What this shows and does not.** W9 is both a real improvement in the write path and a real
+  false-positive in the report: the model changed the source with one exact edit, then described a
+  test it never wrote. The evidence check turns that claim into `UNVERIFIED` instead of a completion,
+  and the nudge gives the model one chance to make it true. W9 remains an unconfirmed `NEEDS_INPUT`,
+  and no run has yet completed the small-fixture task with both the source and the test changed on the
+  current jar. W8, W8b and W9 remain unconfirmed.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
@@ -927,6 +973,7 @@ test exists, the suite passes).
 | W7 `5e5b7731` attempt `bff28ad1` | same, jar `b3673c1` (concrete acceptance nudge) | 8 calls: `find_symbol`, two reads, a 891-char implicit-hunk rejection, a 972-char context rejection, an identical-resend rejection, a corrected 1,034-char patch applied, validation **PASSED**; criteria 2-3 PASSED with evidence, criterion 1 UNVERIFIED -> `NEEDS_INPUT`; 12 calls / 25m46s. Reviewer confirmation -> **COMPLETED**; exported 1,037-byte patch applied to a fresh `6187794` clone, `mvn -B -o test` 3/3 (finding 30) |
 | W8 `28a2fb5a` attempt `ddbc7275` | same, jar with the acceptance-evidence prompt, before the applied-patch fix | 17 calls: eight rejected patches, no change; baseline Maven PASSED 2/2, all criteria UNVERIFIED -> **FAILED** ("did not produce a repository change"); 22 model calls / 36m00s (finding 31) |
 | W8b `6ff90389` attempt `a03cdff8` | same | 15 calls: one source patch applied, eight rejected including the test patch; Maven PASSED 2/2 on the old suite, one changed file, all criteria UNVERIFIED and a blocking question -> **NEEDS_INPUT**; 20 model calls / 32m05s (finding 32) |
+| W9 `6246c9d6` attempt `2034440d` | same, jar `ccec354` (`replace_text`; before the cited-method check) | 6 tool calls: `find_symbol`, `read_file`, one `replace_text` source edit (the correct null guard), `find_symbol`, `read_file`, `run_validation` **PASSED** 2/2; only `Greeting.java` changed, 467-byte untruncated diff. The report falsely marked the test criterion PASSED with `greetsNullNameAsGuest` in `GreetingTest.java`, which was never written; criterion 1 UNVERIFIED on a quote-only mismatch, criterion 3 PASSED -> **NEEDS_INPUT**, export 409; 9 model calls / 10m41s (finding 37) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
 validation; the remaining gap is the report's acceptance assessment (finding 24). W6 repeated it with
@@ -938,8 +985,11 @@ fallback, not an automated completion, and the remaining automation gap is the l
 discipline. W8 and W8b did not exercise the changed-test evidence guidance: W8 never applied a patch,
 and W8b never changed the test. W8 correctly failed an unchanged task; W8b correctly stayed
 `NEEDS_INPUT` with one source-only change and exposed the applied-patch reset fixed in `fa7c789`.
-Neither run was confirmed. The `replace_text` response in finding 36 is the next local experiment;
-until W9 runs, the small-fixture path has no completed automated attempt on the current jar.
+Neither run was confirmed. W9 (finding 37) exercised `replace_text`: the model made the correct source
+edit in one write and passed Docker validation, but never wrote the test it claimed, and the report
+marked that test `PASSED`. The cited-method check and the missing-test nudge now refuse that claim.
+W8, W8b and W9 remain unconfirmed, and the small-fixture path still has no completed automated attempt
+on the current jar; a run on the new rules is the next experiment.
 
 ## Repository selection (the gate, in practice)
 

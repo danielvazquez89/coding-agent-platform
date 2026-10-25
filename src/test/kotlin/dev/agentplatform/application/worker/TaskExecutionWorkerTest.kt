@@ -1215,6 +1215,197 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `rejects a cited test method that is absent from the final workspace`() {
+        val criterion = "Greeting.greet(null) returns Hello guest"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        // Build output is not evidence: a generated copy of the test must not make a fabricated
+        // method look real.
+        Files.createDirectories(temporary.resolve("target"))
+        Files.writeString(
+            temporary.resolve("target/GreetingTest.java"),
+            "class GreetingTest { void greetsNullNameAsGuest() {} }\n"
+        )
+        Files.writeString(temporary.resolve("HugeTest.java"), "x".repeat(500_001))
+        val patch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello guest"
+        ).joinToString("\n", postfix = "\n")
+        val report =
+            """{"summary":"Applied","implementation":"Null is handled.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"Test method greetsNullNameAsGuest in GreetingTest.java asserts the guest fallback."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn(report, emptyList(), "stop", 1, 1),
+            ModelTurn(report, emptyList(), "stop", 1, 1),
+            ModelTurn(report, emptyList(), "stop", 1, 1)
+        )
+
+        assertTrue(worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("Greeting.java"))).execute(task.id))
+
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        val check = attempts.finishedReport!!.acceptanceChecks.single()
+        assertEquals(AcceptanceOutcome.UNVERIFIED, check.outcome)
+        assertEquals(criterion, check.criterion)
+        assertTrue(check.evidence!!.contains("Rejected by the worker"), check.evidence)
+        assertTrue(check.evidence!!.contains("greetsNullNameAsGuest"), check.evidence)
+        assertEquals(
+            2,
+            provider.messages.count {
+                it.role == "user" && it.content.contains("does not assess every supplied acceptance criterion")
+            }
+        )
+    }
+
+    @Test
+    fun `matches a criterion that differs only in quote style`() {
+        val criterion = """Greeting.greet(null) returns "Hello guest" instead of throwing."""
+        val reported = "Greeting.greet(null) returns 'Hello guest' instead of throwing."
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val patch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello guest"
+        ).joinToString("\n", postfix = "\n")
+        val report =
+            """{"summary":"Applied","implementation":"Null is handled.","acceptanceChecks":[{"criterion":"$reported","outcome":"PASSED","evidence":"Greeting.java line 1 returns Hello guest for a null name; Maven tests passed."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn(report, emptyList(), "stop", 1, 1)
+        )
+
+        assertTrue(worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("Greeting.java"))).execute(task.id))
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        val check = attempts.finishedReport!!.acceptanceChecks.single()
+        assertEquals(AcceptanceOutcome.PASSED, check.outcome)
+        assertEquals(criterion, check.criterion)
+        assertTrue(
+            provider.messages.none {
+                it.role == "user" && it.content.contains("does not assess every supplied acceptance criterion")
+            }
+        )
+    }
+
+    @Test
+    fun `nudges once when the report claims a test but no test file changed`() {
+        val behavior = "Greeting.greet(null) returns Hello guest"
+        val testCriterion = "A JUnit test in GreetingTest covers the null name"
+        val task = task(acceptanceCriteria = listOf(behavior, testCriterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val workspace = FakeWorkspace(
+            temporary,
+            changedFilesProvider = { changedFilesUnder(temporary) }
+        )
+        val patch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello guest"
+        ).joinToString("\n", postfix = "\n")
+        val report =
+            """{"summary":"Applied","implementation":"Null is handled and tested.","acceptanceChecks":[{"criterion":"$behavior","outcome":"PASSED","evidence":"Greeting.java line 1 returns Hello guest for a null name."},{"criterion":"$testCriterion","outcome":"PASSED","evidence":"Test method `greetsNullNameAsGuest` in src/test/java/example/GreetingTest.java asserts the guest fallback."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn(report, emptyList(), "stop", 1, 1),
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "create_file",
+                        """{"path":"src/test/java/example/GreetingTest.java","content":"class GreetingTest { void greetsNullNameAsGuest() {} }\n"}"""
+                    )
+                ),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn(report, emptyList(), "stop", 1, 1)
+        )
+
+        assertTrue(worker(FakeState(task), attempts, provider, workspace).execute(task.id))
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(
+            1,
+            provider.messages.count { it.role == "user" && it.content.contains("no test file changed") }
+        )
+        val nudge = provider.messages.single { it.role == "user" && it.content.contains("no test file changed") }
+        assertTrue(nudge.content.contains("Greeting.java"), nudge.content)
+        assertTrue(nudge.content.contains("Do not claim a test that is not in the workspace"), nudge.content)
+        val stored = attempts.finishedReport!!
+        assertEquals(listOf("Greeting.java", "src/test/java/example/GreetingTest.java"), stored.changedFiles)
+        assertTrue(stored.acceptanceChecks.all { it.outcome == AcceptanceOutcome.PASSED })
+    }
+
+    @Test
+    fun `does not treat a test-suite validation criterion as a missing test`() {
+        val criterion = "The full Maven test suite passes"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        val workspace = FakeWorkspace(temporary, listOf("README.md"))
+        Files.writeString(temporary.resolve("README.md"), "project context\n")
+        val patch = listOf(
+            "diff --git a/README.md b/README.md",
+            "--- a/README.md",
+            "+++ b/README.md",
+            "@@ -1 +1 @@",
+            "-project context",
+            "+updated project context"
+        ).joinToString("\n", postfix = "\n")
+        val report =
+            """{"summary":"Applied","implementation":"Context updated.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"Maven test suite passed 2 tests."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls",
+                1,
+                1
+            ),
+            ModelTurn(report, emptyList(), "stop", 1, 1)
+        )
+
+        assertTrue(worker(FakeState(task), attempts, provider, workspace).execute(task.id))
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertTrue(
+            provider.messages.none { it.role == "user" && it.content.contains("no test file changed") },
+            provider.messages.filter { it.role == "user" }.joinToString(" | ") { it.content }
+        )
+    }
+
+    @Test
     fun `does not ask for criterion evidence when the model asks a blocking question`() {
         val criterion = "Greeting.greet(null) returns Hello guest"
         val task = task(acceptanceCriteria = listOf(criterion))
@@ -2289,6 +2480,13 @@ class TaskExecutionWorkerTest {
         override fun validate(workspace: Path) = ValidationCheck("Maven tests", outcome = CheckOutcome.PASSED)
     }, LocalCommandExecutor(), mapper, ExecutionMetrics.NONE)
 
+    private fun changedFilesUnder(root: Path): List<String> =
+        Files.walk(root).use { paths ->
+            paths.filter { Files.isRegularFile(it) }
+                .map { root.relativize(it).toString().replace('\\', '/') }
+                .iterator().asSequence().toList().sorted()
+        }
+
     private fun task(
         repository: String? = "local-repo",
         acceptanceCriteria: List<String> = emptyList()
@@ -2406,12 +2604,13 @@ class TaskExecutionWorkerTest {
         private val changedFilesFailure: Exception? = null,
         private val patchDiffFailure: Exception? = null,
         private val closeFailure: Exception? = null,
-        private val truncated: Boolean = false
+        private val truncated: Boolean = false,
+        private val changedFilesProvider: (() -> List<String>)? = null
     ) : RepositoryWorkspace {
         var closed = false
         override fun changedFiles(): List<String> {
             changedFilesFailure?.let { throw it }
-            return files
+            return changedFilesProvider?.invoke() ?: files
         }
         override fun patchDiff(maxChars: Int): PatchDiff {
             patchDiffFailure?.let { throw it }
