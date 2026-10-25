@@ -880,8 +880,65 @@ a committed document; the day-to-day roadmap and open questions live in the unco
   false-positive in the report: the model changed the source with one exact edit, then described a
   test it never wrote. The evidence check turns that claim into `UNVERIFIED` instead of a completion,
   and the nudge gives the model one chance to make it true. W9 remains an unconfirmed `NEEDS_INPUT`,
-  and no run has yet completed the small-fixture task with both the source and the test changed on the
+  and no run had yet completed the small-fixture task with both the source and the test changed on the
   current jar. W8, W8b and W9 remain unconfirmed.
+
+### 38. The current rules complete the small fixture with a real source and test change
+
+- **Setup.** W10 (`d0516b53-4686-4cae-84df-78dd90bed65f`, attempt
+  `350f0a74-f1bd-4138-bb6a-67ebdbe0b69a`) ran the same null-handling task on `small-java` at
+  `6187794` with the same local `qwen2.5-coder:14b`, context 8192 and Docker validation, on the jar
+  built from `47a780b` (the cited-method check, missing-test nudge, and quote normalization). One
+  attempt; 7 model calls, 6 tool calls, 650.7 seconds (~10m51s); 19,168 prompt / 1,718 completion
+  tokens.
+- **What happened.** The model called `find_symbol`, `read_file`, `find_symbol`, `read_file`, then
+  sent one 896-character `apply_patch` that added the null guard to `Greeting.java` and the
+  `greetsNullNameAsGuest` test to `GreetingTest.java`, then called `run_validation`. Docker Maven
+  passed 3/3. The report listed both changed files, all three criteria `PASSED`, and cited the test
+  method that the workspace now contains. It did not use `replace_text`; the one unified diff was
+  accepted without a retry.
+- **Interface check.** `GET .../patch` returned `200` with a 1,025-byte, untruncated diff. On a fresh
+  clone at `6187794`, `git apply --check` accepted it, `git apply` changed exactly the two files, and
+  `mvn -B -o test` passed 3/3 outside the platform.
+- **What the new rules did and did not do.** The missing-test nudge did not fire: the report's test
+  file had changed and the cited method existed, so there was nothing to ask for. The evidence check
+  ran and left the claims `PASSED`. Criterion 1 still differed from the task only in quote style, and
+  normalized matching accepted it. This run proves the current path can complete honestly; it does
+  not prove the nudge changed the model's behavior. A recurrence of W9's fabricated method would be
+  downgraded, but W10 did not reproduce that failure.
+- **Comparison.** W8 failed with no change after eight rejected patches; W8b applied the source but
+  never the test; W9 fixed the source with one `replace_text` edit and fabricated the test; W10
+  changed both files with one patch and passed 3/3. The model's behavior varies between runs. The
+  platform rules decide whether a report is honest, not whether the model chooses to write the test.
+  One completion is not reproducibility; a second run on the same jar is needed before calling the
+  task reliable.
+- **What this shows and does not.** This is the first automated `COMPLETED` on the small fixture with
+  the current safety rules, and its exported patch verifies outside the platform. It is one run, not
+  a benchmark result; W8, W8b and W9 remain unconfirmed, and W10 is not evidence for a larger
+  repository.
+
+### 39. Two consecutive completions make the narrow task reproducible
+
+- **Setup.** W11 (`38885077-1db7-4c0d-b85a-664357bccb27`, attempt
+  `179bed06-27d3-4830-9c08-3adb3ce0c6df`) repeated W10 exactly on `small-java` at `6187794`, with
+  the same jar built from `47a780b` and the same local model and settings. 8 model calls, 7 tool
+  calls, 464.3 seconds (~7m45s); 21,973 prompt / 1,414 completion tokens.
+- **What happened.** `find_symbol`, `read_file`, `replace_text` (the source null check),
+  `find_symbol`, `read_file`, `apply_patch` (the test), `run_validation`. Docker Maven passed 3/3,
+  both files changed, and all three criteria were `PASSED` with evidence. No missing-test nudge
+  fired, no blocking question remained, and there was no patch failure.
+- **Interface check.** `GET .../patch` returned `200` with a 1,037-byte, untruncated diff. On a fresh
+  clone at `6187794`, `git apply --check` accepted it, `git apply` changed exactly the two files, and
+  `mvn -B -o test` passed 3/3 outside the platform.
+- **Comparison with W10.** W10 used one `apply_patch` for both files; W11 used `replace_text` for the
+  source and `apply_patch` for the test. Both wrote the test unprompted; in neither run did the
+  missing-test nudge fire. That is model variance inside a working tool loop, not a deterministic
+  recipe.
+- **What this shows and does not.** Two consecutive completions on the same 30-line fixture, with
+  real test changes, passing Docker validation, evidenced criteria, and exported patches that pass
+  outside the platform. The narrow task class is reproducible at 2/2. This is not a benchmark result
+  and says nothing about larger repositories or other task classes; the next step is a measurable
+  baseline or a second task class.
 
 ## Where this stands after the real-repository runs
 
@@ -974,6 +1031,8 @@ test exists, the suite passes).
 | W8 `28a2fb5a` attempt `ddbc7275` | same, jar with the acceptance-evidence prompt, before the applied-patch fix | 17 calls: eight rejected patches, no change; baseline Maven PASSED 2/2, all criteria UNVERIFIED -> **FAILED** ("did not produce a repository change"); 22 model calls / 36m00s (finding 31) |
 | W8b `6ff90389` attempt `a03cdff8` | same | 15 calls: one source patch applied, eight rejected including the test patch; Maven PASSED 2/2 on the old suite, one changed file, all criteria UNVERIFIED and a blocking question -> **NEEDS_INPUT**; 20 model calls / 32m05s (finding 32) |
 | W9 `6246c9d6` attempt `2034440d` | same, jar `ccec354` (`replace_text`; before the cited-method check) | 6 tool calls: `find_symbol`, `read_file`, one `replace_text` source edit (the correct null guard), `find_symbol`, `read_file`, `run_validation` **PASSED** 2/2; only `Greeting.java` changed, 467-byte untruncated diff. The report falsely marked the test criterion PASSED with `greetsNullNameAsGuest` in `GreetingTest.java`, which was never written; criterion 1 UNVERIFIED on a quote-only mismatch, criterion 3 PASSED -> **NEEDS_INPUT**, export 409; 9 model calls / 10m41s (finding 37) |
+| W10 `d0516b53` attempt `350f0a74` | same, jar `47a780b` (cited-method check, quote normalization, missing-test nudge) | 6 tool calls: 2 `find_symbol`, 2 `read_file`, one 896-char `apply_patch` (null guard plus `greetsNullNameAsGuest`), `run_validation` **PASSED** 3/3; both files changed, all three criteria PASSED with real evidence -> **COMPLETED**; export 200, 1,025-byte patch applied to a fresh `6187794` clone, `mvn -B -o test` 3/3 outside; 7 model calls / 10m51s (finding 38) |
+| W11 `38885077` attempt `179bed06` | same, jar `47a780b` | 7 tool calls: `find_symbol`, `read_file`, `replace_text` (source null guard), `find_symbol`, `read_file`, `apply_patch` (test), `run_validation` **PASSED** 3/3; both files changed, all three criteria PASSED -> **COMPLETED**; export 200, 1,037-byte patch applied to a fresh `6187794` clone, `mvn -B -o test` 3/3 outside; 8 model calls / 7m45s (finding 39) |
 
 This is the first local evidence that the loop can carry a small change through a real Docker
 validation; the remaining gap is the report's acceptance assessment (finding 24). W6 repeated it with
@@ -988,8 +1047,12 @@ and W8b never changed the test. W8 correctly failed an unchanged task; W8b corre
 Neither run was confirmed. W9 (finding 37) exercised `replace_text`: the model made the correct source
 edit in one write and passed Docker validation, but never wrote the test it claimed, and the report
 marked that test `PASSED`. The cited-method check and the missing-test nudge now refuse that claim.
-W8, W8b and W9 remain unconfirmed, and the small-fixture path still has no completed automated attempt
-on the current jar; a run on the new rules is the next experiment.
+W8, W8b and W9 remain unconfirmed. W10 (finding 38), on the new jar, changed both the source and the
+test with one patch, passed validation 3/3, completed with real evidence, and its exported patch
+passed the suite on a fresh clone. W11 (finding 39) repeated it with a different write path
+(`replace_text` for the source, `apply_patch` for the test), passed 3/3, and its patch also passed on
+a fresh clone. The narrow task class is now reproducible at 2/2 on the current rules, but that is a
+30-line fixture and two runs; it is not a benchmark result and says nothing about larger repositories.
 
 ## Repository selection (the gate, in practice)
 
