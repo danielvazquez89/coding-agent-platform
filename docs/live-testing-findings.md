@@ -1105,6 +1105,49 @@ model-side no-tool-call failure as a known outcome, not average it away.
   bound the damage. Keep W8, W8b, W9 and W12 unconfirmed. The next slice is to widen the benchmark
   beyond the greeting fixture, not to rerun this case again.
 
+### 44. A corrected multi-file patch stayed unresolved, and the slugifier rerun never wrote
+
+- **Setup.** Two runs of the v2.2 `slugifier-collapse` case against the fixture at `d7a6fd6`, with
+  local `qwen2.5-coder:14b`, context 8192, repository map 1,200 tokens, history budget 48,000
+  characters, and a 7,200-second task limit. The first used the jar built from `8d8e1a7`; the second
+  used a jar built after the fix below. Both runs used the same v2.2 case and acceptance criteria.
+- **Run 1: the platform failed to credit two correct writes.** Task
+  `7850e3fa-6efd-4ddd-9a9c-7411635b03ab`, attempt `e87e8e82-78e8-45ab-9edb-f639e02f9f9b`, ended
+  `NEEDS_INPUT` in 1,596 s (~26m36s) with 11 model calls and 10 tool calls; 35,607 prompt / 4,951
+  completion tokens. A 908-character Codex patch named both `src/main/java/example/Slugifier.java`
+  and `src/test/java/example/SlugifierTest.java` and was rejected because its source hunk did not
+  match; the model resent it byte-for-byte and the duplicate guard refused it again. Two separate
+  `replace_text` calls then changed the source and the test correctly, a third source replacement was
+  rejected with the new actual-lines hint, and validation passed on the correct two-file tree. All
+  four criteria were `PASSED` with evidence and the diff was exact. The attempt still ended
+  `NEEDS_INPUT` with "A patch failed and was not corrected": `resolvePatchSuccess` only cleared a
+  rejected patch when one later call wrote **every** path the patch named, and the two corrections
+  arrived in separate calls. This is a platform bug, and it is what made a correct change
+  unexportable.
+- **Fix.** `ExecutionTrace.resolvePatchSuccess` now subtracts the paths written by each successful
+  call from the rejected patch's path set and clears the failure only when that set is empty. A
+  malformed patch that named no paths is still cleared by any later successful write, and a write to
+  an unrelated file still leaves the failure unresolved. A worker regression test rejects a two-file
+  Codex patch, applies separate `replace_text` calls to both named files, and expects `COMPLETED` with
+  no "Patch application still failed" in the report. It fails on the old one-call rule and passes with
+  the cumulative rule; `mvnw verify` passes 301 tests with the coverage gate met.
+- **Run 2: the model never called a write tool.** Task
+  `d5148e44-3d12-496d-955b-049f05cf09c0`, attempt `458e8dc6-cf11-4efb-92be-fc58273cf2e1`, ended
+  `FAILED` in 247 s with 4 model calls, **1 tool call (the final automatic validation)**, and
+  9,519 prompt / 596 completion tokens. The model narrated the intended implementation four times
+  without touching the workspace. Validation passed on the unchanged tree; `changedFiles` was empty,
+  all three behavior criteria were claimed `PASSED`, and the unit-test criterion was downgraded to
+  `UNVERIFIED` because the cited `testCollapsedSeparatorPunctuationBlank` did not exist. The task
+  failed with "The agent did not produce a repository change": **no false success**. This run did not
+  exercise the fix, because no write occurred.
+- **What this shows.** The v2.2 slugifier case is **0/2 with two distinct outcomes**: a real
+  cumulative-path bug (now fixed and covered by a worker regression test) and a model-side
+  no-tool-call failure that the unchanged-task rule handled correctly. The fix is verified by the
+  test rather than by a live repetition of the same tool sequence. Keep the case in the suite; do not
+  rerun it until it passes, and do not add feedback text for either failure mode. The next slice is a
+  different task class: a bug-fix case whose existing test fails, with an independently checked oracle,
+  rather than another feature-addition variant.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`

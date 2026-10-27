@@ -805,6 +805,89 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `clears a failed multi-file patch when separate text replacements correct each file`() {
+        val task = task()
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        Files.writeString(temporary.resolve("GreetingTest.java"), "class GreetingTest {}\n")
+        val rejected = listOf(
+            "*** Begin Patch",
+            "*** Update File: Greeting.java",
+            "@@",
+            "-Goodbye",
+            "+Hello guest",
+            "*** Update File: GreetingTest.java",
+            "@@",
+            "-class OldGreetingTest {}",
+            "+class GreetingTest { void greetsNullNameAsGuest() {} }",
+            "*** End Patch"
+        ).joinToString("\n", postfix = "\n")
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to rejected)))),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "replace_text",
+                        mapper.writeValueAsString(
+                            mapOf(
+                                "path" to "Greeting.java",
+                                "oldText" to "Hello",
+                                "newText" to "Hello guest"
+                            )
+                        )
+                    )
+                ),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                null,
+                listOf(
+                    call(
+                        "replace_text",
+                        mapper.writeValueAsString(
+                            mapOf(
+                                "path" to "GreetingTest.java",
+                                "oldText" to "class GreetingTest {}",
+                                "newText" to "class GreetingTest { void greetsNullNameAsGuest() {} }"
+                            )
+                        )
+                    )
+                ),
+                "tool_calls", null, null
+            ),
+            ModelTurn(
+                """{"summary":"Applied","implementation":"Changed the greeting and added the test."}""",
+                emptyList(), "stop", null, null
+            )
+        )
+
+        worker(FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("Greeting.java", "GreetingTest.java"))).execute(task.id)
+
+        // The rejected patch named both files; the two later exact replacements corrected them one
+        // at a time. Cumulative writes resolve the failure even though no single call touched all
+        // the paths the patch named.
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(AttemptStatus.COMPLETED, attempts.finished?.status)
+        val report = attempts.finishedReport!!
+        assertEquals(1, report.patchFailures.size)
+        assertFalse(report.implementation.contains("Patch application still failed"), report.implementation)
+        assertEquals(
+            listOf("apply_patch", "replace_text", "replace_text", "run_validation"),
+            report.toolExecutions.map { it.toolName }
+        )
+        assertEquals("Hello guest\n", Files.readString(temporary.resolve("Greeting.java")))
+        assertEquals(
+            "class GreetingTest { void greetsNullNameAsGuest() {} }\n",
+            Files.readString(temporary.resolve("GreetingTest.java"))
+        )
+    }
+
+    @Test
     fun `does not complete when the final report claims a failed file creation succeeded`() {
         val behavior = "Greeting handles a null name"
         val testCriterion = "A test covers the null name"

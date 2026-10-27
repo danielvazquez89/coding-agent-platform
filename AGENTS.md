@@ -182,13 +182,14 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   prompt plus history stays under the provider's own limit. Never orphan a `tool` message from its
   assistant call.
 - **An unresolved patch failure blocks `COMPLETED`.** The worker tracks the latest `apply_patch`
-  outcome separately from the one-shot correction nudge. A failed patch stays unresolved until a later
-  successful write touches every file it named. A malformed patch that names no files is cleared by
-  any later successful write, because there is nothing to match; a successful write to a different file
-  is not a correction. While it is unresolved, even a final report that claims every criterion passed
-  and a passing validation ends `NEEDS_INPUT` (the attempt reason is "A patch failed and was not
-  corrected"). A failure followed by a successful patch or exact text replacement touching its named
-  files still completes. Do not treat a rejected patch as applied because the model's narrative says so.
+  outcome separately from the one-shot correction nudge. A failed patch stays unresolved until later
+  successful writes touch every file it named (they need not arrive in one tool call). A malformed
+  patch that names no files is cleared by any later successful write, because there is nothing to
+  match; a successful write to a different file is not a correction. While it is unresolved, even a
+  final report that claims every criterion passed and a passing validation ends `NEEDS_INPUT` (the
+  attempt reason is "A patch failed and was not corrected"). A failure followed by a successful patch
+  or exact text replacement touching its named files still completes. Do not treat a rejected patch as
+  applied because the model's narrative says so.
 - **A rejected file write is unresolved until that path is written.** The worker records a failed
   `create_file` or `replace_text` under its normalized repository path. A later successful
   `create_file` or `replace_text` for that path, or an `apply_patch` whose reported path list includes

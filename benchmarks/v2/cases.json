@@ -1,7 +1,7 @@
 {
-  "version": "v2.1",
+  "version": "v2.2",
   "promptVersion": "unversioned",
-  "description": "Three baseline Java maintenance cases plus a no-change ambiguity control. Uses the clean v1 Java fixture; this remains a smoke benchmark, not a representative evaluation set. v2.1 adds the unit-test criterion that greeting-name already required in its description and expected changed files, so the acceptance contract and the oracle agree.",
+  "description": "Four Java maintenance cases plus a no-change ambiguity control. Uses the clean v1 Java fixture; this remains a smoke benchmark, not a representative evaluation set. v2.2 adds a second fixture domain (Slugifier) with an algorithm change and new tests. v2.1 added the unit-test criterion that greeting-name already required in its description and expected changed files, so the acceptance contract and the oracle agree.",
   "cases": [
     {
       "id": "greeting-message",
@@ -58,6 +58,26 @@
       "expectedChangedFilesExact": true,
       "expectedDiffContains": [
         "Hello!"
+      ]
+    },
+    {
+      "id": "slugifier-collapse",
+      "category": "string-processing",
+      "title": "Collapse slug separators",
+      "description": "Change Slugifier.slugify so any run of whitespace or punctuation becomes one hyphen, leading and trailing separators are removed, and blank input returns an empty string. Keep the existing simple case working and add unit tests for multiple spaces, punctuation, and blank input. Leave the existing test method in place.",
+      "acceptanceCriteria": [
+        "slugify(\"  Hello   World  \") returns \"hello-world\"",
+        "slugify(\"Hello, World!\") returns \"hello-world\"",
+        "slugify(\"   \") returns \"\"",
+        "A unit test covers the collapsed separator, punctuation, and blank cases"
+      ],
+      "expectedChangedFiles": [
+        "src/main/java/example/Slugifier.java",
+        "src/test/java/example/SlugifierTest.java"
+      ],
+      "expectedChangedFilesExact": true,
+      "expectedDiffContains": [
+        "hello-world"
       ]
     },
     {

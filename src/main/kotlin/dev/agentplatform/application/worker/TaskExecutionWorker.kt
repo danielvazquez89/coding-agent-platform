@@ -1360,10 +1360,16 @@ class TaskExecutionWorker @Inject constructor(
 
         fun resolvePatchSuccess(writtenPaths: Set<String>) {
             if (unresolvedPatchFailure == null) return
-            if (unresolvedPatchPaths.isEmpty() || writtenPaths.containsAll(unresolvedPatchPaths)) {
+            if (unresolvedPatchPaths.isEmpty()) {
                 unresolvedPatchFailure = null
-                unresolvedPatchPaths = emptySet()
+                return
             }
+            // A rejected multi-file patch is corrected by writes to all the files it named, even when
+            // the model writes them one at a time. Accumulate the paths here; requiring one tool call
+            // to contain every path left a correct two-file repair unresolved in the v2.2 slugifier
+            // run, where separate replace_text calls fixed the source and the test.
+            unresolvedPatchPaths = unresolvedPatchPaths - writtenPaths
+            if (unresolvedPatchPaths.isEmpty()) unresolvedPatchFailure = null
         }
 
         /** Failed file writes by normalized repository path, cleared by a later successful write to that path. */
