@@ -1,7 +1,7 @@
 {
-  "version": "v2",
+  "version": "v2.1",
   "promptVersion": "unversioned",
-  "description": "Three baseline Java maintenance cases plus a no-change ambiguity control. Uses the clean v1 Java fixture; this remains a smoke benchmark, not a representative evaluation set.",
+  "description": "Three baseline Java maintenance cases plus a no-change ambiguity control. Uses the clean v1 Java fixture; this remains a smoke benchmark, not a representative evaluation set. v2.1 adds the unit-test criterion that greeting-name already required in its description and expected changed files, so the acceptance contract and the oracle agree.",
   "cases": [
     {
       "id": "greeting-message",
@@ -29,7 +29,8 @@
       "acceptanceCriteria": [
         "message(\" Ada \") returns \"Hello, Ada\"",
         "Null and blank names are rejected with IllegalArgumentException",
-        "The existing no-argument message() behavior remains unchanged"
+        "The existing no-argument message() behavior remains unchanged",
+        "A unit test covers the new method and its null and blank rejection"
       ],
       "expectedChangedFiles": [
         "src/main/java/example/Greeting.java",

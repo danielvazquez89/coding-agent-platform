@@ -347,6 +347,52 @@ class WorkspaceToolExecutorTest {
     }
 
     @Test
+    fun `a missing replacement shows the actual lines around the closest match`() {
+        val root = repository()
+        val path = root.resolve("src/main/java/example/Greeting.java")
+        Files.createDirectories(path.parent)
+        val source =
+            "package example;\n" +
+                "\n" +
+                "public final class Greeting {\n" +
+                "    public static String message() {\n" +
+                "        return \"Hello \" + \"world\";\n" +
+                "    }\n" +
+                "}\n"
+        Files.writeString(path, source)
+        val tools = executor()
+
+        val rejection = assertThrows(IllegalArgumentException::class.java) {
+            tools.execute(
+                "replace_text",
+                mapper.createObjectNode()
+                    .put("path", "src/main/java/example/Greeting.java")
+                    .put(
+                        "oldText",
+                        "public static String message() {\n" +
+                            "    return \"Hello \" + name.trim();\n" +
+                            "}"
+                    )
+                    .put(
+                        "newText",
+                        "public static String message() {\n" +
+                            "    return \"Hi \" + name.trim();\n" +
+                            "}"
+                    ),
+                root
+            )
+        }
+
+        val message = rejection.message!!
+        assertTrue(message.contains("was not found"), message)
+        assertTrue(message.contains("Actual lines in src/main/java/example/Greeting.java"), message)
+        assertTrue(message.contains(" around line 4:"), message)
+        assertTrue(message.contains("4:     public static String message() {"), message)
+        assertTrue(message.contains("5:         return \"Hello \" + \"world\";"), message)
+        assertEquals(source, Files.readString(path))
+    }
+
+    @Test
     fun `rejects missing ambiguous or unbounded text replacements`() {
         val root = repository()
         Files.writeString(root.resolve("README.md"), "same\nsame\n")
@@ -369,6 +415,16 @@ class WorkspaceToolExecutorTest {
         }
         assertTrue(missing.message!!.contains("was not found"), missing.message)
         assertTrue(missing.message!!.contains("nothing was changed"), missing.message)
+        assertTrue(missing.message!!.contains("Actual lines in README.md"), missing.message)
+        assertTrue(missing.message!!.contains("showing the start"), missing.message)
+        assertTrue(missing.message!!.contains("1: same"), missing.message)
+
+        Files.writeString(root.resolve("empty.txt"), "")
+        val empty = assertThrows(IllegalArgumentException::class.java) {
+            edit("empty.txt", "anything", "different")
+        }
+        assertTrue(empty.message!!.contains("was not found"), empty.message)
+        assertFalse(empty.message!!.contains("Actual lines in"), empty.message)
 
         val identical = assertThrows(IllegalArgumentException::class.java) {
             edit("README.md", "same\nsame", "same\nsame")

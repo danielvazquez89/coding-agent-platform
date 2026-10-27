@@ -447,7 +447,8 @@ class WorkspaceToolExecutor(
         val first = normalizedContent.indexOf(normalizedOld)
         require(first >= 0) {
             "The exact oldText was not found in '$relative'. Read the file with read_file and pass an exact " +
-                "contiguous snippet, including leading whitespace; nothing was changed."
+                "contiguous snippet, including leading whitespace; nothing was changed." +
+                missingOldTextHint(relative, normalizedContent, normalizedOld)
         }
         val second = normalizedContent.indexOf(normalizedOld, first + 1)
         require(second < 0) {
@@ -463,6 +464,42 @@ class WorkspaceToolExecutor(
         Files.writeString(file, output)
         return "Updated $relative: replaced one occurrence " +
             "(${normalizedOld.length} characters with ${normalizedNew.length})."
+    }
+
+    /**
+     * `replace_text` matches literally, so a snippet copied from an earlier read can be one character
+     * off, and the refusal alone does not say what the file now contains: a live 14B resent the same
+     * 69-character snippet three times even after rereading the file. Quote the numbered lines around
+     * the longest snippet line that actually occurs, or the start of the file when none of them does.
+     * The text is repository data inside a tool message, not an instruction the model may follow.
+     */
+    private fun missingOldTextHint(relative: String, content: String, oldText: String): String {
+        if (content.isEmpty()) return ""
+        val lines = content.lines()
+        val trimmedLines = lines.map(String::trim)
+        val candidates = oldText.lineSequence()
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .distinct()
+            .sortedByDescending(String::length)
+            .take(MISSING_OLD_TEXT_ANCHOR_CANDIDATES)
+        val anchor = candidates.firstNotNullOfOrNull { candidate ->
+            trimmedLines.indexOfFirst { candidate in it }.takeIf { it >= 0 }
+        }
+        val center = anchor?.plus(1) ?: 1
+        val start = (center - PATCH_CONTEXT_LINES).coerceAtLeast(1)
+        val end = (center + PATCH_CONTEXT_LINES).coerceAtMost(lines.size)
+        return buildString {
+            append("\nActual lines in ").append(relative)
+            if (anchor == null) {
+                append(" (no line of oldText occurs in the file; showing the start):\n")
+            } else {
+                append(" around line ").append(center).append(":\n")
+            }
+            for (number in start..end) {
+                append(number).append(": ").append(lines[number - 1].take(PATCH_CONTEXT_LINE_CHARS)).append('\n')
+            }
+        }.take(PATCH_CONTEXT_HINT_LIMIT)
     }
 
     private fun relatedTests(workspace: Path, paths: List<String>, maxResults: Int): String {
@@ -806,6 +843,7 @@ class WorkspaceToolExecutor(
         const val PATCH_CONTEXT_HINT_LIMIT = 2_500
         const val PATCH_CONTEXT_LINE_CHARS = 200
         const val PATCH_CONTEXT_FILE_LIMIT = 2_000_000L
+        const val MISSING_OLD_TEXT_ANCHOR_CANDIDATES = 20
         const val PATCH_PATH_HINT_LIMIT = 3
         const val PATCH_PATH_HINT_SCAN_LIMIT = 5_000
         val GIT_APPLY_FAILURE = Regex("""patch failed:\s*(.+):(\d+)""")

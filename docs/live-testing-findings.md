@@ -1057,6 +1057,54 @@ model-side no-tool-call failure as a known outcome, not average it away.
   failed completion case. The clarification control stays a model-behavior finding, not a reason to
   weaken the unchanged-task rule.
 
+### 43. The `replace_text` hint fires, but the v2.1 case still fails honestly
+
+- **Setup.** `replace_text` now appends a bounded hint to its "oldText was not found" refusal: the
+  numbered actual lines around the longest snippet line that occurs in the file, or the file start
+  when none of them does. Matching is still literal and single-occurrence; the hint only shows
+  repository data. `benchmarks/v2/cases.json` was bumped to **v2.1** to add the missing acceptance
+  criterion "A unit test covers the new method and its null and blank rejection" to `greeting-name`,
+  matching the task description and the expected two-file oracle. Three runs used the local
+  `qwen2.5-coder:14b`; A used the v2 manifest, B and C used a single-case v2.1 manifest.
+- **Run A: completed, but the contract was too weak.** Task `4706c71b-a900-4ae5-a170-1097d8f145fd`,
+  attempt `cac7ba18-4171-43e3-abfb-858297074652`, **COMPLETED** in 1,356 s (~22m36s) with 18 model
+  calls and 12 tool calls; 59,006 prompt / 3,753 completion tokens, 2 patch failures. A malformed
+  Codex hunk was rejected, the model resent it byte-for-byte, then used `replace_text` on the source.
+  Only `Greeting.java` changed; the test file did not. All three v2 criteria were `PASSED` with
+  evidence, so the platform's completion was honest **under the supplied criteria**, but the
+  benchmark scored the case as a failure because the expected test file was missing. The hint did
+  not fire. v2.1 closes this contract gap rather than changing the completion rule.
+- **Run B: the hint fired; the test still did not compile.** Task
+  `4a062449-a113-44d9-8ffa-c5b216558ea6`, attempt `4db94921-c948-4bd4-a103-68445e768a2d`,
+  **FAILED** in 970 s (~16m10s) with 16 model calls and 12 tool calls; 63,963 prompt / 2,331
+  completion tokens, 0 patch failures. Both expected files changed. The model used `assertThrows`
+  without importing it, so Docker validation failed at `testCompile` (`GreetingTest.java:[20,9]` and
+  `[27,9]`). The new hint fired twice, at calls 9 and 10, beginning "Actual lines in
+  src/test/java/example/GreetingTest.java around line 5:"; the model then read the file and made one
+  more successful `replace_text` edit, but the file still lacked the import. It claimed all four
+  criteria `PASSED`, but the worker kept the failed validation and failed the task: **no false
+  success**.
+- **Run C: a patch loop exhausted the budget.** Task `39e213cb-69ea-4d16-b327-fa2246b3bf96`,
+  attempt `289656c4-9d3d-456f-9439-8e82d70347c2`, **FAILED** in 3,573 s (~59m33s) with 27 model
+  calls and 24 tool calls; 149,614 prompt / 7,517 completion tokens. All **13** `apply_patch` calls
+  were rejected, and **9** were byte-identical resends refused by the existing duplicate guard. The
+  model alternated between two rejected test-file patches, re-read the test file at call 17, and still
+  resent the same rejected patches. It used `replace_text` successfully only on the source. The last
+  source edit left `Greeting.java` uncompilable ("unnamed classes are a preview feature" at line 17),
+  the test file was never edited, validation failed, and every criterion stayed `UNVERIFIED`. The
+  attempt ended with "The agent exceeded its limit of 24 tool calls". The existing patch-failure nudge
+  had already told the model to use `replace_text` for a localized edit; it ignored that and the
+  duplicate refusals. This is an honest, bounded failure, not a safety gap.
+- **What this shows and does not.** The diagnostic behaves as designed: it fires on a near miss,
+  shows the actual numbered lines, and stays out of the way otherwise. It does not make recovery
+  automatic. v2.1 `greeting-name` is **0/2** with two different model failure modes (a missing import
+  after a successful edit; a rejected-patch loop that broke the source), and **0 false successes**.
+  The contract gap found by run A is fixed. Adding more feedback text is not justified by run C:
+  the model ignored an existing nudge and explicit duplicate refusals, so another nudge would add
+  prompt cost without evidence it changes the behavior. The tool budget and duplicate guard already
+  bound the damage. Keep W8, W8b, W9 and W12 unconfirmed. The next slice is to widen the benchmark
+  beyond the greeting fixture, not to rerun this case again.
+
 ## Where this stands after the real-repository runs
 
 The first genuine third-party task — `stleary/JSON-java` issue #838, change `JSONObject.writeValue`
