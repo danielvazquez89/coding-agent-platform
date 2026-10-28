@@ -344,3 +344,33 @@ worker can change orchestration without accidentally rewriting completion preced
 still trusts the worker's evidence-gathering: it cannot know whether validation actually ran or
 whether a file write failed. Those facts remain the worker's and adapters' responsibility, and the
 policy must never be called with optimistic defaults.
+
+---
+
+## ADR-0016 — A key-backed hosted model must be priced at startup
+
+**Status:** Accepted (qualifies the zero-rate behavior in ADR-0009 and ADR-0012).
+
+**Context:** ADR-0009 deliberately made cost a guardrail rather than a hard cap, and the default
+token rates are zero so a local Ollama run reports an honest zero estimate. That default becomes a
+silent spend hole when the OpenAI-compatible adapter is pointed at a paid endpoint: with both rates
+at zero, `AGENT_MAX_TASK_COST_USD` can never be reached, no matter how much the provider bills. A
+warning in the README does not fail a deployment that copies `.env.example` and changes only the
+provider and API key.
+
+**Decision:** `ModelCostPolicy` rejects startup when all of the following hold: the configured
+provider is `openai-compatible` or its `openai` alias; `agent.model.openai.api-key` is configured
+(not blank and not the `disabled` sentinel); both per-million-token rates are zero; and
+`AGENT_ALLOW_UNPRICED_HOSTED_MODEL` is false. The worker fails with an actionable message naming the
+two rate variables and the override. A keyless local OpenAI-compatible server, a local Ollama
+provider, and a hosted provider with at least one non-zero rate remain valid. The override exists
+for an operator who has accepted that spend is unenforced, and it is visible in configuration rather
+than implied by a zero default.
+
+**Consequences:** A paid provider cannot be started with a cost ceiling that is structurally unable
+to bind. The rule is intentionally narrow: one non-zero rate is enough to enable cost enforcement,
+and a hosted provider with no key is treated as a local endpoint because the application cannot
+distinguish the two without adding a separate "is this paid?" setting. Compose passes the two rates,
+the maximum cost, and the override through to the worker so an operator's `.env` settings reach the
+process that enforces them. `ModelCostPolicyTest` covers the rejection, every accepted configuration,
+the alias, and the override.

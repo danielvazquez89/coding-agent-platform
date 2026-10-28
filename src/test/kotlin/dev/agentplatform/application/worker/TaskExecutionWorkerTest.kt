@@ -2490,6 +2490,36 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `refuses an unpriced key-backed hosted provider unless explicitly overridden`() {
+        val failure = assertThrows(IllegalArgumentException::class.java) {
+            worker(
+                FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary),
+                modelProvider = "openai-compatible",
+                modelApiKey = "sk-test"
+            )
+        }
+        assertTrue(failure.message!!.contains("AGENT_MODEL_INPUT_COST_PER_MILLION_USD"), failure.message)
+        assertTrue(failure.message!!.contains("AGENT_ALLOW_UNPRICED_HOSTED_MODEL"), failure.message)
+
+        worker(
+            FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary),
+            modelProvider = "openai-compatible",
+            modelApiKey = "sk-test",
+            allowUnpricedHostedModel = true
+        )
+        worker(
+            FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary),
+            modelProvider = "openai-compatible",
+            modelApiKey = "disabled"
+        )
+        worker(
+            FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary),
+            modelProvider = "ollama",
+            modelApiKey = "sk-test"
+        )
+    }
+
+    @Test
     fun `poll handles empty queues disabled workers and claim failures`() {
         worker(FakeState(null), FakeAttempts(), ScriptedProvider(), FakeWorkspace(temporary)).poll()
         worker(
@@ -2717,7 +2747,10 @@ class TaskExecutionWorkerTest {
         maxEstimatedCostUsd: Double = 1.0,
         workerEnabled: Boolean = true,
         staleAttemptTimeoutSeconds: String = "disabled",
-        maxHistoryCharacters: String = "24000"
+        maxHistoryCharacters: String = "24000",
+        modelProvider: String = "ollama",
+        modelApiKey: String = "disabled",
+        allowUnpricedHostedModel: Boolean = false
     ): TaskExecutionWorker {
         val defaultValidationRunner = object : ValidationRunner {
             override fun validate(workspace: Path) = validation
@@ -2730,7 +2763,7 @@ class TaskExecutionWorkerTest {
             state, attempts, TaskExecutionFinalizer(state, attempts, ExecutionMetrics.NONE), provider, workspaceFactory,
             toolExecutor, publisher, mapper, enabled, publishPullRequests, maxToolCalls,
             inputCostPerMillionUsd, outputCostPerMillionUsd, maxDurationSeconds, maxEstimatedCostUsd, workerEnabled,
-            staleAttemptTimeoutSeconds, maxHistoryCharacters
+            staleAttemptTimeoutSeconds, maxHistoryCharacters, modelProvider, modelApiKey, allowUnpricedHostedModel
         )
     }
 

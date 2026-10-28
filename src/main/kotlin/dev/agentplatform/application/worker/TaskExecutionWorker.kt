@@ -48,7 +48,13 @@ class TaskExecutionWorker @Inject constructor(
     @ConfigProperty(name = "agent.execution.stale-attempt-timeout-seconds", defaultValue = "disabled")
     private val staleAttemptTimeoutSeconds: String = "disabled",
     @ConfigProperty(name = "agent.model.max-history-characters", defaultValue = "24000")
-    private val maxHistoryCharacters: String = "24000"
+    private val maxHistoryCharacters: String = "24000",
+    @ConfigProperty(name = "agent.model.provider", defaultValue = "ollama")
+    private val modelProvider: String = "ollama",
+    @ConfigProperty(name = "agent.model.openai.api-key", defaultValue = "disabled")
+    private val modelApiKey: String = "disabled",
+    @ConfigProperty(name = "agent.model.cost.allow-unpriced-hosted", defaultValue = "false")
+    private val allowUnpricedHostedModel: Boolean = false
 ) {
     private val log = Logger.getLogger(TaskExecutionWorker::class.java)
 
@@ -77,6 +83,13 @@ class TaskExecutionWorker @Inject constructor(
         require(maxEstimatedCostUsd.isFinite() && maxEstimatedCostUsd > 0.0) {
             "Maximum estimated task cost must be finite and positive"
         }
+        ModelCostPolicy.rejection(
+            modelProvider,
+            modelApiKey,
+            inputCostPerMillionUsd,
+            outputCostPerMillionUsd,
+            allowUnpricedHostedModel
+        )?.let { throw IllegalArgumentException(it) }
     }
 
     @Scheduled(every = "2s", concurrentExecution = Scheduled.ConcurrentExecution.SKIP)

@@ -135,7 +135,10 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   property-file value as missing and fails startup (`Failed to load config value ...`). Empty
   *environment* variables are treated as unset, so `SOME_ENV=""` in Compose is acceptable.
 - Fail closed: if a feature is configured but incomplete (e.g. a control-plane URL with no token),
-  the adapter throws in `init` rather than running half-configured.
+  the adapter throws in `init` rather than running half-configured. A key-backed hosted model is
+  incomplete without prices: `TaskExecutionWorker` refuses to start when the provider is
+  `openai-compatible`/`openai`, an API key is configured, and both token rates are zero, unless
+  `AGENT_ALLOW_UNPRICED_HOSTED_MODEL=true` explicitly accepts an unenforced ceiling.
 - **A property key must start its own line.** `application.properties` is line-based, so a key appended to
   the end of a comment is inert and the adapter's `@ConfigProperty(defaultValue = ...)` silently applies.
   `ConfigurationCoverageTest` fails when an injected key has no entry in the file, but it cannot see a key
@@ -160,6 +163,11 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
 ## Known pitfalls
 
 - **Use a JDK 21+ for Maven.** An older `java` on `PATH` is not sufficient; set `JAVA_HOME`/`PATH` as above.
+- **A key-backed hosted model must be priced.** `ModelCostPolicy` rejects a startup where the active
+  provider is `openai-compatible` or its `openai` alias, `AGENT_OPENAI_API_KEY` is configured, and both
+  `AGENT_MODEL_INPUT_COST_PER_MILLION_USD` and `AGENT_MODEL_OUTPUT_COST_PER_MILLION_USD` are zero. The
+  override `AGENT_ALLOW_UNPRICED_HOSTED_MODEL=true` records that the spend ceiling is advisory only.
+  Do not treat a keyless local OpenAI-compatible server as hosted by default; it has no bill to bound.
 - **Workspace pollution:** offline Maven validation writes `target/` into the workspace. `changedFiles()`
   and `patchDiff()` deliberately exclude build output; do not reintroduce it into reports or PRs.
 - **A task left `RUNNING` by a crashed worker is failed, not resumed.** On each idle poll tick
