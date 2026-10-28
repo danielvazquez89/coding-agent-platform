@@ -20,13 +20,30 @@ data class AgentQuestion(
 
 enum class CheckOutcome { PASSED, FAILED, SKIPPED }
 
+/**
+ * One test case from the last validation run. The platform uses this to distinguish a test that
+ * merely exists in the workspace from one the machine actually executed and passed.
+ */
+data class TestResult(
+    val className: String,
+    val methodName: String,
+    val outcome: CheckOutcome,
+    val durationMillis: Long? = null
+)
+
 data class ValidationCheck(
     val name: String,
     val command: String? = null,
     val outcome: CheckOutcome,
     val exitCode: Int? = null,
     val details: String? = null,
-    val durationMillis: Long? = null
+    val durationMillis: Long? = null,
+    val testResults: List<TestResult> = emptyList(),
+    /**
+     * True when the runner inspected a machine test report (even an empty one). A false value means
+     * the runner could not observe test execution, so a cited test can only be checked for existence.
+     */
+    val testResultsAvailable: Boolean = false
 )
 
 enum class AcceptanceOutcome { PASSED, FAILED, UNVERIFIED }

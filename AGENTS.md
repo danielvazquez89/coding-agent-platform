@@ -202,13 +202,18 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
   rejects text over 64,000 characters, files or results over 2 MB, binary content, and missing or
   ambiguous matches without writing. It is not a fuzzy editor; do not widen it to make a model's output
   fit.
-- **A cited test method must exist in the final workspace.** A report can name a test it never wrote, as
-  W9 did. `TaskExecutionWorker` scans test-like files (a path segment `test`/`tests`, or a name ending
-  `Test`, `Tests`, `Spec`, or `IT` with `.java`/`.kt`) for a declaration or a backticked name, skipping
-  VCS, build-output, dependency, and IDE directories and bounded to depth 12, 200 files, 500 KB each. A
-  missing method, or a scan failure, downgrades that `PASSED` check to `UNVERIFIED` with the rejection
-  in the evidence. The check can only weaken a claim; never treat the report narrative as proof of a
-  test.
+- **A cited test method must have passed the last validation.** A report can name a test it never wrote,
+  as W9 did. `DockerValidationRunner` reads Maven Surefire's `target/surefire-reports/TEST-*.xml` after
+  the run and stores each test case in `ValidationCheck.testResults` with `testResultsAvailable=true`;
+  the reports are visible through both a bind mount and the shared named volume. `SurefireReports`
+  disables DTDs/external entities and bounds files, bytes, and results; malformed, oversized, or stale
+  files are ignored. `TaskExecutionWorker` requires a cited method to be `PASSED` in those results; a
+  missing, skipped, or failed case downgrades that `PASSED` check to `UNVERIFIED` with the rejection in
+  the evidence. Only when a validator cannot expose machine results does the worker fall back to
+  scanning test-like files (a path segment `test`/`tests`, or a name ending `Test`, `Tests`, `Spec`, or
+  `IT` with `.java`/`.kt`) for a declaration or backticked name, skipping VCS, build-output, dependency,
+  and IDE directories and bounded to depth 12, 200 files, 500 KB each. Both checks only ever weaken a
+  claim; never treat the report narrative as proof of a test.
 - **A claimed-but-unwritten test gets one nudge.** When a report marks a test-requiring criterion
   `PASSED` but no test file changed, the worker asks once for the missing edit before accepting the
   report. The nudge requires a changed workspace, a passing validation, no blocking question, and no

@@ -187,7 +187,9 @@ class TaskExecutionWorker @Inject constructor(
             val modelQuestions = parsedReport.questions
             val blockingQuestions = modelQuestions.filter(AgentQuestion::blocking)
             val lastValidation = validation.lastOrNull()
-            val acceptanceChecks = acceptanceChecks(task, parsedReport.acceptanceChecks, workspace.root)
+            val acceptanceChecks = acceptanceChecks(
+                task, parsedReport.acceptanceChecks, workspace.root, lastValidation
+            )
             // A failed supported validation or an unchanged workspace is a known negative result,
             // not a missing assessment. The attempt must not become NEEDS_INPUT just because the
             // model also left its criteria UNVERIFIED: there is nothing an answer can verify when
@@ -507,7 +509,7 @@ class TaskExecutionWorker @Inject constructor(
                         task.acceptanceCriteria.any {
                             normalizeCriterion(it) == normalizeCriterion(check.criterion)
                         } &&
-                        missingCitedTestMethod(root, check.evidence) != null
+                        missingCitedTestMethod(root, check.evidence, validation.lastOrNull()) != null
                 }
                 val vagueTestClaim = parsedReport.acceptanceChecks.any { check ->
                     check.outcome == AcceptanceOutcome.PASSED &&
@@ -538,7 +540,7 @@ class TaskExecutionWorker @Inject constructor(
                                 if (missingMethod != null) {
                                     append("The cited test method '")
                                     append(missingMethod.take(120))
-                                    append("' is not in the workspace. ")
+                                    append("' was not found in the workspace or did not pass the last validation. ")
                                 }
                                 append("If the task requires a test, open the existing test file with read_file and add or update it with replace_text (or apply_patch for a larger edit), then call run_validation again. Do not claim a test that is not in the workspace. If the task does not require a new test, cite an existing test method and its assertion; otherwise mark that criterion UNVERIFIED with the reason, or return a blocking question with its impact.")
                             }
@@ -552,7 +554,9 @@ class TaskExecutionWorker @Inject constructor(
                 // ended NEEDS_INPUT with no question to answer. Ask once or twice for the assessment,
                 // with the evidence the conversation already contains; a blocking question is a
                 // legitimate way to stop and is left alone.
-                val assessed = acceptanceChecks(task, parsedReport.acceptanceChecks, root)
+                val assessed = acceptanceChecks(
+                    task, parsedReport.acceptanceChecks, root, validation.lastOrNull()
+                )
                 val unassessed = assessed.filter { it.outcome == AcceptanceOutcome.UNVERIFIED }
                 if (
                     !parsedReport.isEmpty &&
@@ -1189,7 +1193,8 @@ class TaskExecutionWorker @Inject constructor(
     private fun acceptanceChecks(
         task: CodingTask,
         reported: List<AcceptanceCheck>,
-        workspaceRoot: Path
+        workspaceRoot: Path,
+        validation: ValidationCheck?
     ): List<AcceptanceCheck> {
         val byCriterion = reported.groupBy { normalizeCriterion(it.criterion) }
         return task.acceptanceCriteria.map { criterion ->
@@ -1201,12 +1206,12 @@ class TaskExecutionWorker @Inject constructor(
                 check.outcome == AcceptanceOutcome.PASSED && evidence.isNullOrBlank() ->
                     check.copy(criterion = criterion, outcome = AcceptanceOutcome.UNVERIFIED)
                 check.outcome == AcceptanceOutcome.PASSED && evidence != null -> {
-                    val missing = missingCitedTestMethod(workspaceRoot, evidence)
-                    if (missing == null) check.copy(criterion = criterion) else check.copy(
+                    val problem = missingCitedTestMethod(workspaceRoot, evidence, validation)
+                    if (problem == null) check.copy(criterion = criterion) else check.copy(
                         criterion = criterion,
                         outcome = AcceptanceOutcome.UNVERIFIED,
                         evidence = "${evidence.take(400)} (Rejected by the worker: the cited test method " +
-                            "'$missing' was not found in the workspace.)"
+                            "'${problem.method}' ${problem.reason}.)"
                     )
                 }
                 else -> check.copy(criterion = criterion)
@@ -1236,15 +1241,41 @@ class TaskExecutionWorker @Inject constructor(
     }
 
     /**
-     * A model can name a test that it never wrote. The report's narrative is not evidence, but the
-     * final workspace is: when the evidence explicitly cites a test method, require that method to
-     * exist in a test file. A missing method downgrades the claim to UNVERIFIED instead of accepting
-     * a fabricated pass. This only ever weakens a claim, never turns an unverified one into a pass.
+     * A model can name a test that it never wrote. When the last validation exposes machine test
+     * results, a cited method must be present and PASSED there; a declaration in the workspace is
+     * not enough. When the runner could not observe test execution (for example a Docker volume),
+     * fall back to checking that the declaration exists. A mismatch downgrades the claim to
+     * UNVERIFIED instead of accepting a fabricated pass; this only ever weakens a claim.
      */
-    private fun missingCitedTestMethod(workspaceRoot: Path, evidence: String): String? {
+    private fun missingCitedTestMethod(
+        workspaceRoot: Path,
+        evidence: String,
+        validation: ValidationCheck?
+    ): CitedTestProblem? {
         val method = citedTestMethod(evidence) ?: return null
-        return if (testMethodExists(workspaceRoot, method)) null else method
+        if (validation?.testResultsAvailable == true) {
+            val passed = validation.testResults.any {
+                it.outcome == CheckOutcome.PASSED && testNameMatches(it.methodName, method)
+            }
+            return if (passed) null else CitedTestProblem(
+                method,
+                "was not reported as passed by the last validation"
+            )
+        }
+        return if (testMethodExists(workspaceRoot, method)) null
+        else CitedTestProblem(method, "was not found in the workspace")
     }
+
+    private fun testNameMatches(reportedName: String, method: String): Boolean {
+        val normalized = reportedName.trim()
+            .substringBefore('[')
+            .substringBefore('(')
+            .substringAfterLast('.')
+            .trim()
+        return normalized == method
+    }
+
+    private data class CitedTestProblem(val method: String, val reason: String)
 
     private fun citedTestMethod(evidence: String): String? {
         BACKTICKED_TEST_METHOD.find(evidence)?.let { return it.groupValues[1] }

@@ -251,3 +251,34 @@ run that uses the other provider; the selected adapter fails closed with an expl
 endpoint or model is unset, and an unknown `agent.model.provider` value fails the deployment instead of
 silently defaulting. Hosted models add network egress and real spend: leave the adapter unselected for
 local-only operation, and set the per-million-token rates when a hosted model is used.
+
+---
+
+## ADR-0013 — Cited tests are verified against machine test results
+
+**Status:** Accepted (tightens the acceptance rule in README and AGENTS).
+
+**Context:** The worker previously treated a cited test method as credible when the method was declared
+in a test-like file. That proves a test exists, not that it ran or passed. A model can add a test that
+Maven never discovers, claim it covers a criterion, and still have the run end `COMPLETED`; W9 showed a
+related failure where a test was claimed but never written. The acceptance decision must prefer
+machine evidence over source-code shape.
+
+**Decision:** `ValidationRunner` returns `ValidationCheck.testResults` with
+`testResultsAvailable=true` when it could observe test execution. `DockerValidationRunner` reads
+Maven Surefire's JUnit XML after validation, in both bind-mounted and named-volume modes, and
+`ExecutionControlHttp` round-trips the results from the control plane. `TaskExecutionWorker` requires
+a cited method to be reported `PASSED` in the last validation. A missing, skipped, or failed case
+downgrades the acceptance check to `UNVERIFIED`. A declaration-only fallback remains for a validator
+that cannot expose results, and it can only weaken a claim.
+
+The parser (`SurefireReports`) treats the workspace as untrusted: DTDs and external entities are
+disabled, files are filtered by modification time against the validation start, file count/bytes and
+result count are bounded, and malformed reports yield no evidence rather than a pass.
+
+**Consequences:** A fabricated or unexecuted test can no longer satisfy completion on the standard
+Maven path. A repository that configures Surefire to write reports somewhere other than
+`target/surefire-reports`, or that uses another test framework, will not produce evidence and its
+cited tests will end `UNVERIFIED`; that is an honest limit, not a reason to relax the check. The
+control plane must return the new fields, and an older control plane that omits them causes the worker
+to fall back to declaration scanning until both services are upgraded.

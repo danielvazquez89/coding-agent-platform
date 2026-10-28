@@ -170,6 +170,40 @@ class DockerValidationRunnerTest {
     }
 
     @Test
+    fun `returns Surefire test results from a bind-mounted workspace`() {
+        val repo = mavenRepository()
+        val commands = object : CommandExecutor {
+            override fun run(
+                command: List<String>, workingDirectory: Path?, standardInput: String?, timeout: Duration,
+                maxOutputChars: Int, environment: Map<String, String>
+            ): CommandResult = when {
+                command.take(3) == listOf("docker", "network", "create") -> CommandResult(0, "network")
+                command.take(3) == listOf("docker", "run", "-d") -> CommandResult(0, "db")
+                command.take(2) == listOf("docker", "exec") -> CommandResult(0, "ready")
+                command.contains("mvn") -> {
+                    val reports = Files.createDirectories(repo.resolve("target/surefire-reports"))
+                    Files.writeString(
+                        reports.resolve("TEST-example.GreetingTest.xml"),
+                        """<testsuite><testcase classname="example.GreetingTest" name="greetsNullNameAsGuest" time="0.25"/></testsuite>"""
+                    )
+                    CommandResult(0, "Tests passed")
+                }
+                else -> CommandResult(0, "cleanup")
+            }
+        }
+
+        val result = runner(commands, temporary.resolve("m2").toString()).validate(repo)
+
+        assertEquals(CheckOutcome.PASSED, result.outcome)
+        assertTrue(result.testResultsAvailable)
+        assertEquals(1, result.testResults.size)
+        assertEquals("example.GreetingTest", result.testResults.single().className)
+        assertEquals("greetsNullNameAsGuest", result.testResults.single().methodName)
+        assertEquals(CheckOutcome.PASSED, result.testResults.single().outcome)
+        assertEquals(250L, result.testResults.single().durationMillis)
+    }
+
+    @Test
     fun `skips unsupported repositories and offline caches`() {
         val repo = Files.createDirectory(temporary.resolve("repo"))
         val noPom = runner(fakeCommands(), temporary.resolve("m2").toString()).validate(repo)
@@ -241,6 +275,16 @@ class DockerValidationRunnerTest {
                     command.take(3) == listOf("docker", "network", "create") -> CommandResult(0, "network")
                     command.take(3) == listOf("docker", "run", "-d") -> CommandResult(0, "db")
                     command.take(2) == listOf("docker", "exec") -> CommandResult(0, "ready")
+                    command.contains("mvn") -> {
+                        // The control-plane process mounts the same named volume at the configured
+                        // workspace root, so the test container's report is visible here.
+                        val reports = Files.createDirectories(workspace.resolve("target/surefire-reports"))
+                        Files.writeString(
+                            reports.resolve("TEST-example.VolumeTest.xml"),
+                            """<testsuite><testcase classname="example.VolumeTest" name="worksInAVolume" time="0.1"/></testsuite>"""
+                        )
+                        CommandResult(0, "ok")
+                    }
                     else -> CommandResult(0, "ok")
                 }
             }
@@ -257,6 +301,8 @@ class DockerValidationRunnerTest {
         assertTrue(mavenCommand.any { it.contains("volume-subpath=attempt-test-123") })
         assertTrue(mavenCommand.any { it.contains("source=agent-maven-cache,target=/m2/repository,readonly") })
         assertTrue(mavenCommand.none { it.startsWith("type=bind,source=") })
+        assertTrue(result.testResultsAvailable)
+        assertEquals(listOf("worksInAVolume"), result.testResults.map { it.methodName })
     }
 
     @Test

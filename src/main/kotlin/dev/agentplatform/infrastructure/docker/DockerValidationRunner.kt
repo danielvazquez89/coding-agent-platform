@@ -12,6 +12,7 @@ import org.eclipse.microprofile.config.inject.ConfigProperty
 import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
+import java.time.Instant
 import java.util.*
 
 @ApplicationScoped
@@ -86,6 +87,7 @@ open class DockerValidationRunner @Inject constructor(
         var outcome = CheckOutcome.FAILED
         var exitCode: Int? = null
         var timedOut = false
+        val reportCutoff = Instant.now()
         val startedAt = System.nanoTime()
         try {
             // `docker network create` and `docker run -d` print opaque 64-hex IDs on success; they
@@ -145,6 +147,11 @@ open class DockerValidationRunner @Inject constructor(
             runCatching { commands.run(listOf("docker", "network", "rm", network), timeout = Duration.ofSeconds(20), maxOutputChars = 1000) }
         }
 
+        // The process that requested validation also holds the workspace on disk: a bind-mounted
+        // directory locally, or the same named volume mounted at the configured workspace root in
+        // Compose. Surefire reports written by the test container are therefore observable in both
+        // modes. An empty result is still evidence that the cited test did not pass.
+        val testResults = SurefireReports.read(workspace, reportCutoff)
         val details = if (timedOut) "Validation timed out after ${validationTimeoutSeconds}s.\n$output" else output.toString()
         return ValidationCheck(
             name = "Maven tests",
@@ -152,7 +159,9 @@ open class DockerValidationRunner @Inject constructor(
             outcome = outcome,
             exitCode = exitCode,
             details = boundedValidationDetails(details),
-            durationMillis = Duration.ofNanos(System.nanoTime() - startedAt).toMillis()
+            durationMillis = Duration.ofNanos(System.nanoTime() - startedAt).toMillis(),
+            testResults = testResults,
+            testResultsAvailable = true
         )
     }
 

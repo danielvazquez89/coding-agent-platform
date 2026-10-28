@@ -1436,6 +1436,96 @@ class TaskExecutionWorkerTest {
     }
 
     @Test
+    fun `accepts a cited test reported passed by the last validation`() {
+        val criterion = "Greeting.greet(null) returns Hello guest"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val patch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello guest"
+        ).joinToString("\n", postfix = "\n")
+        val report =
+            """{"summary":"Applied","implementation":"Null is handled and tested.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"Test method `greetsNullNameAsGuest` in GreetingTest.java asserts the guest fallback."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls", 1, 1
+            ),
+            ModelTurn(report, emptyList(), "stop", 1, 1)
+        )
+        val validation = ValidationCheck(
+            "Maven tests",
+            outcome = CheckOutcome.PASSED,
+            testResults = listOf(
+                TestResult("example.GreetingTest", "greetsNullNameAsGuest[1]", CheckOutcome.PASSED, 12)
+            ),
+            testResultsAvailable = true
+        )
+
+        assertTrue(
+            worker(
+                FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("Greeting.java")),
+                validation = validation
+            ).execute(task.id)
+        )
+
+        assertEquals(TaskStatus.COMPLETED, task.status)
+        assertEquals(AcceptanceOutcome.PASSED, attempts.finishedReport!!.acceptanceChecks.single().outcome)
+    }
+
+    @Test
+    fun `does not accept a cited test that the last validation did not report as passed`() {
+        val criterion = "Greeting.greet(null) returns Hello guest"
+        val task = task(acceptanceCriteria = listOf(criterion))
+        val attempts = FakeAttempts()
+        Files.writeString(temporary.resolve("Greeting.java"), "Hello\n")
+        val patch = listOf(
+            "diff --git a/Greeting.java b/Greeting.java",
+            "--- a/Greeting.java",
+            "+++ b/Greeting.java",
+            "@@ -1 +1 @@",
+            "-Hello",
+            "+Hello guest"
+        ).joinToString("\n", postfix = "\n")
+        val report =
+            """{"summary":"Applied","implementation":"Null is handled and tested.","acceptanceChecks":[{"criterion":"$criterion","outcome":"PASSED","evidence":"Test method `greetsNullNameAsGuest` in GreetingTest.java asserts the guest fallback."}]}"""
+        val provider = ScriptedProvider(
+            ModelTurn(
+                null,
+                listOf(call("apply_patch", mapper.writeValueAsString(mapOf("patch" to patch)))),
+                "tool_calls", 1, 1
+            ),
+            ModelTurn(report, emptyList(), "stop", 1, 1),
+            ModelTurn(report, emptyList(), "stop", 1, 1),
+            ModelTurn(report, emptyList(), "stop", 1, 1)
+        )
+        val validation = ValidationCheck(
+            "Maven tests",
+            outcome = CheckOutcome.PASSED,
+            testResults = emptyList(),
+            testResultsAvailable = true
+        )
+
+        assertTrue(
+            worker(
+                FakeState(task), attempts, provider, FakeWorkspace(temporary, listOf("Greeting.java")),
+                validation = validation
+            ).execute(task.id)
+        )
+
+        assertEquals(TaskStatus.NEEDS_INPUT, task.status)
+        val check = attempts.finishedReport!!.acceptanceChecks.single()
+        assertEquals(AcceptanceOutcome.UNVERIFIED, check.outcome)
+        assertTrue(check.evidence!!.contains("not reported as passed by the last validation"), check.evidence)
+    }
+
+    @Test
     fun `matches a criterion that differs only in quote style`() {
         val criterion = """Greeting.greet(null) returns "Hello guest" instead of throwing."""
         val reported = "Greeting.greet(null) returns 'Hello guest' instead of throwing."

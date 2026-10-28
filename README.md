@@ -80,9 +80,16 @@ The conservatism is deliberate:
   conversation; a changed test that calls the changed code and asserts the required result is valid
   evidence when that test ran in the passing validation, and the model must cite the test method and
   assertion. A test name alone proves only that the test exists, and Maven alone does not prove the
-  behavior. A cited test method is also checked in the final workspace: if the report names a method
-  that is not declared in a test-like file, that check is downgraded to `UNVERIFIED` with the rejection
-  recorded, because a narrative claim is not evidence of a test. When a report marks a test-requiring
+  behavior. A cited test method is checked against the machine test results of the last validation:
+  the runner reads Maven Surefire's JUnit XML from the workspace and requires the named method to be
+  reported `PASSED`. A method that is declared in a test-like file but did not run, was skipped, failed,
+  or appeared only in build output is downgraded to `UNVERIFIED` with the rejection recorded, because a
+  narrative claim is not evidence of a test. The report parser disables DTDs and external entities,
+  ignores stale, oversized, and malformed files, and bounds the reports it reads; the workspace is
+  untrusted repository content. Both bind-mounted and named-volume validation expose the report
+  directory to the process that requested validation, so the check applies in the Compose topology as
+  well as local runs. A declaration-only fallback remains for a validator that cannot expose machine
+  results, but it can only weaken a claim. When a report marks a test-requiring
   criterion `PASSED` but no test file changed, the worker asks once for the missing edit before
   accepting the report; a cited method that already exists is left alone, and build output is not
   evidence. Criteria are matched after normalizing whitespace and quote style, so a report that copies
@@ -142,7 +149,7 @@ The worker's tool allowlist is `list_files`, `search_code`, `find_symbol`, `read
 
 `NEEDS_INPUT` tasks can be answered through the review page or API. The answer is prepended to the task prompt as a labeled clarification so it remains in the prompt when the original description is long; a status-history entry records the requeue, and a fresh attempt runs against a new workspace. The previous report remains available in attempt history.
 
-When acceptance criteria are supplied, the agent must return one evidence-bearing assessment per criterion. Missing or evidence-free checks prevent completion; failed criteria fail the task, and unverified criteria require input. This is a model assessment, not independent proof: Maven tests and benchmark-specific expected-diff checks provide separate machine-verifiable evidence. A task is completed only when the workspace changed, all supplied criteria are reported as passed, supported validation passed, and no patch or file-write failure remains unresolved. A failed patch, file creation, or text replacement must never be treated as applied just because the final narrative says so. A cited test method is checked against test-like files in the final workspace, with VCS, build-output, dependency, and IDE directories skipped; a method the workspace does not declare downgrades that check to `UNVERIFIED`, so a fabricated test cannot satisfy completion. The check only ever weakens a claim.
+When acceptance criteria are supplied, the agent must return one evidence-bearing assessment per criterion. Missing or evidence-free checks prevent completion; failed criteria fail the task, and unverified criteria require input. This is a model assessment, not independent proof: Maven tests, Surefire test-case results, and benchmark-specific expected-diff checks provide separate machine-verifiable evidence. A task is completed only when the workspace changed, all supplied criteria are reported as passed, supported validation passed, and no patch or file-write failure remains unresolved. A failed patch, file creation, or text replacement must never be treated as applied just because the final narrative says so. A cited test method is checked against the last validation's Surefire results: the method must be reported `PASSED`, not merely declared in a test file. If the runner cannot expose machine results, the worker falls back to scanning test-like files in the final workspace, skipping VCS, build-output, dependency, and IDE directories; an absent method downgrades the check to `UNVERIFIED`. Both checks only ever weaken a claim, so a fabricated or unexecuted test cannot satisfy completion.
 
 #### Draft pull-request publishing
 
@@ -150,7 +157,7 @@ Pull-request publishing is disabled by default. Set `AGENT_GITHUB_PULL_REQUESTS_
 
 If branch push or PR creation fails, the task is marked `FAILED` with `pullRequestError` in its persisted attempt report; a successfully pushed branch may remain and require manual cleanup. The local review page at `/` displays reports and draft-PR links but does not embed GitHub's review interface, approve changes, or merge. The UI and API are unauthenticated and must remain on localhost or a trusted network. This first slice does not yet provide GitHub issue webhooks, GitHub App installation tokens, or durable retry/recovery after partial publication.
 
-Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and a read-only Maven cache volume. In Compose, the trusted control-plane container alone receives the Docker socket. The worker calls its authenticated validation endpoint; the control plane rejects workspace paths outside the shared workspace root, and the validator mounts only that attempt's named-volume subdirectory. Test and bounded dependency-fetch commands execute without external network access. Gradle, other build systems, and network-enabled builds are not supported.
+Validation currently supports Maven projects only and runs `mvn -B -o test` in a disposable Linux Docker container with resource limits, a private internal network, a temporary PostgreSQL 18 service, and a read-only Maven cache volume. In Compose, the trusted control-plane container alone receives the Docker socket. The worker calls its authenticated validation endpoint; the control plane rejects workspace paths outside the shared workspace root, and the validator mounts only that attempt's named-volume subdirectory. Test and bounded dependency-fetch commands execute without external network access. After the run, the runner reads Surefire's `target/surefire-reports/TEST-*.xml` from the workspace so a cited test can be checked against what actually executed; that directory is visible through both a bind mount and the shared named volume. The parser is deliberately narrow and hostile-input safe: no DTDs or external entities, a fresh-report cutoff, bounded file count and size, and malformed reports are ignored rather than trusted. Gradle, other build systems, and network-enabled builds are not supported.
 
 The worker container runs non-root with a read-only root filesystem, dropped Linux capabilities, no-new-privileges, a process limit, and CPU/memory limits. It has no Docker socket. The shared workspace and database are reachable by both services; the worker still has the application's database credentials, GitHub credentials when publishing is enabled, and outbound network access needed for GitHub and the configured model endpoint. Compose networking does not enforce a strict egress allowlist, and this deployment is not a hostile multi-tenant boundary. Keep it on a trusted host/network, use a narrowly scoped GitHub token, and do not grant production database access. The control-plane container runs as root to access the Docker socket, has Docker-daemon-equivalent privileges, and is bound to localhost by default; treat it as host-root.
 
@@ -501,7 +508,8 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `infrastructure/ExecutionControlHttpTest.kt` — Worker-to-control-plane HTTP contract and failure tests.
 - `infrastructure/workspace/GitRepositoryWorkspaceFactoryTest.kt` — Workspace cloning, safety, build-output exclusion, and diff-truncation tests.
 - `infrastructure/tool/WorkspaceToolExecutorTest.kt` — Path and patch safety tests.
-- `infrastructure/docker/DockerValidationRunnerTest.kt` — Docker runner tests.
+- `infrastructure/docker/DockerValidationRunnerTest.kt` — Docker runner tests, including bind-mount and named-volume Surefire result evidence.
+- `infrastructure/docker/SurefireReportsTest.kt` — Secure Surefire XML parsing, stale/oversized/malformed rejection, and result bounds.
 - `infrastructure/github/GitHubPullRequestPublisherTest.kt` — Allow-list, branch-push, and draft-PR publishing tests.
 - `infrastructure/process/LocalCommandExecutorTest.kt` — Process execution tests.
 - `infrastructure/process/CommandFixture.kt` — Test helper for command execution.

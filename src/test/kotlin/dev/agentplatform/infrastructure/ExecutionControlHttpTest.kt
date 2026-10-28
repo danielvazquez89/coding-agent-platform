@@ -22,7 +22,7 @@ class ExecutionControlHttpTest {
             respond(
                 exchange,
                 200,
-                """{"name":"Maven tests","command":"mvn test","outcome":"PASSED","exitCode":0,"details":"All tests passed","durationMillis":42}"""
+                """{"name":"Maven tests","command":"mvn test","outcome":"PASSED","exitCode":0,"details":"All tests passed","durationMillis":42,"testResultsAvailable":true,"testResults":[{"className":"example.GreetingTest","methodName":"greetsNullNameAsGuest","outcome":"PASSED","durationMillis":125},{"className":"","methodName":"ignored","outcome":"PASSED"},{"className":"example.GreetingTest","methodName":"","outcome":"PASSED"},{"className":"example.GreetingTest","methodName":"unknown","outcome":"NOT_AN_OUTCOME"},{"className":"example.GreetingTest","methodName":"skipped","outcome":"SKIPPED"}]}"""
             )
         }
         server.start()
@@ -46,6 +46,13 @@ class ExecutionControlHttpTest {
             assertEquals(0, result.exitCode)
             assertEquals("All tests passed", result.details)
             assertEquals(42L, result.durationMillis)
+            assertTrue(result.testResultsAvailable)
+            assertEquals(2, result.testResults.size)
+            assertEquals("greetsNullNameAsGuest", result.testResults.first().methodName)
+            assertEquals(CheckOutcome.PASSED, result.testResults.first().outcome)
+            assertEquals(125L, result.testResults.first().durationMillis)
+            assertEquals(CheckOutcome.SKIPPED, result.testResults.last().outcome)
+            assertEquals(null, result.testResults.last().durationMillis)
         } finally {
             server.stop(0)
             Files.deleteIfExists(workspace)
@@ -97,6 +104,8 @@ class ExecutionControlHttpTest {
             assertEquals(null, result.durationMillis)
             assertEquals(null, result.command)
             assertEquals(null, result.details)
+            assertTrue(result.testResults.isEmpty())
+            assertEquals(false, result.testResultsAvailable)
         } finally {
             server.stop(0)
             Files.deleteIfExists(workspace)

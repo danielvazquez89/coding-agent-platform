@@ -2,6 +2,7 @@ package dev.agentplatform.infrastructure
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.agentplatform.domain.model.CheckOutcome
+import dev.agentplatform.domain.model.TestResult
 import dev.agentplatform.domain.model.ValidationCheck
 import java.net.URI
 import java.net.http.HttpClient
@@ -18,13 +19,29 @@ object ExecutionControlHttp {
         val body = mapper.createObjectNode().put("workspacePath", workspace.toAbsolutePath().normalize().toString())
         val response = post(baseUrl, token, "/internal/execution/validate", body, timeoutSeconds)
         val json = mapper.readTree(response)
+        val testResults = json.path("testResults").takeIf { it.isArray }?.mapNotNull { node ->
+            val className = node.path("className").asText("").takeIf(String::isNotBlank)
+                ?: return@mapNotNull null
+            val methodName = node.path("methodName").asText("").takeIf(String::isNotBlank)
+                ?: return@mapNotNull null
+            val outcome = runCatching { CheckOutcome.valueOf(node.path("outcome").asText("")) }
+                .getOrNull() ?: return@mapNotNull null
+            TestResult(
+                className = className,
+                methodName = methodName,
+                outcome = outcome,
+                durationMillis = node.path("durationMillis").takeIf { it.isNumber }?.asLong()
+            )
+        }.orEmpty()
         return ValidationCheck(
             name = json.path("name").asText(),
             command = json.path("command").textValue(),
             outcome = CheckOutcome.valueOf(json.path("outcome").asText()),
             exitCode = json.path("exitCode").takeIf { it.isInt }?.asInt(),
             details = json.path("details").textValue(),
-            durationMillis = json.path("durationMillis").takeIf { it.isNumber }?.asLong()
+            durationMillis = json.path("durationMillis").takeIf { it.isNumber }?.asLong(),
+            testResults = testResults,
+            testResultsAvailable = json.path("testResultsAvailable").asBoolean(false)
         )
     }
 
