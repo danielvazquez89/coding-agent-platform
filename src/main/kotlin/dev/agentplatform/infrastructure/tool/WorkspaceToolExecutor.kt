@@ -7,6 +7,7 @@ import dev.agentplatform.domain.port.ExecutionMetrics
 import dev.agentplatform.domain.port.ModelToolDefinition
 import dev.agentplatform.domain.port.ToolExecutionResult
 import dev.agentplatform.domain.port.ValidationRunner
+import dev.agentplatform.domain.port.WorkspaceTools
 import dev.agentplatform.infrastructure.retrieval.RepositoryFiles
 import dev.agentplatform.infrastructure.retrieval.RepositoryMapBuilder
 import dev.agentplatform.infrastructure.retrieval.TestImpactAnalyzer
@@ -23,7 +24,7 @@ class WorkspaceToolExecutor(
     private val commands: CommandExecutor,
     private val objectMapper: ObjectMapper,
     private val metrics: ExecutionMetrics
-) {
+) : WorkspaceTools {
     private val log = Logger.getLogger(WorkspaceToolExecutor::class.java)
     private val codexPatches = CodexPatchNormalizer()
     private val repositoryMapBuilder: RepositoryMapBuilder by lazy { RepositoryMapBuilder.fromConfig() }
@@ -33,9 +34,10 @@ class WorkspaceToolExecutor(
      * Ranks repository files for the task prompt. Configuration is read lazily so the bean needs no
      * extra constructor parameter; failures are surfaced to the caller, which decides whether to continue.
      */
-    fun repositoryMap(workspace: Path, query: String): String = repositoryMapBuilder.build(workspace, query)
+    override fun repositoryMap(workspace: Path, query: String): String =
+        repositoryMapBuilder.build(workspace, query)
 
-    fun definitions(): List<ModelToolDefinition> = listOf(
+    override fun definitions(): List<ModelToolDefinition> = listOf(
         tool("list_files", "List repository files, optionally under a relative directory, filtered by a glob and a depth.", """{"type":"object","properties":{"path":{"type":"string"},"depth":{"type":"integer","minimum":1,"description":"Maximum directory levels below path. Omit for the whole tree."},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example **/*.kt or src/**/*.java."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 250, capped at 1000."}},"additionalProperties":false}"""),
         tool("search_code", "Search repository text line by line. The query is a literal unless regex is true. The path may be a file or a directory. Results are paginated with offset and maxResults.", """{"type":"object","properties":{"query":{"type":"string"},"path":{"type":"string"},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example **/*.kt."},"regex":{"type":"boolean","description":"Treat the query as a Java regular expression. Invalid expressions are rejected."},"ignoreCase":{"type":"boolean","description":"Defaults to true."},"offset":{"type":"integer","minimum":0,"description":"Number of matches to skip. Defaults to 0."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 25, capped at 200."}},"required":["query"],"additionalProperties":false}"""),
         tool("find_symbol", "Locate where a class, interface, enum, record, method, function or field is declared. Use this first when the task names an identifier or when the repository map points at a file: it returns path:line for declarations before other occurrences, so you can read only the surrounding lines. The path may be a file or a directory. A bounded line scan, not a compiler; confirm the line before editing.", """{"type":"object","properties":{"name":{"type":"string","description":"A single identifier, for example writeValue or JSONObject."},"path":{"type":"string"},"glob":{"type":"string","description":"Glob matched against the repository-relative path, for example src/**/*.java."},"maxResults":{"type":"integer","minimum":1,"description":"Defaults to 25, capped at 200."}},"required":["name"],"additionalProperties":false}"""),
@@ -47,6 +49,24 @@ class WorkspaceToolExecutor(
         tool("run_validation", "Run the repository's Maven tests in a disposable, resource-limited Docker container.", """{"type":"object","properties":{},"additionalProperties":false}""")
     )
 
+    override fun execute(name: String, argumentsJson: String, workspace: Path): ToolExecutionResult {
+        val arguments = try {
+            objectMapper.readTree(argumentsJson)
+        } catch (failure: Exception) {
+            metrics.toolCall(name, "rejected")
+            throw IllegalArgumentException("Tool arguments must be a JSON object", failure)
+        }
+        if (arguments == null || !arguments.isObject) {
+            metrics.toolCall(name, "rejected")
+            throw IllegalArgumentException("Tool arguments must be a JSON object")
+        }
+        return execute(name, arguments, workspace)
+    }
+
+    /**
+     * Convenience overload for callers that already hold a parsed tree. The application uses the
+     * JSON-text method above so it depends on the [WorkspaceTools] port rather than Jackson.
+     */
     fun execute(name: String, arguments: JsonNode, workspace: Path): ToolExecutionResult {
         val result = try {
             executeAllowed(name, arguments, workspace)

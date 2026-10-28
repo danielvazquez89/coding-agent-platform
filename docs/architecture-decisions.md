@@ -282,3 +282,38 @@ Maven path. A repository that configures Surefire to write reports somewhere oth
 cited tests will end `UNVERIFIED`; that is an honest limit, not a reason to relax the check. The
 control plane must return the new fields, and an older control plane that omits them causes the worker
 to fall back to declaration scanning until both services are upgraded.
+
+---
+
+## ADR-0014 — Layer boundaries are enforced by ArchUnit, with named exceptions
+
+**Status:** Accepted.
+
+**Context:** The repository claimed hexagonal boundaries, but the worker imported the concrete
+`WorkspaceToolExecutor`, so the application layer depended on an outbound adapter. Nothing failed when
+a new import crossed a layer. The prose rule was also broader than the code: domain entities have
+always carried JPA mapping annotations, the provider SPI uses Jackson's `JsonNode`, and application
+services use Panache repositories and API DTOs directly. Treating those as invisible exceptions made
+the architecture claim hard to trust.
+
+**Decision:** Add the `WorkspaceTools` domain port (`definitions`, `repositoryMap`, `execute` with
+JSON-text arguments) and implement it in `WorkspaceToolExecutor`; the worker depends only on the port.
+`ArchitectureTest` uses ArchUnit to enforce:
+
+- domain does not depend on `api`, `application`, or `infrastructure`;
+- the worker does not depend on `infrastructure`;
+- `api` does not depend on `infrastructure`;
+- `application` does not depend on `infrastructure` except its Panache repositories;
+- `application` uses only the `api.dto` package from the inbound adapter;
+- `infrastructure` does not depend on `api` or `application`;
+- domain depends only on the JDK/Kotlin, JPA annotations, and Jackson's databind package.
+
+The exceptions are deliberate and documented here. A new dependency outside those packages fails the
+test instead of becoming hidden drift.
+
+**Consequences:** Moving a use case or adding an adapter now has a mechanical guard. The remaining
+exceptions are debt with a clear removal path: repository ports would remove the Panache dependency,
+application-owned commands/responses would remove the DTO dependency, and a JSON value type in the
+provider contract would remove Jackson from the domain. Until then, the test keeps the exception list
+small enough to review. ArchUnit runs on the compiled production classes and is excluded from the
+coverage gate like the rest of the test sources.

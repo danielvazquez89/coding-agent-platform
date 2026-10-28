@@ -50,6 +50,24 @@ class WorkspaceToolExecutorTest {
     }
 
     @Test
+    fun `executes from JSON text and rejects arguments that are not an object`() {
+        val root = repository()
+        Files.createDirectories(root.resolve("src"))
+        Files.writeString(root.resolve("src/Sample.kt"), "package sample\n")
+        val tools = executor()
+
+        assertTrue(
+            tools.execute("list_files", """{"path":"src"}""", root).content.contains("Sample.kt")
+        )
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("list_files", "not-json", root)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            tools.execute("list_files", "[]", root)
+        }
+    }
+
+    @Test
     fun `lists searches and reads repository files while skipping generated directories`() {
         val root = repository()
         Files.createDirectories(root.resolve("src/main"))

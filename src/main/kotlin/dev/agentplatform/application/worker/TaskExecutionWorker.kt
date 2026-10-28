@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode
 import com.fasterxml.jackson.databind.ObjectMapper
 import dev.agentplatform.domain.model.*
 import dev.agentplatform.domain.port.*
-import dev.agentplatform.infrastructure.tool.WorkspaceToolExecutor
 import io.quarkus.scheduler.Scheduled
 import jakarta.enterprise.context.ApplicationScoped
 import jakarta.inject.Inject
@@ -27,7 +26,7 @@ class TaskExecutionWorker @Inject constructor(
     private val finalizer: TaskExecutionFinalizer,
     private val model: CodingModelProvider,
     private val workspaces: RepositoryWorkspaceFactory,
-    private val tools: WorkspaceToolExecutor,
+    private val tools: WorkspaceTools,
     private val pullRequestPublisher: PullRequestPublisher,
     private val objectMapper: ObjectMapper,
     @ConfigProperty(name = "agent.execution.enabled", defaultValue = "true")
@@ -921,7 +920,7 @@ class TaskExecutionWorker @Inject constructor(
                     duplicatePatchMessage(trace.rejectedPatches.getValue(patchFingerprint))
                 )
             }
-            tools.execute(name, arguments, root)
+            tools.execute(name, arguments.toString(), root)
         } catch (failure: Exception) {
             if (failure is AuditPersistenceException) throw failure
             // `IllegalArgumentException` is the tools' deliberate refusal of an invalid or disallowed

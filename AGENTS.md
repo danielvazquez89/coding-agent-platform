@@ -16,9 +16,11 @@ public GitHub repositories. See README for the product surface.
 
 ## Golden rules (do not break these)
 
-1. **Hexagonal boundaries.** Dependencies point inward: `api` → `application` → `domain`; `infrastructure`
-   implements `domain` ports. `domain` must not import Quarkus, JAX-RS, Panache, Jackson, or any other
-   infrastructure type. Keep entities/value objects framework-free.
+1. **Hexagonal boundaries.** Dependencies point inward: `api` → `application` → `domain`;
+   `infrastructure` implements `domain` ports. `ArchitectureTest` enforces the directions. Known,
+   documented exceptions (ADR-0014): domain entities carry JPA mapping annotations, the provider SPI
+   uses Jackson `JsonNode`, application services use Panache repositories directly, and they map API
+   DTOs. Do not add a new exception; put an adapter behind a domain port instead.
 2. **Model tool requests are proposals, not commands.** The application authorizes every call
    (`WorkspaceToolExecutor` allow-list, path checks, patch-size checks). Never add a shell, network,
    credential, arbitrary-command, or GitHub-write tool.
@@ -70,6 +72,7 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
 | `CodingModelProvider` | `model/SelectingCodingModelProvider` → `ollama/OllamaCodingModelProvider` or `openai/OpenAiCompatibleCodingModelProvider` (by `agent.model.provider`) | `ollama/OllamaCodingModelProviderTest`, `openai/OpenAiCompatibleCodingModelProviderTest`, `model/SelectingCodingModelProviderTest` |
 | (pacing policy) | `model/ModelRateLimiter` → `model/RateLimitBudget` (one shared sliding minute; consulted by the OpenAI-compatible adapter only) | `model/RateLimitBudgetTest` |
 | `RepositoryWorkspaceFactory`, `RepositoryWorkspace` | `workspace/GitRepositoryWorkspaceFactory` | `workspace/GitRepositoryWorkspaceFactoryTest` |
+| `WorkspaceTools` | `tool/WorkspaceToolExecutor` | `tool/WorkspaceToolExecutorTest` |
 | `CommandExecutor` | `process/LocalCommandExecutor` | `process/LocalCommandExecutorTest` |
 | `ValidationRunner` | `docker/DockerValidationRunner` (or `ExecutionControlHttp` via the gateway) | `docker/DockerValidationRunnerTest`, `ExecutionControlHttpTest` |
 | `PullRequestPublisher` | `github/GitHubPullRequestPublisher` | `github/GitHubPullRequestPublisherTest` |
@@ -80,6 +83,9 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
 - Observability: events go through the framework-free `domain/port/ExecutionMetrics` seam (no-op by
   default) so the application, tools and providers stay decoupled from Micrometer. Meter tags must stay
   low-cardinality; never tag with task ids, paths, tool output or prompt text.
+- Layer boundaries are enforced by `ArchitectureTest` (ArchUnit). The worker depends on the
+  `WorkspaceTools` port, not the tool adapter; tool arguments cross that boundary as JSON text. The
+  test permits the documented exceptions in ADR-0014 and rejects any new outward dependency.
 
 - Worker entry point: `application/worker/TaskExecutionWorker` (scheduled, claims one queued task with a
   DB lock; also reaps attempts orphaned by a stopped worker). Terminal updates:

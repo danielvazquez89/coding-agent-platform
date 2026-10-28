@@ -421,7 +421,7 @@ Treat `report.patchDiff` as review material, not as a guaranteed-appliable patch
 
 ### Architecture and code map
 
-The codebase follows a **hexagonal (ports-and-adapters) architecture** with four layers. Dependencies point inward: infrastructure and API depend on domain and application, but domain has no outward dependencies.
+The codebase follows a **hexagonal (ports-and-adapters) architecture** with four layers. Dependencies point inward: `api` depends on `application` and `domain`; `application` depends on `domain`; `infrastructure` implements `domain` ports. `ArchitectureTest` enforces those directions with ArchUnit and fails the build on a new reverse edge. Two couplings are explicit, documented debt rather than hidden drift: application services use the Panache repositories directly, and they map API request/response DTOs; the provider SPI also uses Jackson's `JsonNode` in the domain. ADR-0014 records why and what would remove them.
 
 ```text
 ┌──────────────────────────────────────────────────────────┐
@@ -457,6 +457,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `domain/model/TaskExecutionReport.kt` — Value objects: `TaskExecutionReport`, `HumanReview`, `ToolExecutionAudit`, `ToolExecutionOutcome`, `AgentDecision`, `AgentQuestion`, `AcceptanceCheck`, `ModelUsage`, `PullRequestReference`, `ValidationCheck`, `CheckOutcome`; `review` and `modelAcceptanceChecks` preserve human-confirmation provenance.
 - `domain/model/ToolExecutionEvent.kt` — Durable per-call audit entity linked to its task and attempt.
 - `domain/port/CodingModelProvider.kt` — Provider-neutral LLM chat/tool-calling SPI (messages, tool definitions, tool calls, turns).
+- `domain/port/WorkspaceTools.kt` — The application's boundary to repository inspection/editing: tool definitions, prompt repository map, and execution with JSON-text arguments. The adapter, not the caller, owns the allow-list and path checks.
 - `domain/port/ExecutionPorts.kt` — Outbound port interfaces: `TaskExecutionState`, `AttemptOperations`, `RepositoryWorkspaceFactory`, `RepositoryWorkspace`, `CommandExecutor`, `CommandResult`, `ValidationRunner`, `PullRequestPublisher`, `ToolExecutionResult`.
 
 #### `dev.agentplatform.application` — Use cases and orchestration
@@ -477,7 +478,7 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `infrastructure/model/SelectingCodingModelProvider.kt` — Runtime selection of the active provider from `agent.model.provider`, plus the CDI qualifiers that keep the concrete adapters off the plain `CodingModelProvider` type, and the shared content-based tool-request extractor.
 - `infrastructure/github/GitHubPullRequestPublisher.kt` — allowlisted branch push and GitHub draft-PR creation; implements `PullRequestPublisher`.
 - `infrastructure/workspace/GitRepositoryWorkspaceFactory.kt` — Authorized local/GitHub repository cloning into isolated workspaces; implements `RepositoryWorkspaceFactory`.
-- `infrastructure/tool/WorkspaceToolExecutor.kt` — Path-checked, allowlisted tool execution for the model loop.
+- `infrastructure/tool/WorkspaceToolExecutor.kt` — Path-checked, allowlisted tool execution for the model loop; implements `WorkspaceTools`.
 - `infrastructure/docker/DockerValidationRunner.kt` — Disposable Docker Maven/PostgreSQL validation runtime; implements `ValidationRunner`.
 - `infrastructure/ExecutionControlHttp.kt` — Worker HTTP client for the authenticated validation gateway.
 - `infrastructure/process/LocalCommandExecutor.kt` — Argument-vector process runner with bounded output and timeouts; implements `CommandExecutor`.
@@ -489,11 +490,12 @@ The codebase follows a **hexagonal (ports-and-adapters) architecture** with four
 - `scripts/Apply-TaskPatch.ps1` — Export a completed attempt's patch and optionally apply it to a clean local Git worktree.
 - `compose.yaml` and `.env.example` — Separate worker/control-plane deployment with named workspace/cache volumes and no Docker socket in the worker.
 - `src/main/resources/db/migration/` — Flyway-managed PostgreSQL schema migrations (V1 tasks, V2 status history, V3 attempts, V4 one-running-attempt constraint, V5 tool execution events).
-- `pom.xml` — Maven build, Kotlin compiler, Quarkus platform and extensions, and the JaCoCo coverage gate (95% line / 85% branch).
+- `pom.xml` — Maven build, Kotlin compiler, Quarkus platform and extensions, ArchUnit boundary tests, and the JaCoCo coverage gate (95% line / 85% branch).
 
 #### Tests (mirror the main source structure under `src/test/kotlin/dev/agentplatform/`)
 
 - `AgentWorkflowIntegrationTest.kt` — end-to-end REST submission through workspace creation, the scripted model/tool loop, validation, and the stored report.
+- `ArchitectureTest.kt` — ArchUnit rules pinning outward-inward layer dependencies and documenting the known exceptions.
 - `AgentWorkflowTestSupport.kt` — shared fixture: scripted Ollama HTTP server and isolated workspace/repository roots.
 - `api/TaskResourceTest.kt` — Quarkus REST and PostgreSQL integration tests, including patch-export responses.
 - `api/InternalExecutionResourceTest.kt` — Validation-gateway authentication, workspace-root, invalid-path, and unavailable-configuration tests.
@@ -560,7 +562,7 @@ $env:DB_PASSWORD = (Get-Content .env | ConvertFrom-StringData).DB_PASSWORD
 Remove-Item Env:DB_PASSWORD
 ```
 
-The suite includes transition-policy and REST/database tests, provider protocol tests, worker/report lifecycle tests, path and patch safety tests, repository workspace tests, command execution tests, and Docker-runner tests. `api/InternalExecutionResourceTest.kt` directly covers the validation gateway's authentication, workspace-root checks, invalid paths, and unavailable configuration; `infrastructure/ExecutionControlHttpTest.kt` covers the worker-to-control-plane HTTP contract and failures. `application/AgentWorkflowIntegrationTest.kt` exercises REST submission through real workspace creation, scripted Ollama tool calls, durable audit retrieval, validation, draft-PR reporting, `NEEDS_INPUT` answer/resume, failed validation, unapproved-tool rejection, and the authenticated control-plane path restriction. It uses a local Git fixture and a scripted model server; PostgreSQL remains the test database. Run these focused suites with `.\mvnw.cmd "-Dtest=InternalExecutionResourceTest,ExecutionControlHttpTest,AgentWorkflowIntegrationTest" test`. `mvnw verify` enforces a coverage gate of **95% lines and 85% branches** for measured application code. A literal 100% branch ratio is deliberately not required: Kotlin emits synthetic default-argument dispatch branches onto data holders (entities, DTOs, value objects), and a few branches are environment-specific (the Windows-only Java argument-file path, JVM interrupt handling), so hitting 100% would require contrived tests rather than meaningful verification. The current ratios are reported under `target/site/jacoco`.
+The suite includes transition-policy and REST/database tests, ArchUnit layer-boundary rules, provider protocol tests, worker/report lifecycle tests, path and patch safety tests, repository workspace tests, command execution tests, and Docker-runner tests. `api/InternalExecutionResourceTest.kt` directly covers the validation gateway's authentication, workspace-root checks, invalid paths, and unavailable configuration; `infrastructure/ExecutionControlHttpTest.kt` covers the worker-to-control-plane HTTP contract and failures. `application/AgentWorkflowIntegrationTest.kt` exercises REST submission through real workspace creation, scripted Ollama tool calls, durable audit retrieval, validation, draft-PR reporting, `NEEDS_INPUT` answer/resume, failed validation, unapproved-tool rejection, and the authenticated control-plane path restriction. It uses a local Git fixture and a scripted model server; PostgreSQL remains the test database. Run these focused suites with `.\mvnw.cmd "-Dtest=InternalExecutionResourceTest,ExecutionControlHttpTest,AgentWorkflowIntegrationTest" test`. `mvnw verify` enforces a coverage gate of **95% lines and 85% branches** for measured application code. A literal 100% branch ratio is deliberately not required: Kotlin emits synthetic default-argument dispatch branches onto data holders (entities, DTOs, value objects), and a few branches are environment-specific (the Windows-only Java argument-file path, JVM interrupt handling), so hitting 100% would require contrived tests rather than meaningful verification. The current ratios are reported under `target/site/jacoco`.
 
 ### Repeatable coding benchmark
 
