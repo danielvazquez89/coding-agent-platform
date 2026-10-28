@@ -317,3 +317,30 @@ application-owned commands/responses would remove the DTO dependency, and a JSON
 provider contract would remove Jackson from the domain. Until then, the test keeps the exception list
 small enough to review. ArchUnit runs on the compiled production classes and is excluded from the
 coverage gate like the rest of the test sources.
+
+---
+
+## ADR-0015 — The completion decision is a pure domain policy
+
+**Status:** Accepted.
+
+**Context:** The rule that decides whether an attempt is `COMPLETED`, `FAILED`, or `NEEDS_INPUT` was a
+nine-branch `when` inside the 1,500-line worker. Its precedence encodes the project's central honesty
+requirement, but it could only be tested by driving a model/tool loop. A reordering during unrelated
+worker work could silently turn a failed validation into a request for input, or completion into a
+failure, without a focused test failing.
+
+**Decision:** Extract exactly that decision into `domain/model/CompletionPolicy.decide`, a pure
+function over the facts the worker already gathered: last validation outcome, whether the workspace
+changed, whether a blocking question exists, the assessed acceptance checks, and whether a patch or
+file write remains unresolved. The worker supplies the facts and uses the returned `TaskStatus`.
+`CompletionPolicyTest` is a decision table covering every branch and the precedence conflicts,
+including blocking question vs failed validation, skipped validation vs failed criterion, and an
+unchanged workspace vs an unresolved patch. The worker's reason text and every existing worker test
+are unchanged.
+
+**Consequences:** The honesty rule is now testable without a model, a workspace, or Docker, and the
+worker can change orchestration without accidentally rewriting completion precedence. The policy
+still trusts the worker's evidence-gathering: it cannot know whether validation actually ran or
+whether a file write failed. Those facts remain the worker's and adapters' responsibility, and the
+policy must never be called with optimistic defaults.

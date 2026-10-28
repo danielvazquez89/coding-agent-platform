@@ -196,17 +196,14 @@ class TaskExecutionWorker @Inject constructor(
             // validation that could not run still legitimately needs input. A rejected patch with no
             // later success is another known negative: the report may claim a change that never
             // reached the workspace, so it must not complete automatically (W8b).
-            var taskStatus = when {
-                blockingQuestions.isNotEmpty() || lastValidation?.outcome == CheckOutcome.SKIPPED -> TaskStatus.NEEDS_INPUT
-                acceptanceChecks.any { it.outcome == AcceptanceOutcome.FAILED } -> TaskStatus.FAILED
-                lastValidation?.outcome == CheckOutcome.FAILED -> TaskStatus.FAILED
-                changedFiles.isEmpty() -> TaskStatus.FAILED
-                trace.unresolvedPatchFailure != null -> TaskStatus.NEEDS_INPUT
-                trace.unresolvedWriteFailures.isNotEmpty() -> TaskStatus.NEEDS_INPUT
-                acceptanceChecks.any { it.outcome != AcceptanceOutcome.PASSED } -> TaskStatus.NEEDS_INPUT
-                lastValidation?.outcome == CheckOutcome.PASSED -> TaskStatus.COMPLETED
-                else -> TaskStatus.FAILED
-            }
+            var taskStatus = CompletionPolicy.decide(
+                validationOutcome = lastValidation?.outcome,
+                workspaceChanged = changedFiles.isNotEmpty(),
+                hasBlockingQuestion = blockingQuestions.isNotEmpty(),
+                acceptanceChecks = acceptanceChecks,
+                hasUnresolvedPatchFailure = trace.unresolvedPatchFailure != null,
+                hasUnresolvedWriteFailure = trace.unresolvedWriteFailures.isNotEmpty()
+            )
             val questions = when {
                 lastValidation?.outcome == CheckOutcome.SKIPPED && blockingQuestions.isEmpty() -> modelQuestions + AgentQuestion(
                     "Which supported validation should run for this repository?", lastValidation.details.orEmpty(), true

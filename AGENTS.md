@@ -90,6 +90,9 @@ infrastructure  persistence, Ollama/OpenAI, Git, Docker, process, tools (outboun
 - Worker entry point: `application/worker/TaskExecutionWorker` (scheduled, claims one queued task with a
   DB lock; also reaps attempts orphaned by a stopped worker). Terminal updates:
   `application/worker/TaskExecutionFinalizer`.
+- Completion precedence: `domain/model/CompletionPolicy` is the pure decision table from validation,
+  workspace, acceptance, and unresolved-failure evidence to `COMPLETED`/`FAILED`/`NEEDS_INPUT`.
+  Change the policy and its table test together; do not duplicate or reorder the branches in the worker.
 - Prompt context: `infrastructure/retrieval/RepositoryMapBuilder` ranks files with BM25 over identifier
   tokens plus PageRank over type references, and packs the top entries into a token budget. It is a
   heuristic, labelled as such in the prompt, bounded by file count/bytes, and fail-soft: a failure to
